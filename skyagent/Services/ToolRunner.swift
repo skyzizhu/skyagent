@@ -103,10 +103,10 @@ class ToolRunner {
         self.skillManager = skillManager
         self.attachmentStore = attachmentStore
         self.validationService = validationService
+        AppStoragePaths.migrateLegacyDataIfNeeded()
         let settings = AppSettings.load()
         self.sandboxDir = settings.ensureSandboxDir()
-        self.undoBaseDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".openclaw/workspace-coding/MiniAgent/data/undo").path
+        self.undoBaseDir = AppStoragePaths.undoDir.path
         self.compatibilityBinDir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".skyagent/bin").path
         try? FileManager.default.createDirectory(atPath: undoBaseDir, withIntermediateDirectories: true)

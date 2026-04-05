@@ -23,10 +23,10 @@ class ConversationStore: ObservableObject {
         attachmentStore: UploadedAttachmentStore = .shared,
         saveDir: URL? = nil
     ) {
+        AppStoragePaths.migrateLegacyDataIfNeeded()
         self.settings = settings ?? AppSettings.load()
         self.attachmentStore = attachmentStore
-        self.saveDirURL = saveDir ?? FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".openclaw/workspace-coding/MiniAgent/data")
+        self.saveDirURL = saveDir ?? AppStoragePaths.dataDir
         try? FileManager.default.createDirectory(at: self.saveDirURL, withIntermediateDirectories: true)
         loadConversations()
         cleanupStaleAttachments()

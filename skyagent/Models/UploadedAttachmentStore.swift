@@ -53,8 +53,8 @@ final class UploadedAttachmentStore {
     private let baseDir: URL
 
     init(baseDir: URL? = nil) {
-        self.baseDir = baseDir ?? FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".openclaw/workspace-coding/MiniAgent/data/attachments")
+        AppStoragePaths.migrateLegacyDataIfNeeded()
+        self.baseDir = baseDir ?? AppStoragePaths.attachmentsDir
         try? FileManager.default.createDirectory(at: self.baseDir, withIntermediateDirectories: true)
     }
 

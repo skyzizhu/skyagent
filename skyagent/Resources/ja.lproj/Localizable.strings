@@ -73,7 +73,7 @@
 "chat.approval.risk.skill_script" = "Skill スクリプト実行";
 "chat.approval.risk.high" = "高リスク";
 "chat.approval.risk.normal" = "通常操作";
-"onboarding.welcome.title" = "MiniAgent へようこそ";
+"onboarding.welcome.title" = "SkyAgent へようこそ";
 "onboarding.welcome.subtitle" = "macOS ネイティブのエージェントアプリ\nOpenAI 互換 API の複数モデル接続に対応";
 "onboarding.welcome.note" = "開始する前に、AI モデル API を設定してください。";
 "onboarding.welcome.cta" = "設定を開始";

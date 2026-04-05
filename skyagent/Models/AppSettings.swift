@@ -63,10 +63,10 @@ struct AppSettings: Codable {
         activeProfileId: nil
     )
 
-    /// 默认沙盒目录：~/MiniAgent
+    /// 默认沙盒目录：~/SkyAgent
     static var defaultSandboxDir: String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return (home as NSString).appendingPathComponent("MiniAgent")
+        return (home as NSString).appendingPathComponent("SkyAgent")
     }
 
     /// 确保沙盒目录存在

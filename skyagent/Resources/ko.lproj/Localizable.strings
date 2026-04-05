@@ -73,7 +73,7 @@
 "chat.approval.risk.skill_script" = "Skill 스크립트 실행";
 "chat.approval.risk.high" = "고위험";
 "chat.approval.risk.normal" = "일반 작업";
-"onboarding.welcome.title" = "MiniAgent에 오신 것을 환영합니다";
+"onboarding.welcome.title" = "SkyAgent에 오신 것을 환영합니다";
 "onboarding.welcome.subtitle" = "macOS 네이티브 에이전트 앱\nOpenAI 호환 API 기반 멀티 모델 연결 지원";
 "onboarding.welcome.note" = "시작하기 전에 AI 모델 API를 설정하세요.";
 "onboarding.welcome.cta" = "설정 시작";

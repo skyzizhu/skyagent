@@ -73,7 +73,7 @@
 "chat.approval.risk.skill_script" = "Skill 脚本执行";
 "chat.approval.risk.high" = "高风险";
 "chat.approval.risk.normal" = "常规操作";
-"onboarding.welcome.title" = "欢迎使用 MiniAgent";
+"onboarding.welcome.title" = "欢迎使用 SkyAgent";
 "onboarding.welcome.subtitle" = "一个 macOS 原生智能体应用\n支持 OpenAI 兼容 API 的多模型接入";
 "onboarding.welcome.note" = "开始之前，需要配置你的 AI 模型 API。";
 "onboarding.welcome.cta" = "开始配置";

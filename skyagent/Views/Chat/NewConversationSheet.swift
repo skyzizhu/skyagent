@@ -10,7 +10,7 @@ struct NewConversationSheet: View {
 
     private var defaultSandboxDir: String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return (home as NSString).appendingPathComponent("MiniAgent")
+        return (home as NSString).appendingPathComponent("SkyAgent")
     }
 
     var body: some View {

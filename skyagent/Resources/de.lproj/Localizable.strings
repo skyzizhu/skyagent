@@ -73,7 +73,7 @@
 "chat.approval.risk.skill_script" = "Skill-Skriptausführung";
 "chat.approval.risk.high" = "Hohes Risiko";
 "chat.approval.risk.normal" = "Standardvorgang";
-"onboarding.welcome.title" = "Willkommen bei MiniAgent";
+"onboarding.welcome.title" = "Willkommen bei SkyAgent";
 "onboarding.welcome.subtitle" = "Eine native macOS-Agent-App\nmit Unterstützung für OpenAI-kompatible Multi-Modell-APIs";
 "onboarding.welcome.note" = "Bevor du beginnst, richte die API deines KI-Modells ein.";
 "onboarding.welcome.cta" = "Einrichtung starten";

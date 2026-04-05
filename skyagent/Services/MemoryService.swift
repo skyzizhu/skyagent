@@ -27,11 +27,11 @@ class MemoryService {
     private let maxGlobalMemoryLength = 3000
 
     init() {
-        self.baseDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".openclaw/workspace-coding/MiniAgent/data")
-        self.memoryDir = baseDir.appendingPathComponent("memories")
-        self.globalMemoryURL = baseDir.appendingPathComponent("MEMORY.md")
-        self.conversationSummaryDir = baseDir.appendingPathComponent("conversation-summaries")
+        AppStoragePaths.migrateLegacyDataIfNeeded()
+        self.baseDir = AppStoragePaths.dataDir
+        self.memoryDir = AppStoragePaths.memoriesDir
+        self.globalMemoryURL = AppStoragePaths.globalMemoryFile
+        self.conversationSummaryDir = AppStoragePaths.conversationSummaryDir
         try? FileManager.default.createDirectory(at: memoryDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: conversationSummaryDir, withIntermediateDirectories: true)
     }

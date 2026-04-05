@@ -50,7 +50,7 @@ struct EmptyStateView: View {
                 .fill(Color.accentColor.opacity(0.75))
                 .frame(width: 28, height: 3)
 
-            Text("MiniAgent")
+            Text("SkyAgent")
                 .font(.system(size: 12, weight: .semibold, design: .rounded))
                 .foregroundStyle(.secondary)
         }
