@@ -27,7 +27,10 @@ enum ToolDefinition {
         case readFile = "read_file"
         case previewImage = "preview_image"
         case writeFile = "write_file"
+        case writeAssistantContentToFile = "write_assistant_content_to_file"
         case writeMultipleFiles = "write_multiple_files"
+        case movePaths = "move_paths"
+        case deletePaths = "delete_paths"
         case writeDOCX = "write_docx"
         case writeXLSX = "write_xlsx"
         case replaceDOCXSection = "replace_docx_section"
@@ -60,7 +63,7 @@ enum ToolDefinition {
             tools.append(
                 function(
                     name: ToolName.shell.rawValue,
-                    description: "在当前会话工作目录执行 shell 命令。开放模式下允许访问其他系统路径。",
+                    description: "在当前会话工作目录执行 shell 命令。开放模式下允许访问其他系统路径。仅在结构化工具无法覆盖时使用；如果任务只是统计数量、查找多少个文件、列出少量样例，请优先让命令直接返回计数和少量样例，不要输出完整超长列表。",
                     properties: [
                         "command": [
                             "type": "string",
@@ -113,10 +116,26 @@ enum ToolDefinition {
 
         tools.append(
             function(
+                name: ToolName.writeAssistantContentToFile.rawValue,
+                description: mode == .sandbox
+                    ? "将当前轮 assistant 已生成好的正文直接写入文件（自动创建目录）。这是长篇 Markdown、TXT、方案、PRD、总结等正文写入的默认首选工具，能避免把几千字正文再次塞进 tool arguments 导致等待变慢。调用这个工具前，应先在 assistant 正文里完整给出要写入的内容；工具只负责把这段正文落盘。沙盒模式下只能写入当前会话工作目录及其子目录。"
+                    : "将当前轮 assistant 已生成好的正文直接写入文件（自动创建目录）。这是长篇 Markdown、TXT、方案、PRD、总结等正文写入的默认首选工具，能避免把几千字正文再次塞进 tool arguments 导致等待变慢。调用这个工具前，应先在 assistant 正文里完整给出要写入的内容；工具只负责把这段正文落盘。默认相对当前会话工作目录解析，也可写入其他绝对路径。",
+                properties: [
+                    "path": [
+                        "type": "string",
+                        "description": "文件路径"
+                    ]
+                ],
+                required: ["path"]
+            )
+        )
+
+        tools.append(
+            function(
                 name: ToolName.writeFile.rawValue,
                 description: mode == .sandbox
-                    ? "写入文件内容（自动创建目录）。沙盒模式下只能写入当前会话工作目录及其子目录，不能写入其他系统路径。如果上一轮写后校验提示需要修复，请优先只修改被点名的单个文件，不要整轮重写无问题文件。"
-                    : "写入文件内容（自动创建目录）。默认相对当前会话工作目录解析，也可写入其他绝对路径。如果上一轮写后校验提示需要修复，请优先只修改被点名的单个文件，不要整轮重写无问题文件。",
+                    ? "写入文件内容（自动创建目录）。沙盒模式下只能写入当前会话工作目录及其子目录，不能写入其他系统路径。如果需要同时创建或修改多个文件，不要重复调用 write_file，请改用 write_multiple_files 一次完成。如果上一轮写后校验提示需要修复，请优先只修改被点名的单个文件，不要整轮重写无问题文件。这个工具更适合短内容、局部修正和小文件。对于长篇 Markdown、TXT、方案、PRD、总结等正文内容，默认必须优先使用 write_assistant_content_to_file，把当前轮 assistant 已经写好的正文直接落盘；不要把整段长文重新塞进 write_file 的 content 参数。"
+                    : "写入文件内容（自动创建目录）。默认相对当前会话工作目录解析，也可写入其他绝对路径。如果需要同时创建或修改多个文件，不要重复调用 write_file，请改用 write_multiple_files 一次完成。如果上一轮写后校验提示需要修复，请优先只修改被点名的单个文件，不要整轮重写无问题文件。这个工具更适合短内容、局部修正和小文件。对于长篇 Markdown、TXT、方案、PRD、总结等正文内容，默认必须优先使用 write_assistant_content_to_file，把当前轮 assistant 已经写好的正文直接落盘；不要把整段长文重新塞进 write_file 的 content 参数。",
                 properties: [
                     "path": [
                         "type": "string",
@@ -158,6 +177,59 @@ enum ToolDefinition {
                     ]
                 ],
                 required: ["files"]
+            )
+        )
+
+        tools.append(
+            function(
+                name: ToolName.movePaths.rawValue,
+                description: mode == .sandbox
+                    ? "批量重命名或移动当前会话工作目录中的文件/目录，也适用于批量修改文件后缀。沙盒模式下 source_path 和 destination_path 都必须位于当前会话工作目录内。需要改名、改后缀、移动文件时，优先使用这个工具，不要生成 shell 脚本。"
+                    : "批量重命名或移动文件/目录，也适用于批量修改文件后缀。默认相对当前会话工作目录解析；开放模式下也可处理其他绝对路径。需要改名、改后缀、移动文件时，优先使用这个工具，不要生成 shell 脚本。",
+                properties: [
+                    "items": [
+                        "type": "array",
+                        "description": "待移动或重命名的路径映射列表",
+                        "items": [
+                            "type": "object",
+                            "properties": [
+                                "source_path": [
+                                    "type": "string",
+                                    "description": "原路径"
+                                ],
+                                "destination_path": [
+                                    "type": "string",
+                                    "description": "目标路径"
+                                ]
+                            ],
+                            "required": ["source_path", "destination_path"]
+                        ]
+                    ],
+                    "overwrite": [
+                        "type": "boolean",
+                        "description": "目标已存在时是否覆盖"
+                    ]
+                ],
+                required: ["items"]
+            )
+        )
+
+        tools.append(
+            function(
+                name: ToolName.deletePaths.rawValue,
+                description: mode == .sandbox
+                    ? "批量删除当前会话工作目录中的文件或目录。默认会尽量移动到系统废纸篓，而不是直接永久删除。沙盒模式下所有路径都必须位于当前会话工作目录内。需要删除文件时，优先使用这个工具，不要生成 shell 脚本。"
+                    : "批量删除文件或目录。默认会尽量移动到系统废纸篓，而不是直接永久删除。开放模式下也可处理其他绝对路径。需要删除文件时，优先使用这个工具，不要生成 shell 脚本。",
+                properties: [
+                    "paths": [
+                        "type": "array",
+                        "description": "待删除路径列表",
+                        "items": [
+                            "type": "string"
+                        ]
+                    ]
+                ],
+                required: ["paths"]
             )
         )
 
@@ -838,10 +910,6 @@ enum ToolDefinition {
                     "stdin": [
                         "type": "string",
                         "description": "可选，传给脚本标准输入的文本"
-                    ],
-                    "timeout_seconds": [
-                        "type": "integer",
-                        "description": "可选，脚本超时时间，默认 20 秒，最大 60 秒"
                     ]
                 ],
                 required: ["skill_name", "path"]

@@ -21,7 +21,7 @@ struct CodeBlockView: View {
                     .padding(.vertical, 3)
                     .background(
                         Capsule()
-                            .fill(Color.accentColor.opacity(0.09))
+                            .fill(Color.accentColor.opacity(0.11))
                     )
 
                 Spacer()
@@ -36,7 +36,7 @@ struct CodeBlockView: View {
                 } label: {
                     HStack(spacing: 4) {
                         Image(systemName: copied ? "checkmark" : "doc.on.doc")
-                        Text(copied ? "已复制" : "复制")
+                        Text(copied ? L10n.tr("common.copied") : L10n.tr("common.copy"))
                     }
                     .font(.system(size: 10.5, weight: .medium, design: .rounded))
                     .foregroundStyle(Color.primary.opacity(0.72))
@@ -44,37 +44,48 @@ struct CodeBlockView: View {
                     .padding(.vertical, 5)
                     .background(
                         Capsule()
-                            .fill(Color.white.opacity(0.55))
+                            .fill(Color.primary.opacity(0.05))
                     )
                 }
                 .buttonStyle(.plain)
             }
             .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.vertical, 11)
+            .background(Color.primary.opacity(0.015))
 
             Rectangle()
-                .fill(Color.primary.opacity(0.07))
-                .frame(height: 0.7)
+                .fill(Color.primary.opacity(0.06))
+                .frame(height: 0.8)
 
             ScrollView([.horizontal, .vertical], showsIndicators: true) {
                 Text(highlightedCode)
-                    .font(.system(size: 12, weight: .regular, design: .monospaced))
-                    .lineSpacing(3)
+                    .font(.system(size: 12.5, weight: .regular, design: .monospaced))
+                    .lineSpacing(3.4)
                     .textSelection(.enabled)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 14)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 16)
                     .fixedSize(horizontal: true, vertical: true)
                     .frame(alignment: .leading)
             }
-            .frame(maxWidth: .infinity, minHeight: 72, maxHeight: 360, alignment: .leading)
+            .frame(maxWidth: .infinity, minHeight: 84, maxHeight: 400, alignment: .leading)
             .clipped()
+            .background(
+                LinearGradient(
+                    colors: [
+                        Color(nsColor: .textBackgroundColor).opacity(0.96),
+                        Color.primary.opacity(0.018)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            )
         }
         .background(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(
                     LinearGradient(
                         colors: [
-                            Color(nsColor: .textBackgroundColor).opacity(0.98),
+                            Color(nsColor: .windowBackgroundColor).opacity(0.98),
                             Color(nsColor: .controlBackgroundColor).opacity(0.94)
                         ],
                         startPoint: .topLeading,
@@ -84,9 +95,9 @@ struct CodeBlockView: View {
         )
         .overlay(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .stroke(Color.primary.opacity(0.1), lineWidth: 0.9)
+                .stroke(Color.primary.opacity(0.09), lineWidth: 0.9)
         )
-        .shadow(color: Color.black.opacity(0.035), radius: 12, y: 4)
+        .shadow(color: Color.black.opacity(0.025), radius: 12, y: 4)
     }
 
     /// 简易语法高亮：基于正则给关键字、字符串、注释上色

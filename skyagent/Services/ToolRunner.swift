@@ -18,11 +18,15 @@ class ToolRunner {
     private var allowedReadRoots: [String] = []
     private var activeSkillIDs: [String] = []
     private var activeAttachmentIDs: [String] = []
+    private var currentConversationID: UUID?
     private var cachedShellEnvironment: [String: String]?
     private var cachedDocumentPythonPath: String?
     private var cachedDocumentPythonModules: [String: Bool]?
     private let activeProcessLock = NSLock()
     private var activeProcess: Process?
+    private var latestAssistantDraft = ""
+    private let largeToolVisibleOutputLimit = 24_000
+    private let largeToolModelOutputLimit = 8_000
 
     private final class PipeCollector {
         private let lock = NSLock()
@@ -117,12 +121,42 @@ class ToolRunner {
     /// 切换到指定会话的权限设置
     func configure(for conversation: Conversation, globalSandboxDir: String, allowedReadRoots: [String] = []) {
         self.permissionMode = conversation.filePermissionMode
+        self.currentConversationID = conversation.id
         let dir = conversation.sandboxDir.isEmpty ? globalSandboxDir : conversation.sandboxDir
         self.sandboxDir = canonicalExistingPath(dir)
         self.allowedReadRoots = allowedReadRoots.map(canonicalPathForComparison)
         self.activeSkillIDs = conversation.activatedSkillIDs
         self.activeAttachmentIDs = conversation.messages.compactMap(\.attachmentID)
+        self.latestAssistantDraft = conversation.messages.last(where: { $0.role == .assistant })?.content ?? ""
         try? FileManager.default.createDirectory(atPath: sandboxDir, withIntermediateDirectories: true)
+    }
+
+    private func logExecutionEvent(
+        level: LogLevel = .info,
+        category: LogCategory,
+        event: String,
+        operationId: String?,
+        status: LogStatus? = nil,
+        durationMs: Double? = nil,
+        summary: String,
+        metadata: [String: LogValue] = [:]
+    ) {
+        let traceContext = TraceContext(
+            conversationID: currentConversationID,
+            operationID: operationId
+        )
+        Task {
+            await LoggerService.shared.log(
+                level: level,
+                category: category,
+                event: event,
+                traceContext: traceContext,
+                status: status,
+                durationMs: durationMs,
+                summary: summary,
+                metadata: metadata
+            )
+        }
     }
 
     func cancelActiveExecution() {
@@ -151,6 +185,23 @@ class ToolRunner {
                 summary: exists ? "将覆盖已有文件内容" : "将在当前会话目录创建新文件",
                 detailLines: [
                     "工具：write_file",
+                    "目标：\(path)",
+                    exists ? "影响：原文件内容会被替换" : "影响：会新增一个文件"
+                ],
+                isDestructive: exists,
+                canUndo: true
+            )
+
+        case .writeAssistantContentToFile:
+            let path = resolvePath(params["path"] as? String ?? "")
+            let exists = FileManager.default.fileExists(atPath: path)
+            return OperationPreview(
+                id: operationId,
+                toolName: name,
+                title: exists ? "确认写入助手正文并覆盖文件" : "确认将助手正文写入文件",
+                summary: exists ? "会用当前轮 assistant 正文覆盖已有文件" : "会把当前轮 assistant 正文保存为新文件",
+                detailLines: [
+                    "工具：write_assistant_content_to_file",
                     "目标：\(path)",
                     exists ? "影响：原文件内容会被替换" : "影响：会新增一个文件"
                 ],
@@ -424,55 +475,119 @@ class ToolRunner {
         }
     }
 
-    func execute(name: String, arguments: String, operationId: String, onProgress: ((String) -> Void)? = nil) -> ToolExecutionOutcome {
+    private enum PreparedExecution {
+        case ready(tool: ToolDefinition.ToolName, params: [String: Any])
+        case rejected(ToolExecutionOutcome)
+    }
+
+    func execute(
+        name: String,
+        arguments: String,
+        operationId: String,
+        assistantContentOverride: String? = nil,
+        onProgress: ((String) -> Void)? = nil
+    ) async -> ToolExecutionOutcome {
+        switch prepareExecution(name: name, arguments: arguments) {
+        case .rejected(let outcome):
+            return outcome
+        case .ready(let tool, let params):
+            if tool == .webFetch {
+                let outcome = ToolExecutionOutcome(output: await webFetch(params["url"] as? String ?? ""), operation: nil)
+                let normalized = normalizedLargeOutputOutcome(outcome, for: tool)
+                return advisedOutcome(for: normalized, tool: tool, params: params)
+            }
+            return executeBlocking(
+                name: name,
+                arguments: arguments,
+                operationId: operationId,
+                assistantContentOverride: assistantContentOverride,
+                onProgress: onProgress
+            )
+        }
+    }
+
+    func executeBlocking(
+        name: String,
+        arguments: String,
+        operationId: String,
+        assistantContentOverride: String? = nil,
+        onProgress: ((String) -> Void)? = nil
+    ) -> ToolExecutionOutcome {
+        switch prepareExecution(name: name, arguments: arguments) {
+        case .rejected(let outcome):
+            return outcome
+        case .ready(let tool, let params):
+            let outcome = executePrepared(
+                tool: tool,
+                params: params,
+                operationId: operationId,
+                assistantContentOverride: assistantContentOverride,
+                onProgress: onProgress
+            )
+            let normalized = normalizedLargeOutputOutcome(outcome, for: tool)
+            return advisedOutcome(for: normalized, tool: tool, params: params)
+        }
+    }
+
+    private func prepareExecution(name: String, arguments: String) -> PreparedExecution {
         guard let tool = ToolDefinition.ToolName(rawValue: name) else {
-            return ToolExecutionOutcome(output: "[错误] 未知工具: \(name)", operation: nil)
+            return .rejected(ToolExecutionOutcome(output: "[错误] 未知工具: \(name)", operation: nil))
         }
         guard let params = decodeParams(arguments, for: tool) else {
-            return ToolExecutionOutcome(output: argumentParsingFailureMessage(for: tool, rawArguments: arguments), operation: nil)
+            return .rejected(ToolExecutionOutcome(output: argumentParsingFailureMessage(for: tool, rawArguments: arguments), operation: nil))
         }
 
         // 危险命令检查（所有模式都生效）
         if tool == .shell {
             let cmd = params["command"] as? String ?? ""
             if permissionMode == .sandbox {
-                return advisedOutcome(
+                return .rejected(advisedOutcome(
                     for: ToolExecutionOutcome(output: "⚠️ 当前为沙盒模式，不能使用 shell 工具。请改用 read_file、write_file、list_files 等文件工具，或切换到开放模式。", operation: nil),
                     tool: tool,
                     params: params
-                )
+                ))
             }
             if let bypassMessage = shellBypassMessageIfNeeded(command: cmd) {
-                return advisedOutcome(
+                return .rejected(advisedOutcome(
                     for: ToolExecutionOutcome(output: bypassMessage, operation: nil),
                     tool: tool,
                     params: params
-                )
+                ))
             }
             if Self.isDangerous(command: cmd) {
-                return advisedOutcome(
+                return .rejected(advisedOutcome(
                     for: ToolExecutionOutcome(output: "⚠️ 操作被拒绝：该命令可能存在危险（\(cmd)）。如需执行，请修改命令后重试。", operation: nil),
                     tool: tool,
                     params: params
-                )
+                ))
             }
         }
 
         // 沙盒模式：检查路径权限
         if permissionMode == .sandbox {
             if let violation = checkSandboxViolation(tool: tool, params: params) {
-                return advisedOutcome(
+                return .rejected(advisedOutcome(
                     for: ToolExecutionOutcome(output: violation, operation: nil),
                     tool: tool,
                     params: params
-                )
+                ))
             }
         }
 
+        return .ready(tool: tool, params: params)
+    }
+
+    private func executePrepared(
+        tool: ToolDefinition.ToolName,
+        params: [String: Any],
+        operationId: String,
+        assistantContentOverride: String? = nil,
+        onProgress: ((String) -> Void)? = nil
+    ) -> ToolExecutionOutcome {
         let outcome: ToolExecutionOutcome
         switch tool {
         case .shell:
-            outcome = ToolExecutionOutcome(output: runShell(params["command"] as? String ?? "", onProgress: onProgress), operation: nil)
+            outcome = ToolExecutionOutcome(output: runShell(params["command"] as? String ?? "", operationId: operationId, onProgress: onProgress), operation: nil)
         case .readFile:
             outcome = ToolExecutionOutcome(output: readFile(params["path"] as? String ?? ""), operation: nil)
         case .previewImage:
@@ -486,9 +601,27 @@ class ToolRunner {
                 content: params["content"] as? String ?? "",
                 operationId: operationId
             )
+        case .writeAssistantContentToFile:
+            outcome = writeAssistantContentToFile(
+                params["path"] as? String ?? "",
+                assistantContent: assistantContentOverride,
+                operationId: operationId,
+                onProgress: onProgress
+            )
         case .writeMultipleFiles:
             outcome = writeMultipleFiles(
                 decodeFileBatch(params["files"]),
+                operationId: operationId
+            )
+        case .movePaths:
+            outcome = movePaths(
+                decodeMoveBatch(params["items"]),
+                overwrite: params["overwrite"] as? Bool ?? false,
+                operationId: operationId
+            )
+        case .deletePaths:
+            outcome = deletePaths(
+                (params["paths"] as? [String]) ?? [],
                 operationId: operationId
             )
         case .writeDOCX:
@@ -543,7 +676,7 @@ class ToolRunner {
                 operationId: operationId
             )
         case .webFetch:
-            outcome = ToolExecutionOutcome(output: webFetch(params["url"] as? String ?? ""), operation: nil)
+            outcome = ToolExecutionOutcome(output: "[错误] web_fetch 需要异步执行", operation: nil)
         case .listFiles:
             outcome = ToolExecutionOutcome(output: listFiles(params["path"] as? String ?? nil, recursive: params["recursive"] as? Bool ?? false), operation: nil)
         case .importFile:
@@ -606,7 +739,7 @@ class ToolRunner {
                 recursive: params["recursive"] as? Bool ?? false
             ), operation: nil)
         case .activateSkill:
-            outcome = activateSkill(named: params["name"] as? String ?? "")
+            outcome = activateSkill(named: params["name"] as? String ?? "", operationId: operationId)
         case .installSkill:
             outcome = installSkill(
                 url: params["url"] as? String,
@@ -647,12 +780,82 @@ class ToolRunner {
                 relativePath: params["path"] as? String ?? "",
                 args: params["args"] as? [String] ?? [],
                 stdin: params["stdin"] as? String,
-                timeoutSeconds: params["timeout_seconds"] as? Int ?? 240,
                 operationId: operationId,
                 onProgress: onProgress
             )
         }
-        return advisedOutcome(for: outcome, tool: tool, params: params)
+        return outcome
+    }
+
+    private func normalizedLargeOutputOutcome(
+        _ outcome: ToolExecutionOutcome,
+        for tool: ToolDefinition.ToolName
+    ) -> ToolExecutionOutcome {
+        let text = outcome.output
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !trimmed.hasPrefix("[错误]"),
+              !trimmed.hasPrefix("⚠️"),
+              text.count > largeToolVisibleOutputLimit else {
+            return outcome
+        }
+
+        let lines = text.components(separatedBy: .newlines)
+        let nonEmptyLineCount = lines.reduce(into: 0) { partialResult, line in
+            if !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                partialResult += 1
+            }
+        }
+        let visiblePreview = String(text.prefix(largeToolVisibleOutputLimit))
+        let modelPreview = String(text.prefix(largeToolModelOutputLimit))
+        let countHint = nonEmptyLineCount > 1
+            ? "若每行代表一个结果项，则总数约为 \(nonEmptyLineCount) 项。"
+            : "结果为长文本输出，请直接基于摘要继续。"
+
+        let visibleOutput = """
+        [结果过长，已截断显示]
+        工具: \(tool.rawValue)
+        总长度: \(text.count.formatted()) 个字符
+        总行数: \(nonEmptyLineCount.formatted()) 行
+        说明: 以下仅展示前 \(largeToolVisibleOutputLimit.formatted()) 个字符，完整原始结果不会继续无上限展开。
+
+        \(visiblePreview)
+        """
+
+        let modelOutput = """
+        [工具结果过长，系统已做摘要]
+        工具: \(tool.rawValue)
+        总长度: \(text.count) 个字符
+        总行数: \(nonEmptyLineCount) 行
+        \(countHint)
+        以下为前 \(largeToolModelOutputLimit) 个字符预览：
+        \(modelPreview)
+        """
+
+        let followupHint = """
+        上一个工具结果过长，系统已自动摘要。
+        请直接用自然语言继续回应用户，不要要求用户展开工具详情。
+        如果用户是在做统计、计数、查多少个、列举桌面图片这类问题，优先返回总数和少量样例，不要再次输出完整长列表。
+        """
+
+        let clippedOriginalFollowup = outcome.followupContextMessage.map {
+            String($0.prefix(largeToolModelOutputLimit))
+        }
+        let mergedFollowupContext = [clippedOriginalFollowup, followupHint]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+
+        return ToolExecutionOutcome(
+            output: visibleOutput,
+            modelOutput: modelOutput,
+            operation: outcome.operation,
+            activatedSkillID: outcome.activatedSkillID,
+            skillContextMessage: outcome.skillContextMessage,
+            followupContextMessage: mergedFollowupContext.isEmpty ? nil : mergedFollowupContext,
+            previewImagePath: outcome.previewImagePath,
+            previewImagePaths: outcome.previewImagePaths
+        )
     }
 
     private func previewImage(singlePath: String?, paths: [String]?) -> ToolExecutionOutcome {
@@ -828,6 +1031,14 @@ class ToolRunner {
     private func checkSandboxViolation(tool: ToolDefinition.ToolName, params: [String: Any]) -> String? {
         switch tool {
         case .writeFile:
+            let path = params["path"] as? String ?? ""
+            guard !path.isEmpty else { return nil }
+            let resolved = resolvePath(path)
+            if !isInSandbox(resolved) {
+                return sandboxWriteDeniedMessage(for: resolved)
+            }
+
+        case .writeAssistantContentToFile:
             let path = params["path"] as? String ?? ""
             guard !path.isEmpty else { return nil }
             let resolved = resolvePath(path)
@@ -1070,6 +1281,20 @@ class ToolRunner {
 
     // MARK: - Shell
     private func runShell(_ command: String, onProgress: ((String) -> Void)? = nil) -> String {
+        runShell(command, operationId: nil, onProgress: onProgress)
+    }
+
+    private func runShell(_ command: String, operationId: String?, onProgress: ((String) -> Void)? = nil) -> String {
+        let startedAt = Date()
+        let timeoutSeconds = 120
+        logExecutionEvent(
+            category: .shell,
+            event: "shell_started",
+            operationId: operationId,
+            status: .started,
+            summary: "开始执行 shell 命令",
+            metadata: ["command_preview": .string(LogRedactor.preview(command))]
+        )
         let process = Process()
         let pipe = Pipe()
         let errPipe = Pipe()
@@ -1090,17 +1315,93 @@ class ToolRunner {
             reportProgress("命令已启动")
             stdoutCollector.attach(to: pipe)
             stderrCollector.attach(to: errPipe)
+            let exitSignal = DispatchSemaphore(value: 0)
+            process.terminationHandler = { _ in
+                exitSignal.signal()
+            }
             try process.run()
             registerActiveProcess(process)
             defer { unregisterActiveProcess(process) }
-            process.waitUntilExit()
+            let waitResult = exitSignal.wait(timeout: .now() + .seconds(timeoutSeconds))
+            if waitResult == .timedOut {
+                reportProgress("命令执行超时，正在结束进程")
+                let terminatedGracefully = terminateProcess(process, graceSeconds: 2)
+                let output = stdoutCollector.finishReading(from: pipe)
+                let error = stderrCollector.finishReading(from: errPipe)
+                logExecutionEvent(
+                    level: .warn,
+                    category: .shell,
+                    event: "shell_timeout",
+                    operationId: operationId,
+                    status: .timeout,
+                    durationMs: Date().timeIntervalSince(startedAt) * 1000,
+                    summary: "shell 命令执行超时",
+                    metadata: LogMetadataBuilder.failure(
+                        errorKind: .timeout,
+                        recoveryAction: .abort,
+                        isUserVisible: true,
+                        extra: [
+                            "command_preview": .string(LogRedactor.preview(command)),
+                            "timeout_seconds": .int(timeoutSeconds),
+                            "termination": .string(terminatedGracefully ? "graceful" : "forced"),
+                            "stdout_preview": .string(LogRedactor.preview(output)),
+                            "stderr_preview": .string(LogRedactor.preview(error))
+                        ]
+                    )
+                )
+                return """
+                [Shell timeout]
+                Timeout: \(timeoutSeconds)s
+                Termination: \(terminatedGracefully ? "graceful" : "forced")
+                \(error)\(output)
+                """
+            }
             let output = stdoutCollector.finishReading(from: pipe)
             let error = stderrCollector.finishReading(from: errPipe)
             if process.terminationStatus != 0 {
+                logExecutionEvent(
+                    level: .warn,
+                    category: .shell,
+                    event: "shell_failed",
+                    operationId: operationId,
+                    status: .failed,
+                    durationMs: Date().timeIntervalSince(startedAt) * 1000,
+                    summary: "shell 命令执行失败",
+                    metadata: [
+                        "command_preview": .string(LogRedactor.preview(command)),
+                        "exit_code": .int(Int(process.terminationStatus)),
+                        "stderr_preview": .string(LogRedactor.preview(error))
+                    ]
+                )
                 return "Exit code: \(process.terminationStatus)\n\(error)\(output)"
             }
+            logExecutionEvent(
+                category: .shell,
+                event: "shell_completed",
+                operationId: operationId,
+                status: .succeeded,
+                durationMs: Date().timeIntervalSince(startedAt) * 1000,
+                summary: "shell 命令执行完成",
+                metadata: [
+                    "command_preview": .string(LogRedactor.preview(command)),
+                    "stdout_preview": .string(LogRedactor.preview(output))
+                ]
+            )
             return output.isEmpty ? "(无输出)" : output
         } catch {
+            logExecutionEvent(
+                level: .error,
+                category: .shell,
+                event: "shell_failed",
+                operationId: operationId,
+                status: .failed,
+                durationMs: Date().timeIntervalSince(startedAt) * 1000,
+                summary: "shell 命令执行异常",
+                metadata: [
+                    "command_preview": .string(LogRedactor.preview(command)),
+                    "error": .string(error.localizedDescription)
+                ]
+            )
             return "[错误] \(error.localizedDescription)"
         }
     }
@@ -1169,6 +1470,34 @@ class ToolRunner {
             cleanupUndoArtifacts(operationId: operationId)
             return ToolExecutionOutcome(output: "[错误] 写入失败: \(error.localizedDescription)", operation: nil)
         }
+    }
+
+    private func writeAssistantContentToFile(
+        _ path: String,
+        assistantContent: String?,
+        operationId: String,
+        onProgress: ((String) -> Void)? = nil
+    ) -> ToolExecutionOutcome {
+        let preferredContent = assistantContent?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallbackContent = latestAssistantDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let content = !(preferredContent ?? "").isEmpty ? preferredContent! : fallbackContent
+
+        guard !content.isEmpty else {
+            return ToolExecutionOutcome(
+                output: """
+                [错误] 当前没有可直接写入的 assistant 正文
+                请先在 assistant 正文中生成完整内容，再调用 write_assistant_content_to_file。
+                """,
+                operation: nil
+            )
+        }
+
+        onProgress?("已接收正文草稿，正在写入目标文件")
+        let outcome = writeFile(path, content: content, operationId: operationId)
+        if !outcome.output.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("[错误]") {
+            latestAssistantDraft = content
+        }
+        return outcome
     }
 
     private func writeMultipleFiles(_ files: [(path: String, content: String)], operationId: String) -> ToolExecutionOutcome {
@@ -1269,6 +1598,17 @@ class ToolRunner {
                 return nil
             }
             return (path, content)
+        }
+    }
+
+    private func decodeMoveBatch(_ value: Any?) -> [(sourcePath: String, destinationPath: String)] {
+        guard let items = value as? [[String: Any]] else { return [] }
+        return items.compactMap { item in
+            guard let sourcePath = item["source_path"] as? String,
+                  let destinationPath = item["destination_path"] as? String else {
+                return nil
+            }
+            return (sourcePath, destinationPath)
         }
     }
 
@@ -1375,6 +1715,108 @@ class ToolRunner {
             operationTitle: "导出目录",
             summary: "已导出 \(source) -> \(destination)",
             toolName: ToolDefinition.ToolName.exportDirectory.rawValue
+        )
+    }
+
+    private func movePaths(_ items: [(sourcePath: String, destinationPath: String)], overwrite: Bool, operationId: String) -> ToolExecutionOutcome {
+        guard !items.isEmpty else {
+            return ToolExecutionOutcome(output: "[错误] items 不能为空", operation: nil)
+        }
+
+        let fm = FileManager.default
+        var summaries: [String] = []
+
+        for item in items {
+            let source = resolvePath(item.sourcePath)
+            let destination = resolvePath(item.destinationPath)
+
+            guard fm.fileExists(atPath: source) else {
+                return ToolExecutionOutcome(output: "[错误] 源路径不存在：\(source)", operation: nil)
+            }
+
+            if permissionMode == .sandbox, (!isInSandbox(source) || !isInSandbox(destination)) {
+                return ToolExecutionOutcome(output: sandboxWriteDeniedMessage(for: destination), operation: nil)
+            }
+
+            let destinationDir = (destination as NSString).deletingLastPathComponent
+            try? fm.createDirectory(atPath: destinationDir, withIntermediateDirectories: true)
+
+            if fm.fileExists(atPath: destination) {
+                guard overwrite else {
+                    return ToolExecutionOutcome(output: "[错误] 目标路径已存在：\(destination)", operation: nil)
+                }
+                try? fm.removeItem(atPath: destination)
+            }
+
+            do {
+                try fm.moveItem(atPath: source, toPath: destination)
+                summaries.append("\((source as NSString).lastPathComponent) → \((destination as NSString).lastPathComponent)")
+            } catch {
+                return ToolExecutionOutcome(output: "[错误] 重命名失败：\(error.localizedDescription)\n源路径：\(source)\n目标路径：\(destination)", operation: nil)
+            }
+        }
+
+        let operation = FileOperationRecord(
+            id: operationId,
+            toolName: ToolDefinition.ToolName.movePaths.rawValue,
+            title: L10n.tr("chat.tool.move_paths"),
+            summary: L10n.tr("file.move.summary", items.count),
+            detailLines: summaries,
+            createdAt: Date(),
+            undoAction: nil,
+            isUndone: false
+        )
+
+        return ToolExecutionOutcome(
+            output: L10n.tr("file.move.success", items.count) + "\n" + summaries.joined(separator: "\n"),
+            operation: operation
+        )
+    }
+
+    private func deletePaths(_ paths: [String], operationId: String) -> ToolExecutionOutcome {
+        let cleanedPaths = paths
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard !cleanedPaths.isEmpty else {
+            return ToolExecutionOutcome(output: "[错误] paths 不能为空", operation: nil)
+        }
+
+        let fm = FileManager.default
+        var summaries: [String] = []
+
+        for rawPath in cleanedPaths {
+            let resolved = resolvePath(rawPath)
+            guard fm.fileExists(atPath: resolved) else {
+                return ToolExecutionOutcome(output: "[错误] 路径不存在：\(resolved)", operation: nil)
+            }
+            if permissionMode == .sandbox, !isInSandbox(resolved) {
+                return ToolExecutionOutcome(output: sandboxWriteDeniedMessage(for: resolved), operation: nil)
+            }
+
+            do {
+                var trashedURL: NSURL?
+                try fm.trashItem(at: URL(fileURLWithPath: resolved), resultingItemURL: &trashedURL)
+                summaries.append((resolved as NSString).lastPathComponent)
+            } catch {
+                return ToolExecutionOutcome(output: "[错误] 删除失败：\(error.localizedDescription)\n路径：\(resolved)", operation: nil)
+            }
+        }
+
+        let operation = FileOperationRecord(
+            id: operationId,
+            toolName: ToolDefinition.ToolName.deletePaths.rawValue,
+            title: L10n.tr("chat.tool.delete_paths"),
+            summary: L10n.tr("file.delete.summary", cleanedPaths.count),
+            detailLines: summaries.map { L10n.tr("file.delete.detail", $0) },
+            createdAt: Date(),
+            undoAction: nil,
+            isUndone: false
+        )
+
+        return ToolExecutionOutcome(
+            output: L10n.tr("file.delete.success", cleanedPaths.count) + "\n" + summaries.joined(separator: "\n"),
+            operation: operation
         )
     }
 
@@ -1871,19 +2313,25 @@ class ToolRunner {
     }
 
     // MARK: - Web Fetch
-    private func webFetch(_ urlStr: String) -> String {
+    private func webFetch(_ urlStr: String) async -> String {
         guard let url = URL(string: urlStr) else { return "[错误] 无效 URL" }
-        var result = ""
-        let sem = DispatchSemaphore(value: 0)
-        URLSession.shared.dataTask(with: url) { data, _, error in
-            defer { sem.signal() }
-            if let error = error { result = "[错误] \(error.localizedDescription)"; return }
-            guard let data = data, let html = String(data: data, encoding: .utf8) else { result = "[错误] 无法解码"; return }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+
+        do {
+            let (data, _) = try await URLSession.shared.data(for: request)
+            guard let html = String(data: data, encoding: .utf8) else {
+                return "[错误] 无法解码"
+            }
             let cleaned = html.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
-            result = String(cleaned.prefix(10000))
-        }.resume()
-        _ = sem.wait(timeout: .now() + 15)
-        return result.isEmpty ? "[超时]" : result
+            return String(cleaned.prefix(10000))
+        } catch {
+            let nsError = error as NSError
+            if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorTimedOut {
+                return "[超时]"
+            }
+            return "[错误] \(error.localizedDescription)"
+        }
     }
 
     // MARK: - Helpers
@@ -2286,7 +2734,7 @@ class ToolRunner {
         let text = ToolRunnerXMLTextExtractor.extractPlainText(from: xml)
         let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else {
-            throw NSError(domain: "MiniAgent.Export", code: 1001, userInfo: [NSLocalizedDescriptionKey: "DOCX 中没有可读文本"])
+            throw NSError(domain: "SkyAgent.Export", code: 1001, userInfo: [NSLocalizedDescriptionKey: "DOCX 中没有可读文本"])
         }
         return normalized
     }
@@ -2321,7 +2769,7 @@ class ToolRunner {
         }
 
         guard !sheets.isEmpty else {
-            throw NSError(domain: "MiniAgent.Export", code: 1002, userInfo: [NSLocalizedDescriptionKey: "XLSX 中没有可读工作表"])
+            throw NSError(domain: "SkyAgent.Export", code: 1002, userInfo: [NSLocalizedDescriptionKey: "XLSX 中没有可读工作表"])
         }
         return sheets
     }
@@ -2686,7 +3134,7 @@ class ToolRunner {
         process.waitUntilExit()
         guard process.terminationStatus == 0 else {
             let message = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            throw NSError(domain: "MiniAgent.Export", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "zip 打包失败" : message])
+            throw NSError(domain: "SkyAgent.Export", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "zip 打包失败" : message])
         }
     }
 
@@ -2702,7 +3150,7 @@ class ToolRunner {
         process.waitUntilExit()
         guard process.terminationStatus == 0 else {
             let message = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            throw NSError(domain: "MiniAgent.Export", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "读取压缩目录失败" : message])
+            throw NSError(domain: "SkyAgent.Export", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "读取压缩目录失败" : message])
         }
         let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         return output
@@ -2724,7 +3172,7 @@ class ToolRunner {
         let data = stdout.fileHandleForReading.readDataToEndOfFile()
         guard process.terminationStatus == 0 else {
             let message = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            throw NSError(domain: "MiniAgent.Export", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "读取压缩文件条目失败: \(entry)" : message])
+            throw NSError(domain: "SkyAgent.Export", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "读取压缩文件条目失败: \(entry)" : message])
         }
         return data
     }
@@ -2832,7 +3280,7 @@ class ToolRunner {
         guard let data = Data(base64Encoded: encoded),
               let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let path = object["path"] as? String else {
-            throw NSError(domain: "MiniAgent.Export", code: 1010, userInfo: [NSLocalizedDescriptionKey: "DOCX 图片占位符格式无效"])
+            throw NSError(domain: "SkyAgent.Export", code: 1010, userInfo: [NSLocalizedDescriptionKey: "DOCX 图片占位符格式无效"])
         }
 
         let width: Double?
@@ -2859,7 +3307,7 @@ class ToolRunner {
         let resolvedPath = resolvePath(input.path)
         let url = URL(fileURLWithPath: resolvedPath)
         guard FileManager.default.fileExists(atPath: resolvedPath) else {
-            throw NSError(domain: "MiniAgent.Export", code: 1011, userInfo: [NSLocalizedDescriptionKey: "图片不存在: \(resolvedPath)"])
+            throw NSError(domain: "SkyAgent.Export", code: 1011, userInfo: [NSLocalizedDescriptionKey: "图片不存在: \(resolvedPath)"])
         }
 
         let rawData = try Data(contentsOf: url)
@@ -2876,7 +3324,7 @@ class ToolRunner {
 
         guard let rep = bitmapRep,
               let pngData = rep.representation(using: .png, properties: [:]) else {
-            throw NSError(domain: "MiniAgent.Export", code: 1012, userInfo: [NSLocalizedDescriptionKey: "无法读取图片: \(resolvedPath)"])
+            throw NSError(domain: "SkyAgent.Export", code: 1012, userInfo: [NSLocalizedDescriptionKey: "无法读取图片: \(resolvedPath)"])
         }
 
         let pixelWidth = max(rep.pixelsWide, 1)
@@ -3129,13 +3577,33 @@ class ToolRunner {
         }
     }
 
-    private func activateSkill(named name: String) -> ToolExecutionOutcome {
+    private func activateSkill(named name: String, operationId: String? = nil) -> ToolExecutionOutcome {
         guard let result = skillManager.activateSkill(named: name) else {
+            logExecutionEvent(
+                level: .warn,
+                category: .skill,
+                event: "skill_activated",
+                operationId: operationId,
+                status: .failed,
+                summary: "激活 skill 失败",
+                metadata: ["skill_name": .string(name)]
+            )
             return ToolExecutionOutcome(output: "⚠️ 当前没有找到可激活的 skill：\(name)。请确认它已经安装，且名称与 catalog 中一致。")
         }
         if !activeSkillIDs.contains(result.skillID) {
             activeSkillIDs.append(result.skillID)
         }
+        logExecutionEvent(
+            category: .skill,
+            event: "skill_activated",
+            operationId: operationId,
+            status: .succeeded,
+            summary: "已激活 skill：\(name)",
+            metadata: [
+                "skill_name": .string(name),
+                "skill_id": .string(result.skillID)
+            ]
+        )
 
         return ToolExecutionOutcome(
             output: result.output,
@@ -3278,10 +3746,10 @@ class ToolRunner {
         relativePath: String,
         args: [String],
         stdin: String?,
-        timeoutSeconds: Int,
         operationId: String,
         onProgress: ((String) -> Void)? = nil
     ) -> ToolExecutionOutcome {
+        let startedAt = Date()
         let trimmedSkillName = skillName.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedPath = relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedSkillName.isEmpty else { return ToolExecutionOutcome(output: "[错误] skill_name 不能为空") }
@@ -3323,7 +3791,20 @@ class ToolRunner {
             return ToolExecutionOutcome(output: dependencyIssue)
         }
 
-        let safeTimeout = min(max(timeoutSeconds, 1), 300)
+        let safeTimeout = resolvedSkillScriptTimeout(for: skill)
+        logExecutionEvent(
+            category: .skill,
+            event: "skill_script_started",
+            operationId: operationId,
+            status: .started,
+            summary: "开始执行 skill 脚本",
+            metadata: [
+                "skill_name": .string(skill.name),
+                "script_path": .string(resource.relativePath),
+                "timeout_seconds": .int(safeTimeout),
+                "arg_count": .int(args.count)
+            ]
+        )
         let isSandboxedScriptExecution = permissionMode == .sandbox
         let sandboxNetworkWarning = isSandboxedScriptExecution && scriptMayUseNetwork(skill: skill, scriptPath: scriptPath)
             ? sandboxNetworkWarningMessage(skill: skill, resource: resource)
@@ -3364,6 +3845,10 @@ class ToolRunner {
             reportProgress("脚本准备启动：\(resource.relativePath)")
             stdoutCollector.attach(to: stdout)
             stderrCollector.attach(to: stderr)
+            let exitSignal = DispatchSemaphore(value: 0)
+            process.terminationHandler = { _ in
+                exitSignal.signal()
+            }
             try process.run()
             registerActiveProcess(process)
             defer { unregisterActiveProcess(process) }
@@ -3374,45 +3859,57 @@ class ToolRunner {
                 try? stdinPipe.fileHandleForWriting.close()
             }
 
-            let deadline = Date().addingTimeInterval(TimeInterval(safeTimeout))
-            while process.isRunning {
-                if Date() >= deadline {
-                    reportProgress("执行超时，正在尝试结束脚本")
-                    let terminatedGracefully = terminateProcess(process, graceSeconds: 2)
-                    _ = stdoutCollector.finishReading(from: stdout)
-                    _ = stderrCollector.finishReading(from: stderr)
-                    let output = """
-                    [Skill script timeout]
-                    Skill: \(skill.name)
-                    Script: \(resource.relativePath)
-                    Mode: \(permissionMode.rawValue)
-                    Timeout: \(safeTimeout)s
-                    Termination: \(terminatedGracefully ? "graceful" : "forced")
-                    """
-                    let finalOutput = [sandboxNetworkWarning, output].compactMap { $0 }.joined(separator: "\n")
-                    return ToolExecutionOutcome(
-                        output: finalOutput,
-                        operation: buildSkillScriptOperation(
-                            operationId: operationId,
-                            skill: skill,
-                            resource: resource,
-                            args: args,
-                            status: "timeout",
-                            exitCode: nil,
-                            summary: "脚本执行超时：\(resource.relativePath)",
-                            detailLines: [
-                                "Skill：\(skill.name)",
-                                "脚本：\(resource.relativePath)",
-                                "状态：timeout",
-                                "模式：\(permissionMode.rawValue)",
-                                "超时：\(safeTimeout)s",
-                                "终止方式：\(terminatedGracefully ? "graceful" : "forced")",
-                                "参数：\(normalizedArgs.isEmpty ? "(none)" : normalizedArgs.joined(separator: " "))"
-                            ]
-                        )
+            let waitResult = exitSignal.wait(timeout: .now() + .seconds(safeTimeout))
+            if waitResult == .timedOut {
+                reportProgress("执行超时，正在尝试结束脚本")
+                let terminatedGracefully = terminateProcess(process, graceSeconds: 2)
+                _ = stdoutCollector.finishReading(from: stdout)
+                _ = stderrCollector.finishReading(from: stderr)
+                logExecutionEvent(
+                    level: .warn,
+                    category: .skill,
+                    event: "skill_script_timeout",
+                    operationId: operationId,
+                    status: .timeout,
+                    durationMs: Date().timeIntervalSince(startedAt) * 1000,
+                    summary: "skill 脚本执行超时",
+                    metadata: [
+                        "skill_name": .string(skill.name),
+                        "script_path": .string(resource.relativePath),
+                        "timeout_seconds": .int(safeTimeout),
+                        "termination": .string(terminatedGracefully ? "graceful" : "forced")
+                    ]
+                )
+                let output = """
+                [Skill script timeout]
+                Skill: \(skill.name)
+                Script: \(resource.relativePath)
+                Mode: \(permissionMode.rawValue)
+                Timeout: \(safeTimeout)s
+                Termination: \(terminatedGracefully ? "graceful" : "forced")
+                """
+                let finalOutput = [sandboxNetworkWarning, output].compactMap { $0 }.joined(separator: "\n")
+                return ToolExecutionOutcome(
+                    output: finalOutput,
+                    operation: buildSkillScriptOperation(
+                        operationId: operationId,
+                        skill: skill,
+                        resource: resource,
+                        args: args,
+                        status: "timeout",
+                        exitCode: nil,
+                        summary: "脚本执行超时：\(resource.relativePath)",
+                        detailLines: [
+                            "Skill：\(skill.name)",
+                            "脚本：\(resource.relativePath)",
+                            "状态：timeout",
+                            "模式：\(permissionMode.rawValue)",
+                            "超时：\(safeTimeout)s",
+                            "终止方式：\(terminatedGracefully ? "graceful" : "forced")",
+                            "参数：\(normalizedArgs.isEmpty ? "(none)" : normalizedArgs.joined(separator: " "))"
+                        ]
                     )
-                }
-                Thread.sleep(forTimeInterval: 0.1)
+                )
             }
 
             let output = stdoutCollector.finishReading(from: stdout)
@@ -3421,6 +3918,22 @@ class ToolRunner {
             let clippedStderr = clipScriptOutput(error, limit: 20000)
             let status = process.terminationStatus == 0 ? "success" : "failure"
             reportProgress(status == "success" ? "脚本执行完成" : "脚本执行失败")
+            logExecutionEvent(
+                level: status == "success" ? .info : .warn,
+                category: .skill,
+                event: status == "success" ? "skill_script_completed" : "skill_script_failed",
+                operationId: operationId,
+                status: status == "success" ? .succeeded : .failed,
+                durationMs: Date().timeIntervalSince(startedAt) * 1000,
+                summary: status == "success" ? "skill 脚本执行完成" : "skill 脚本执行失败",
+                metadata: [
+                    "skill_name": .string(skill.name),
+                    "script_path": .string(resource.relativePath),
+                    "exit_code": .int(Int(process.terminationStatus)),
+                    "stdout_preview": .string(LogRedactor.preview(clippedStdout)),
+                    "stderr_preview": .string(LogRedactor.preview(clippedStderr))
+                ]
+            )
             let stdoutSection = clippedStdout.isEmpty ? "(无 stdout 输出)" : "--- STDOUT ---\n\(clippedStdout)"
             let stderrSection = clippedStderr.isEmpty ? "(无 stderr 输出)" : "--- STDERR ---\n\(clippedStderr)"
 
@@ -3460,8 +3973,27 @@ class ToolRunner {
                 )
             )
         } catch {
+            logExecutionEvent(
+                level: .error,
+                category: .skill,
+                event: "skill_script_failed",
+                operationId: operationId,
+                status: .failed,
+                durationMs: Date().timeIntervalSince(startedAt) * 1000,
+                summary: "skill 脚本执行异常",
+                metadata: [
+                    "skill_name": .string(trimmedSkillName),
+                    "script_path": .string(trimmedPath),
+                    "error": .string(error.localizedDescription)
+                ]
+            )
             return ToolExecutionOutcome(output: "[错误] 运行 skill 脚本失败：\(error.localizedDescription)")
         }
+    }
+
+    private func resolvedSkillScriptTimeout(for skill: AgentSkill) -> Int {
+        let declaredTimeout = skill.scriptTimeoutSeconds ?? 60
+        return min(max(declaredTimeout, 1), 300)
     }
 
     private func scriptLaunchConfiguration(for scriptPath: String) -> (executable: String, arguments: [String], displayName: String)? {

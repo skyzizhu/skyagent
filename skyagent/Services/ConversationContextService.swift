@@ -1,7 +1,7 @@
 import Foundation
 
 final class ConversationContextService {
-    static let shared = ConversationContextService()
+    nonisolated static let shared = ConversationContextService()
 
     private let attachmentStore: UploadedAttachmentStore
 
@@ -9,37 +9,49 @@ final class ConversationContextService {
         self.attachmentStore = attachmentStore
     }
 
-    func buildState(for conversation: Conversation, fallbackSandboxDir: String) -> ConversationContextState {
+    nonisolated func buildState(for conversation: Conversation, fallbackSandboxDir: String) -> ConversationContextState {
         let latestIntent = latestIntentContext(in: conversation)
-        let scopeStartDate = contextScopeStartDate(in: conversation)
+        let segment = currentTaskSegment(in: conversation)
+        let scopeStartDate = segment.startDate
         return ConversationContextState(
-            taskSummary: buildTaskSummary(conversation: conversation, intent: latestIntent),
+            taskSummary: buildTaskSummary(conversation: conversation, intent: latestIntent, scopeStartDate: scopeStartDate),
             activeTargets: normalize(buildTargets(conversation: conversation, intent: latestIntent, fallbackSandboxDir: fallbackSandboxDir, scopeStartDate: scopeStartDate), limit: 5),
-            activeConstraints: normalize(buildConstraints(conversation: conversation, intent: latestIntent, fallbackSandboxDir: fallbackSandboxDir), limit: 10),
-            activeSkillNames: normalize(SkillManager.shared.skills(withIDs: conversation.activatedSkillIDs).map(\.name), limit: 4),
+            activeConstraints: normalize(buildConstraints(conversation: conversation, intent: latestIntent, fallbackSandboxDir: fallbackSandboxDir, scopeStartDate: scopeStartDate), limit: 10),
+            activeSkillNames: normalize(conversation.activatedSkillIDs, limit: 4),
             recentResults: normalize(buildRecentResults(conversation: conversation, scopeStartDate: scopeStartDate), limit: 4),
+            recentTimeline: normalize(buildRecentTimeline(conversation: conversation, scopeStartDate: scopeStartDate), limit: 6),
             openQuestions: normalize(buildOpenQuestions(intent: latestIntent), limit: 2),
+            segmentStartedAt: segment.startDate,
+            segmentReason: segment.reason,
             updatedAt: Date()
         )
     }
 
-    private func buildTaskSummary(conversation: Conversation, intent: ParsedIntentContext?) -> String {
+    private nonisolated func buildTaskSummary(
+        conversation: Conversation,
+        intent: ParsedIntentContext?,
+        scopeStartDate: Date?
+    ) -> String {
         if let summary = intent?.summary, !summary.isEmpty {
             return summary
         }
-        guard let lastUser = conversation.messages.reversed().first(where: { $0.role == .user })?.content else {
+        let scopedMessages = scopedUserMessages(in: conversation, scopeStartDate: scopeStartDate)
+        guard !scopedMessages.isEmpty else {
             return ""
         }
-        return String(
-            lastUser
-                .components(separatedBy: .newlines)
-                .joined(separator: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .prefix(120)
-        )
+
+        let summary = scopedMessages.suffix(2)
+            .map {
+                $0.components(separatedBy: .newlines)
+                    .joined(separator: " ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            .filter { !$0.isEmpty }
+            .joined(separator: "；")
+        return String(summary.prefix(120))
     }
 
-    private func buildTargets(
+    private nonisolated func buildTargets(
         conversation: Conversation,
         intent: ParsedIntentContext?,
         fallbackSandboxDir: String,
@@ -67,15 +79,16 @@ final class ConversationContextService {
         return targets
     }
 
-    private func buildConstraints(
+    private nonisolated func buildConstraints(
         conversation: Conversation,
         intent: ParsedIntentContext?,
-        fallbackSandboxDir: String
+        fallbackSandboxDir: String,
+        scopeStartDate: Date?
     ) -> [String] {
         var constraints: [String] = []
         let effectiveSandboxDir = conversation.sandboxDir.isEmpty ? fallbackSandboxDir : conversation.sandboxDir
 
-        constraints.append("权限模式：\(conversation.filePermissionMode.displayName)")
+        constraints.append("权限模式：\(permissionModeLabel(for: conversation.filePermissionMode))")
         constraints.append("工作目录：\(effectiveSandboxDir)")
 
         switch conversation.filePermissionMode {
@@ -100,12 +113,12 @@ final class ConversationContextService {
             }
         }
 
-        constraints.append(contentsOf: extractPersistentConstraints(from: conversation))
+        constraints.append(contentsOf: extractPersistentConstraints(from: conversation, scopeStartDate: scopeStartDate))
 
         return constraints
     }
 
-    private func buildRecentResults(conversation: Conversation, scopeStartDate: Date?) -> [String] {
+    private nonisolated func buildRecentResults(conversation: Conversation, scopeStartDate: Date?) -> [String] {
         conversation.recentOperations
             .filter { scopeStartDate == nil || $0.createdAt >= scopeStartDate! }
             .prefix(3)
@@ -115,7 +128,36 @@ final class ConversationContextService {
         }
     }
 
-    private func buildOpenQuestions(intent: ParsedIntentContext?) -> [String] {
+    private nonisolated func buildRecentTimeline(conversation: Conversation, scopeStartDate: Date?) -> [String] {
+        let userEvents = conversation.messages
+            .filter { $0.role == .user && (scopeStartDate == nil || $0.timestamp >= scopeStartDate!) }
+            .suffix(4)
+            .map { message in
+                TimelineEvent(
+                    timestamp: message.timestamp,
+                    text: "用户要求：\(timelineSummary(from: message.content, limit: 70))"
+                )
+            }
+
+        let operationEvents = conversation.recentOperations
+            .filter { scopeStartDate == nil || $0.createdAt >= scopeStartDate! }
+            .prefix(4)
+            .map { operation in
+                let actionPrefix = operation.isUndone ? "已撤销" : "已执行"
+                let detail = operation.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+                let text = detail.isEmpty
+                    ? "\(actionPrefix)：\(operation.title)"
+                    : "\(actionPrefix)：\(operation.title)（\(timelineSummary(from: detail, limit: 70))）"
+                return TimelineEvent(timestamp: operation.createdAt, text: text)
+            }
+
+        return (userEvents + operationEvents)
+            .sorted { lhs, rhs in lhs.timestamp < rhs.timestamp }
+            .suffix(6)
+            .map(\.text)
+    }
+
+    private nonisolated func buildOpenQuestions(intent: ParsedIntentContext?) -> [String] {
         var questions: [String] = []
         if let clarification = intent?.clarificationQuestion, !clarification.isEmpty {
             questions.append(clarification)
@@ -126,7 +168,7 @@ final class ConversationContextService {
         return questions
     }
 
-    private func latestAttachmentID(in conversation: Conversation, scopeStartDate: Date?) -> String? {
+    private nonisolated func latestAttachmentID(in conversation: Conversation, scopeStartDate: Date?) -> String? {
         conversation.messages
             .filter { scopeStartDate == nil || $0.timestamp >= scopeStartDate! }
             .reversed()
@@ -134,7 +176,7 @@ final class ConversationContextService {
             .first
     }
 
-    private func recentOperationTargetPath(in conversation: Conversation, scopeStartDate: Date?) -> String? {
+    private nonisolated func recentOperationTargetPath(in conversation: Conversation, scopeStartDate: Date?) -> String? {
         for operation in conversation.recentOperations where scopeStartDate == nil || operation.createdAt >= scopeStartDate! {
             for line in operation.detailLines {
                 if let path = extractAbsolutePath(from: line) {
@@ -145,13 +187,13 @@ final class ConversationContextService {
         return nil
     }
 
-    private func extractAbsolutePath(from line: String) -> String? {
+    private nonisolated func extractAbsolutePath(from line: String) -> String? {
         guard let slashIndex = line.firstIndex(of: "/") else { return nil }
         let candidate = String(line[slashIndex...]).trimmingCharacters(in: .whitespacesAndNewlines)
         return candidate.isEmpty ? nil : candidate
     }
 
-    private func latestIntentContext(in conversation: Conversation) -> ParsedIntentContext? {
+    private nonisolated func latestIntentContext(in conversation: Conversation) -> ParsedIntentContext? {
         guard let content = conversation.messages.reversed().first(where: {
             $0.role == .system &&
             $0.hiddenFromTranscript == true &&
@@ -162,8 +204,8 @@ final class ConversationContextService {
         return parseIntentContext(from: content)
     }
 
-    private func extractPersistentConstraints(from conversation: Conversation) -> [String] {
-        let recentUserMessages = scopedUserMessages(in: conversation)
+    private nonisolated func extractPersistentConstraints(from conversation: Conversation, scopeStartDate: Date?) -> [String] {
+        let recentUserMessages = scopedUserMessages(in: conversation, scopeStartDate: scopeStartDate)
 
         guard !recentUserMessages.isEmpty else { return [] }
 
@@ -214,38 +256,116 @@ final class ConversationContextService {
         return constraints
     }
 
-    private func scopedUserMessages(in conversation: Conversation) -> [String] {
-        let userMessages = conversation.messages.filter { $0.role == .user }
-        guard !userMessages.isEmpty else { return [] }
-
-        if let resetIndex = userMessages.lastIndex(where: { isContextResetCue($0.content) }) {
-            return userMessages.suffix(from: resetIndex).suffix(8).map(\.content)
-        }
-
-        return userMessages.suffix(8).map(\.content)
-    }
-
-    private func contextScopeStartDate(in conversation: Conversation) -> Date? {
+    private nonisolated func scopedUserMessages(in conversation: Conversation, scopeStartDate: Date?) -> [String] {
         conversation.messages
-            .filter { $0.role == .user }
-            .last(where: { isContextResetCue($0.content) })?
-            .timestamp
+            .filter { $0.role == .user && (scopeStartDate == nil || $0.timestamp >= scopeStartDate!) }
+            .suffix(8)
+            .map(\.content)
     }
 
-    private func isContextResetCue(_ text: String) -> Bool {
+    private nonisolated func isContextResetCue(_ text: String) -> Bool {
         let cues = [
             "换一个任务", "换个任务", "重新开始", "重新来", "换一个文件", "换个文件",
-            "先不看这个", "先不管这个", "忽略前面", "不看前面的", "另一个任务", "新的任务"
+            "先不看这个", "先不管这个", "忽略前面", "不看前面的", "另一个任务", "新的任务",
+            "换到另一个", "切到另一个", "看下另一个", "处理另一个", "再开一个任务"
         ]
         return cues.contains(where: { text.localizedCaseInsensitiveContains($0) })
     }
 
-    private func extractImageRatio(from text: String) -> String? {
+    private nonisolated func currentTaskSegment(in conversation: Conversation) -> TaskSegmentBoundary {
+        let userMessages = conversation.messages.filter { $0.role == .user }
+        guard !userMessages.isEmpty else {
+            return TaskSegmentBoundary(startDate: nil, reason: nil)
+        }
+
+        var segmentStartDate: Date?
+        var segmentReason: String?
+        var currentFocusSignals = Set<String>()
+
+        for (index, message) in userMessages.enumerated() {
+            let content = normalizedContent(message.content)
+            let focusSignals = extractFocusSignals(from: content)
+
+            if isContextResetCue(content) {
+                segmentStartDate = message.timestamp
+                segmentReason = "explicit_reset"
+                currentFocusSignals = focusSignals
+                continue
+            }
+
+            guard index > 0 else {
+                currentFocusSignals = focusSignals
+                continue
+            }
+
+            if isLikelyTaskPivot(content, currentFocusSignals: currentFocusSignals, nextFocusSignals: focusSignals) {
+                segmentStartDate = message.timestamp
+                segmentReason = "focus_shift"
+                currentFocusSignals = focusSignals
+                continue
+            }
+
+            currentFocusSignals.formUnion(focusSignals)
+        }
+
+        return TaskSegmentBoundary(startDate: segmentStartDate, reason: segmentReason)
+    }
+
+    private nonisolated func isLikelyTaskPivot(
+        _ text: String,
+        currentFocusSignals: Set<String>,
+        nextFocusSignals: Set<String>
+    ) -> Bool {
+        let lowercased = text.lowercased()
+        let pivotCues = [
+            "另外", "另一个", "顺便", "接下来", "再处理", "再看", "换到", "切到", "改看", "然后看下"
+        ]
+        let hasPivotCue = pivotCues.contains(where: { lowercased.contains($0) })
+        let changedFocus = !nextFocusSignals.isEmpty &&
+            !currentFocusSignals.isEmpty &&
+            currentFocusSignals.isDisjoint(with: nextFocusSignals)
+        let explicitObjectCue = text.contains("目录") || text.contains("文件") || text.contains("项目") || text.contains("仓库")
+        return changedFocus && (hasPivotCue || explicitObjectCue)
+    }
+
+    private nonisolated func extractFocusSignals(from text: String) -> Set<String> {
+        var signals = Set<String>()
+
+        let nsText = text as NSString
+        if let pathRegex = try? NSRegularExpression(pattern: #"/[^\s\"\n，。；、,]+"#) {
+            let range = NSRange(location: 0, length: nsText.length)
+            for match in pathRegex.matches(in: text, range: range) {
+                signals.insert(nsText.substring(with: match.range).lowercased())
+            }
+        }
+
+        if let fileRegex = try? NSRegularExpression(pattern: #"[A-Za-z0-9_\-]+\.[A-Za-z0-9]{1,8}"#) {
+            let range = NSRange(location: 0, length: nsText.length)
+            for match in fileRegex.matches(in: text, range: range) {
+                signals.insert(nsText.substring(with: match.range).lowercased())
+            }
+        }
+
+        return signals
+    }
+
+    private nonisolated func normalizedContent(_ text: String) -> String {
+        text
+            .components(separatedBy: .newlines)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private nonisolated func timelineSummary(from text: String, limit: Int) -> String {
+        String(normalizedContent(text).prefix(limit))
+    }
+
+    private nonisolated func extractImageRatio(from text: String) -> String? {
         let patterns = ["16:9", "9:16", "4:3", "3:4", "1:1", "21:9"]
         return patterns.first(where: { text.localizedCaseInsensitiveContains($0) })
     }
 
-    private func extractResolution(from lowercasedText: String) -> String? {
+    private nonisolated func extractResolution(from lowercasedText: String) -> String? {
         if lowercasedText.contains("4k") {
             return "4K"
         }
@@ -261,7 +381,7 @@ final class ConversationContextService {
         return nil
     }
 
-    private func extractExplicitDirectory(from text: String) -> String? {
+    private nonisolated func extractExplicitDirectory(from text: String) -> String? {
         let nsText = text as NSString
         let regex = try? NSRegularExpression(pattern: #"/[^\s\"\n，。；、,]+"#)
         let range = NSRange(location: 0, length: nsText.length)
@@ -274,7 +394,7 @@ final class ConversationContextService {
         return path
     }
 
-    private func parseIntentContext(from text: String) -> ParsedIntentContext {
+    private nonisolated func parseIntentContext(from text: String) -> ParsedIntentContext {
         let lines = text.components(separatedBy: .newlines)
         var context = ParsedIntentContext()
 
@@ -297,7 +417,16 @@ final class ConversationContextService {
         return context
     }
 
-    private func parseArguments(from raw: String) -> [String: String] {
+    private nonisolated func permissionModeLabel(for mode: FilePermissionMode) -> String {
+        switch mode {
+        case .sandbox:
+            return "沙盒模式"
+        case .open:
+            return "开放模式"
+        }
+    }
+
+    private nonisolated func parseArguments(from raw: String) -> [String: String] {
         var arguments: [String: String] = [:]
         for pair in raw.components(separatedBy: ", ") {
             let parts = pair.components(separatedBy: "=")
@@ -310,13 +439,13 @@ final class ConversationContextService {
         return arguments
     }
 
-    private func value(in line: String, prefix: String) -> String? {
+    private nonisolated func value(in line: String, prefix: String) -> String? {
         guard line.hasPrefix(prefix) else { return nil }
         let value = String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? nil : value
     }
 
-    private func normalize(_ items: [String], limit: Int) -> [String] {
+    private nonisolated func normalize(_ items: [String], limit: Int) -> [String] {
         var seen = Set<String>()
         var result: [String] = []
 
@@ -332,11 +461,37 @@ final class ConversationContextService {
     }
 }
 
-private struct ParsedIntentContext {
+private struct ParsedIntentContext: Sendable {
     var summary: String?
     var targetPath: String?
     var referencedAttachmentID: String?
     var plannedArguments: [String: String] = [:]
     var clarificationQuestion: String?
     var writeConfirmationQuestion: String?
+
+    nonisolated init(
+        summary: String? = nil,
+        targetPath: String? = nil,
+        referencedAttachmentID: String? = nil,
+        plannedArguments: [String: String] = [:],
+        clarificationQuestion: String? = nil,
+        writeConfirmationQuestion: String? = nil
+    ) {
+        self.summary = summary
+        self.targetPath = targetPath
+        self.referencedAttachmentID = referencedAttachmentID
+        self.plannedArguments = plannedArguments
+        self.clarificationQuestion = clarificationQuestion
+        self.writeConfirmationQuestion = writeConfirmationQuestion
+    }
+}
+
+private struct TaskSegmentBoundary: Sendable {
+    let startDate: Date?
+    let reason: String?
+}
+
+private struct TimelineEvent {
+    let timestamp: Date
+    let text: String
 }

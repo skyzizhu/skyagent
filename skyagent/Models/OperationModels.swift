@@ -34,6 +34,7 @@ struct FileOperationRecord: Identifiable, Codable {
 
 struct ToolExecutionOutcome {
     let output: String
+    let modelOutput: String?
     let operation: FileOperationRecord?
     let activatedSkillID: String?
     let skillContextMessage: String?
@@ -43,6 +44,7 @@ struct ToolExecutionOutcome {
 
     init(
         output: String,
+        modelOutput: String? = nil,
         operation: FileOperationRecord? = nil,
         activatedSkillID: String? = nil,
         skillContextMessage: String? = nil,
@@ -51,6 +53,7 @@ struct ToolExecutionOutcome {
         previewImagePaths: [String]? = nil
     ) {
         self.output = output
+        self.modelOutput = modelOutput
         self.operation = operation
         self.activatedSkillID = activatedSkillID
         self.skillContextMessage = skillContextMessage

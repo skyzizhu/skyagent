@@ -142,7 +142,10 @@ struct OnboardingView: View {
             systemPrompt: viewModel.settings.systemPrompt,
             maxTokens: viewModel.settings.maxTokens,
             temperature: viewModel.settings.temperature,
-            sandboxDir: viewModel.settings.sandboxDir
+            sandboxDir: viewModel.settings.sandboxDir,
+            themePreference: viewModel.settings.themePreference,
+            languagePreference: viewModel.settings.languagePreference,
+            requireCommandReturnToSend: viewModel.settings.requireCommandReturnToSend
         )
         viewModel.saveSettings(settings)
         withAnimation(.spring(response: 0.4)) { step = 2 }

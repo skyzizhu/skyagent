@@ -7,10 +7,11 @@ struct MainContentView: View {
     var body: some View {
         NavigationSplitView {
             SidebarView(viewModel: appState.sidebarVM)
-                .frame(minWidth: 220)
+                .frame(minWidth: 250, idealWidth: 286, maxWidth: 340)
         } detail: {
             ChatView(viewModel: appState.chatVM)
         }
+        .navigationSplitViewStyle(.balanced)
         .onAppear {
             WindowPersistence.shared.restore()
             hideWindowTitle()

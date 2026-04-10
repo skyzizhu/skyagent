@@ -14,11 +14,11 @@ struct OperationSummaryView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Label("最近操作", systemImage: "checklist")
+                Label(L10n.tr("chat.summary.recent_operations"), systemImage: "checklist")
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text("最多展示 5 条")
+                Text(L10n.tr("chat.summary.max_items", displayedOperations.count))
                     .font(.system(size: 10, weight: .medium, design: .rounded))
                     .foregroundStyle(.tertiary)
             }
@@ -96,10 +96,32 @@ private struct OperationRowView: View {
     let onReveal: (FileOperationRecord) -> Void
     let onUndo: (String) -> Void
 
+    private let targetPrefixes = ["目标：", "目標：", "Target: ", "Cible : ", "Ziel: ", "対象：", "대상: "]
+    private let metadataPrefixKeys: [(raw: String, localized: String)] = [
+        ("格式：", "chat.summary.badge.format"),
+        ("章節：", "chat.summary.badge.section"),
+        ("章节：", "chat.summary.badge.section"),
+        ("新章節：", "chat.summary.badge.new_section"),
+        ("新章节：", "chat.summary.badge.new_section"),
+        ("工作表：", "chat.summary.badge.sheet"),
+        ("單元格：", "chat.summary.badge.cell"),
+        ("单元格：", "chat.summary.badge.cell"),
+        ("插入位置：", "chat.summary.badge.insert_position"),
+        ("新增行數：", "chat.summary.badge.rows_added"),
+        ("新增行数：", "chat.summary.badge.rows_added")
+    ]
+
     private var targetPath: String? {
-        operation.detailLines.first(where: { $0.hasPrefix("目标：") })?
-            .replacingOccurrences(of: "目标：", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let line = operation.detailLines.first(where: { detailLine in
+            targetPrefixes.contains { detailLine.hasPrefix($0) }
+        }) else { return nil }
+
+        for prefix in targetPrefixes where line.hasPrefix(prefix) {
+            return line
+                .replacingOccurrences(of: prefix, with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return nil
     }
 
     private var targetFileName: String? {
@@ -108,10 +130,12 @@ private struct OperationRowView: View {
     }
 
     private var metadataBadges: [String] {
-        let keys = ["格式：", "章节：", "新章节：", "工作表：", "单元格：", "插入位置：", "新增行数："]
         let extracted = operation.detailLines.compactMap { line -> String? in
-            guard keys.contains(where: { line.hasPrefix($0) }) else { return nil }
-            return line
+            guard let match = metadataPrefixKeys.first(where: { line.hasPrefix($0.raw) }) else { return nil }
+            let value = line
+                .replacingOccurrences(of: match.raw, with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return "\(L10n.tr(match.localized)): \(value)"
         }
         let time = RelativeDateTimeFormatter().localizedString(for: operation.createdAt, relativeTo: Date())
         return extracted + [time]
@@ -149,7 +173,7 @@ private struct OperationRowView: View {
 
             HStack(spacing: 6) {
                 if targetPath != nil {
-                    Button("定位") {
+                    Button(L10n.tr("chat.operation.reveal_short")) {
                         onReveal(operation)
                     }
                     .buttonStyle(.plain)
@@ -157,7 +181,7 @@ private struct OperationRowView: View {
                     .foregroundStyle(.secondary)
                 }
 
-                Button("详情") {
+                Button(L10n.tr("chat.summary.details")) {
                     onInspect(operation)
                 }
                 .buttonStyle(.plain)
@@ -165,11 +189,11 @@ private struct OperationRowView: View {
                 .foregroundStyle(.secondary)
 
                 if operation.isUndone {
-                    Text("已撤销")
+                    Text(L10n.tr("chat.operation.undone"))
                         .font(.system(size: 10.5, weight: .medium, design: .rounded))
                         .foregroundStyle(.secondary)
                 } else if operation.undoAction != nil {
-                    Button("撤销") {
+                    Button(L10n.tr("chat.operation.undo_short")) {
                         onUndo(operation.id)
                     }
                     .buttonStyle(.plain)
@@ -184,7 +208,12 @@ private struct OperationRowView: View {
     private var iconColor: Color {
         if operation.isUndone { return .secondary }
         if operation.toolName == ToolDefinition.ToolName.runSkillScript.rawValue,
-           operation.summary.contains("失败") || operation.summary.contains("超时") {
+           operation.summary.localizedCaseInsensitiveContains("失败") ||
+           operation.summary.localizedCaseInsensitiveContains("失敗") ||
+           operation.summary.localizedCaseInsensitiveContains("timeout") ||
+           operation.summary.localizedCaseInsensitiveContains("timed out") ||
+           operation.summary.localizedCaseInsensitiveContains("超时") ||
+           operation.summary.localizedCaseInsensitiveContains("超時") {
             return .orange
         }
         return .blue

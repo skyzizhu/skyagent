@@ -1,6 +1,9 @@
 import Foundation
 
 enum FileIntentKind: String {
+    case createFiles
+    case renameFiles
+    case deleteFiles
     case buildWebPage
     case updateSpreadsheetCell
     case appendSpreadsheetRows
@@ -16,6 +19,12 @@ enum FileIntentKind: String {
 
     var displayName: String {
         switch self {
+        case .createFiles:
+            return "创建文件"
+        case .renameFiles:
+            return "重命名文件"
+        case .deleteFiles:
+            return "删除文件"
         case .buildWebPage:
             return "生成网页工程"
         case .updateSpreadsheetCell:
@@ -265,12 +274,34 @@ final class FileIntentResolver {
             "html+css+js", "html css js", "分开写", "分别写", "不要写到一块", "不要写在一起",
             "拆成三个文件", "三个文件", "index.html", "styles.css", "script.js"
         ])
+        let hasFileSurface = containsAny(normalized, [
+            "文件", "文档", "表格", "工作表", "sheet", "章节", "附件", "pdf", "docx", "xlsx",
+            "csv", ".md", ".txt", ".json", ".yaml", ".yml", ".html", ".css", ".js"
+        ])
+        let hasGenericFileReference = containsAny(normalized, [
+            "这个文件", "那个文件", "这份文件", "这个文档", "那个文档", "这个表", "那个表", "这个附件", "上传的"
+        ])
         let hasExcel = containsAny(normalized, ["excel", "xlsx", "表格", "工作表", "sheet", "单元格", "这个表", "那个表", "刚才那个表", "上一个表", "上一版表", "表的"])
         let hasWord = containsAny(normalized, ["word", "docx", "文档", "章节", "小节", "部分"])
-        let hasExport = containsAny(normalized, ["导出", "生成", "输出为", "另存为"])
+        let hasExport = containsAny(normalized, ["导出", "输出为", "另存为", "保存为", "导成", "导出成"])
         let hasRead = containsAny(normalized, ["读取", "查看", "看看", "打开", "分析", "识别"])
         let hasSummary = containsAny(normalized, ["总结", "摘要", "概括", "提炼"])
         let hasCompare = containsAny(normalized, ["对比", "比较", "diff"])
+        let hasDelete = containsAny(normalized, ["删除", "删掉", "移除", "清掉", "清空", "remove", "delete"])
+        let hasRename = containsAny(normalized, ["重命名", "改名", "改后缀", "后缀改成", "扩展名改成", "rename", "改成ini", "改成txt", "改成md", "改成json", "改成yaml", "改成yml"])
+        let hasCreate = containsAny(normalized, ["创建", "新建", "生成", "写", "做", "产出"]) && containsAny(normalized, ["文件", ".txt", ".md", ".json", ".yaml", ".yml", ".ini", ".html", ".css", ".js"])
+
+        if hasDelete {
+            return .deleteFiles
+        }
+
+        if hasRename {
+            return .renameFiles
+        }
+
+        if hasCreate && !hasWebSurface {
+            return .createFiles
+        }
 
         if hasWebSurface && (hasWebPageNouns || hasMultiFileWebIntent) {
             if containsAny(normalized, [
@@ -306,16 +337,16 @@ final class FileIntentResolver {
             }
         }
 
-        if hasExport {
+        if hasExport && (hasFileSurface || hasGenericFileReference || recentContext != nil) {
             return .exportDocument
         }
-        if hasCompare {
+        if hasCompare && (hasFileSurface || hasGenericFileReference || recentContext != nil) {
             return .compareFiles
         }
-        if hasSummary {
+        if hasSummary && (hasFileSurface || hasGenericFileReference || recentContext != nil) {
             return .summarizeDocument
         }
-        if hasRead {
+        if hasRead && (hasFileSurface || hasGenericFileReference || recentContext != nil) {
             return .readDocument
         }
 
@@ -422,6 +453,8 @@ final class FileIntentResolver {
 
         let filtered: [FileIntentCandidate]
         switch intent {
+        case .createFiles, .renameFiles, .deleteFiles, .compareFiles, .exportDocument:
+            filtered = candidates
         case .buildWebPage:
             filtered = candidates.filter { isWebCandidate($0) }
         case .updateSpreadsheetCell, .appendSpreadsheetRows, .rewriteSpreadsheet:
@@ -434,10 +467,6 @@ final class FileIntentResolver {
             } else {
                 filtered = candidates
             }
-        case .compareFiles:
-            filtered = candidates
-        case .exportDocument:
-            filtered = candidates
         case .unknown:
             filtered = []
         }
@@ -453,6 +482,12 @@ final class FileIntentResolver {
 
     private func suggestedTools(for intent: FileIntentKind, target: FileIntentCandidate?) -> [ToolDefinition.ToolName] {
         switch intent {
+        case .createFiles:
+            return [.writeMultipleFiles]
+        case .renameFiles:
+            return [.movePaths]
+        case .deleteFiles:
+            return [.deletePaths]
         case .buildWebPage:
             return [.writeMultipleFiles]
         case .updateSpreadsheetCell:
@@ -530,7 +565,12 @@ final class FileIntentResolver {
                 arguments["after_section_title"] = afterTitle
             }
             return arguments
-        case .rewriteDocument, .rewriteSpreadsheet, .exportDocument, .readDocument, .summarizeDocument, .compareFiles, .unknown:
+        case .renameFiles:
+            if let targetExtension = extractTargetExtension(from: text) {
+                return ["target_extension": targetExtension]
+            }
+            return [:]
+        case .createFiles, .deleteFiles, .rewriteDocument, .rewriteSpreadsheet, .exportDocument, .readDocument, .summarizeDocument, .compareFiles, .unknown:
             return [:]
         }
     }
@@ -541,6 +581,12 @@ final class FileIntentResolver {
         }
         let targetName = target?.name ?? "未明确文件"
         switch intent {
+        case .createFiles:
+            return "用户更像是要一次创建一个或多个新文件，而不是修改现有文件。"
+        case .renameFiles:
+            return "用户更像是要重命名文件、批量改名或修改文件后缀，而不是新建一批新文件。"
+        case .deleteFiles:
+            return "用户更像是要删除已有文件，而不是生成删除脚本。"
         case .buildWebPage:
             if let targetName = target?.name {
                 return "用户更像是要围绕 \(targetName) 继续完成一个由 HTML、CSS、JS 分离的网页工程。"
@@ -578,7 +624,7 @@ final class FileIntentResolver {
         }
         if let target {
             badges.append(target.type.uppercased())
-            switch target.source {
+        switch target.source {
             case .attachment:
                 badges.append("上传附件")
             case .recentOperation:
@@ -586,6 +632,10 @@ final class FileIntentResolver {
             case .workspace:
                 badges.append("工作目录")
             }
+        }
+
+        if let targetExtension = extractTargetExtension(from: text) {
+            badges.append(".\(targetExtension)")
         }
 
         if let cellMatch = text.range(of: #"[A-Za-z]+[0-9]+"#, options: .regularExpression) {
@@ -600,6 +650,15 @@ final class FileIntentResolver {
                 return "这看起来是网页工程任务。请先确定 HTML、CSS、JS 三个关联文件，再分别写入，并确保 HTML 正确引用 CSS 和 JS。"
             }
             return "当前命中了多个相近候选文件。请先让用户确认是哪个文件，再执行写入或修改。"
+        }
+        if intent == .createFiles {
+            return "这是创建文件任务。只要涉及多个文件，就优先一次调用 write_multiple_files，不要循环调用 write_file，也不要先生成额外脚本。"
+        }
+        if intent == .renameFiles {
+            return "这是重命名/改后缀任务。优先一次调用 move_paths 批量改名，不要创建新的副本文件，也不要生成 shell 脚本。"
+        }
+        if intent == .deleteFiles {
+            return "这是删除任务。优先一次调用 delete_paths 删除目标文件，不要生成 delete.sh 之类的辅助脚本。"
         }
         if intent == .buildWebPage {
             return "这是网页工程任务。先用一句短计划确认 HTML、CSS、JS 三个关联文件，再优先一次写入；如果后面只坏了一个文件，就只精确修那个文件。"
@@ -620,6 +679,15 @@ final class FileIntentResolver {
         guard ambiguousCandidates.isEmpty else { return nil }
 
         switch intent {
+        case .createFiles:
+            return "将优先一次写入全部目标文件；如果有多个文件，会先用 write_multiple_files，而不是逐个调用 write_file。"
+        case .renameFiles:
+            if let ext = plannedArguments["target_extension"], !ext.isEmpty {
+                return "将优先一次调用 move_paths，把命中的文件批量改成 .\(ext) 后缀，而不是重新创建新文件。"
+            }
+            return "将优先一次调用 move_paths 直接重命名目标文件，不会额外生成脚本。"
+        case .deleteFiles:
+            return "将优先一次调用 delete_paths 删除目标文件，并尽量移动到废纸篓，而不是生成删除脚本。"
         case .buildWebPage:
             let html = plannedArguments["html_path"] ?? "index.html"
             let css = plannedArguments["css_path"] ?? "styles.css"
@@ -719,6 +787,12 @@ final class FileIntentResolver {
         }
 
         switch intent {
+        case .createFiles:
+            return "你是要创建哪几个文件？"
+        case .renameFiles:
+            return "你是要重命名 \(joinedNames) 里的哪一些文件？"
+        case .deleteFiles:
+            return "你是要删除 \(joinedNames) 里的哪一些文件？"
         case .buildWebPage:
             return "你是要继续修改 \(joinedNames) 这几个网页文件中的哪一个？"
         case .updateSpreadsheetCell, .appendSpreadsheetRows, .rewriteSpreadsheet:
@@ -745,6 +819,12 @@ final class FileIntentResolver {
         guard shouldRequireWriteConfirmation(for: intent, text: text) else { return nil }
 
         switch intent {
+        case .createFiles:
+            return nil
+        case .deleteFiles:
+            return "我准备删除现有文件 \(target.name)，要继续吗？"
+        case .renameFiles:
+            return "我准备重命名现有文件 \(target.name)，要继续吗？"
         case .buildWebPage:
             return "我准备直接覆盖现有网页文件 \(target.name) 的内容，要继续吗？"
         case .rewriteDocument:
@@ -771,6 +851,12 @@ final class FileIntentResolver {
         }
 
         switch intent {
+        case .deleteFiles:
+            return true
+        case .renameFiles:
+            return containsAny(normalized, ["这个", "那个", "刚才", "上一个", "上一版", "现有", "原来", "已有", "批量"])
+        case .createFiles:
+            return false
         case .buildWebPage:
             return containsAny(normalized, ["这个", "那个", "刚才", "上一个", "上一版", "现有", "原来", "已有", "重写", "覆盖", "改写"])
         case .rewriteDocument, .rewriteSpreadsheet:
@@ -780,6 +866,26 @@ final class FileIntentResolver {
         case .exportDocument, .readDocument, .summarizeDocument, .compareFiles, .unknown:
             return false
         }
+    }
+
+    private func extractTargetExtension(from text: String) -> String? {
+        let patterns = [
+            #"改成\s*([A-Za-z0-9]+)\s*后缀"#,
+            #"后缀改成\s*([A-Za-z0-9]+)"#,
+            #"扩展名改成\s*([A-Za-z0-9]+)"#,
+            #"改成\s*\.?([A-Za-z0-9]+)"#
+        ]
+
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { continue }
+            let range = NSRange(location: 0, length: (text as NSString).length)
+            guard let match = regex.firstMatch(in: text, range: range), match.numberOfRanges > 1 else { continue }
+            let value = (text as NSString).substring(with: match.range(at: 1)).lowercased()
+            if !value.isEmpty, value.count <= 10 {
+                return value
+            }
+        }
+        return nil
     }
 
     private func extractCellReference(from text: String) -> String? {
@@ -1012,6 +1118,8 @@ final class FileIntentResolver {
         guard containsAny(normalizedText, continuationPhrases) else { return false }
 
         switch intent {
+        case .createFiles, .renameFiles, .deleteFiles:
+            return true
         case .buildWebPage,
              .updateSpreadsheetCell, .appendSpreadsheetRows, .rewriteSpreadsheet,
              .replaceDocumentSection, .insertDocumentSection, .rewriteDocument:

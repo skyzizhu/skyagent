@@ -57,9 +57,15 @@ struct AgentSkill: Identifiable, Codable, Hashable {
     let id: String
     let name: String
     let description: String
+    let displayName: String?
+    let shortDescription: String?
+    let defaultPrompt: String?
     let aliases: [String]
     let triggerHints: [String]
+    let antiTriggerHints: [String]
+    let allowImplicitInvocation: Bool
     let requiredEnvironmentVariables: [String]
+    let scriptTimeoutSeconds: Int?
     let skillDirectory: String
     let skillFile: String
     let sourceType: AgentSkillSourceType
@@ -79,4 +85,27 @@ struct SkillActivationResult {
     let output: String
     let skillID: String
     let contextMessage: String
+}
+
+enum SkillMatchSource: String, Equatable {
+    case name
+    case alias
+    case displayName
+    case description
+    case shortDescription
+    case defaultPrompt
+    case triggerHint
+    case antiTriggerHint
+}
+
+struct SkillMatchSignal: Equatable {
+    let source: SkillMatchSource
+    let phrase: String
+}
+
+struct SkillMatchCandidate: Equatable {
+    let skill: AgentSkill
+    let score: Int
+    let matchedSignals: [SkillMatchSignal]
+    let blockedSignals: [SkillMatchSignal]
 }

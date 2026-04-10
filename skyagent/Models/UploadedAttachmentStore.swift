@@ -48,9 +48,9 @@ struct UploadedAttachmentDocument: Codable {
 }
 
 final class UploadedAttachmentStore {
-    static let shared = UploadedAttachmentStore()
+    nonisolated static let shared = UploadedAttachmentStore()
 
-    private let baseDir: URL
+    nonisolated private let baseDir: URL
 
     init(baseDir: URL? = nil) {
         AppStoragePaths.migrateLegacyDataIfNeeded()
@@ -59,13 +59,23 @@ final class UploadedAttachmentStore {
     }
 
     @discardableResult
-    func saveDocument(
+    nonisolated func saveDocument(
         fileName: String,
         typeName: String,
         detail: String,
         chunks: [UploadedAttachmentChunk],
         segments: [UploadedAttachmentSegment] = []
     ) throws -> UploadedAttachmentDocument {
+        struct PersistedDocument: Codable {
+            let id: String
+            let fileName: String
+            let typeName: String
+            let detail: String
+            let createdAt: Date
+            let chunks: [UploadedAttachmentChunk]
+            let segments: [UploadedAttachmentSegment]
+        }
+
         let document = UploadedAttachmentDocument(
             id: UUID().uuidString,
             fileName: fileName,
@@ -75,15 +85,22 @@ final class UploadedAttachmentStore {
             chunks: chunks,
             segments: segments
         )
-        let data = try JSONEncoder().encode(document)
+        let persisted = PersistedDocument(
+            id: document.id,
+            fileName: document.fileName,
+            typeName: document.typeName,
+            detail: document.detail,
+            createdAt: document.createdAt,
+            chunks: document.chunks,
+            segments: document.segments
+        )
+        let data = try JSONEncoder().encode(persisted)
         try data.write(to: fileURL(for: document.id), options: .atomic)
         return document
     }
 
-    func loadDocument(id: String) -> UploadedAttachmentDocument? {
-        let url = fileURL(for: id)
-        guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? JSONDecoder().decode(UploadedAttachmentDocument.self, from: data)
+    nonisolated func loadDocument(id: String) -> UploadedAttachmentDocument? {
+        loadDocument(at: fileURL(for: id))
     }
 
     func chunk(attachmentID: String, index: Int) -> UploadedAttachmentChunk? {
@@ -120,13 +137,9 @@ final class UploadedAttachmentStore {
     }
 
     func allDocuments() -> [UploadedAttachmentDocument] {
-        let fileURLs = (try? FileManager.default.contentsOfDirectory(at: baseDir, includingPropertiesForKeys: nil)) ?? []
-        return fileURLs
+        documentURLs()
             .filter { $0.pathExtension == "json" }
-            .compactMap { url in
-                guard let data = try? Data(contentsOf: url) else { return nil }
-                return try? JSONDecoder().decode(UploadedAttachmentDocument.self, from: data)
-            }
+            .compactMap(loadDocument(at:))
     }
 
     @discardableResult
@@ -144,28 +157,84 @@ final class UploadedAttachmentStore {
     @discardableResult
     func cleanupOrphanedDocuments(retaining retainedIDs: Set<String>, olderThan age: TimeInterval? = nil) -> [String] {
         let cutoffDate = age.map { Date().addingTimeInterval(-$0) }
-        let orphaned = allDocuments().filter { document in
-            guard !retainedIDs.contains(document.id) else { return false }
+        var deletedIDs: [String] = []
+
+        for url in documentURLs().filter({ $0.pathExtension == "json" }) {
+            let id = url.deletingPathExtension().lastPathComponent
+            guard !retainedIDs.contains(id) else { continue }
+
             if let cutoffDate {
-                return document.createdAt < cutoffDate
+                if let fileDate = documentTimestamp(for: url), fileDate >= cutoffDate {
+                    continue
+                }
+                if documentTimestamp(for: url) == nil,
+                   let document = loadDocument(at: url),
+                   document.createdAt >= cutoffDate {
+                    continue
+                }
             }
-            return true
+
+            if deleteDocument(at: url) {
+                deletedIDs.append(id)
+            }
         }
 
-        var deletedIDs: [String] = []
-        for document in orphaned {
-            if deleteDocument(id: document.id) {
-                deletedIDs.append(document.id)
-            }
-        }
         return deletedIDs
     }
 
-    private func fileURL(for id: String) -> URL {
+    nonisolated private func fileURL(for id: String) -> URL {
         baseDir.appendingPathComponent("\(id).json")
     }
 
-    private func normalize(_ text: String) -> String {
+    nonisolated private func documentURLs() -> [URL] {
+        (try? FileManager.default.contentsOfDirectory(
+            at: baseDir,
+            includingPropertiesForKeys: [.contentModificationDateKey, .creationDateKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+    }
+
+    nonisolated private func loadDocument(at url: URL) -> UploadedAttachmentDocument? {
+        struct PersistedDocument: Codable {
+            let id: String
+            let fileName: String
+            let typeName: String
+            let detail: String
+            let createdAt: Date
+            let chunks: [UploadedAttachmentChunk]
+            let segments: [UploadedAttachmentSegment]
+        }
+
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        guard let persisted = try? JSONDecoder().decode(PersistedDocument.self, from: data) else { return nil }
+        return UploadedAttachmentDocument(
+            id: persisted.id,
+            fileName: persisted.fileName,
+            typeName: persisted.typeName,
+            detail: persisted.detail,
+            createdAt: persisted.createdAt,
+            chunks: persisted.chunks,
+            segments: persisted.segments
+        )
+    }
+
+    nonisolated private func documentTimestamp(for url: URL) -> Date? {
+        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey, .creationDateKey])
+        return values?.contentModificationDate ?? values?.creationDate
+    }
+
+    @discardableResult
+    nonisolated private func deleteDocument(at url: URL) -> Bool {
+        guard FileManager.default.fileExists(atPath: url.path) else { return false }
+        do {
+            try FileManager.default.removeItem(at: url)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    nonisolated private func normalize(_ text: String) -> String {
         text
             .folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: .current)
             .replacingOccurrences(of: " ", with: "")

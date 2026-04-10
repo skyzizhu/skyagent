@@ -6,6 +6,7 @@ class SettingsViewModel: ObservableObject {
     let store: ConversationStore
     let llm: LLMService
     let skillManager: SkillManager
+    let mcpManager: MCPServerManager
 
     @Published var draftURL: String
     @Published var draftKey: String
@@ -14,13 +15,21 @@ class SettingsViewModel: ObservableObject {
     @Published var draftMaxTokens: Double
     @Published var draftTemperature: Double
     @Published var draftSandboxDir: String
+    @Published var draftThemePreference: AppThemePreference
+    @Published var draftLanguagePreference: AppLanguagePreference
+    @Published var draftRequireCommandReturnToSend: Bool
     @Published var draftProfiles: [APIProfile]
     @Published var selectedProfileId: UUID?
+    @Published private(set) var logEntries: [PersistedLogEvent] = []
+    @Published private(set) var logFiles: [URL] = []
+    @Published private(set) var isLoadingLogs = false
+    @Published private(set) var logsErrorMessage: String?
 
-    init(store: ConversationStore, llm: LLMService, skillManager: SkillManager) {
+    init(store: ConversationStore, llm: LLMService, skillManager: SkillManager, mcpManager: MCPServerManager) {
         self.store = store
         self.llm = llm
         self.skillManager = skillManager
+        self.mcpManager = mcpManager
         let s = store.settings
         self.draftURL = s.apiURL
         self.draftKey = s.apiKey
@@ -29,8 +38,12 @@ class SettingsViewModel: ObservableObject {
         self.draftMaxTokens = Double(s.maxTokens)
         self.draftTemperature = s.temperature
         self.draftSandboxDir = s.sandboxDir
+        self.draftThemePreference = s.themePreference
+        self.draftLanguagePreference = s.languagePreference
+        self.draftRequireCommandReturnToSend = s.requireCommandReturnToSend
         self.draftProfiles = s.profiles
         self.selectedProfileId = s.activeProfileId ?? s.profiles.first?.id
+        refreshLogs()
     }
 
     var settings: AppSettings { store.settings }
@@ -55,20 +68,29 @@ class SettingsViewModel: ObservableObject {
             maxTokens: Int(draftMaxTokens),
             temperature: draftTemperature,
             sandboxDir: draftSandboxDir.isEmpty ? "" : draftSandboxDir,
+            themePreference: draftThemePreference,
+            languagePreference: draftLanguagePreference,
+            requireCommandReturnToSend: draftRequireCommandReturnToSend,
             profiles: profiles,
             activeProfileId: activeProfileId
         )
         store.settings = newSettings
         newSettings.save()
         syncDraft(from: newSettings)
-        Task { await llm.updateSettings(newSettings) }
+        Task {
+            await llm.updateSettings(newSettings)
+            await mcpManager.refreshTools()
+        }
     }
 
     func saveSettings(_ s: AppSettings) {
         store.settings = s
         s.save()
         syncDraft(from: s)
-        Task { await llm.updateSettings(s) }
+        Task {
+            await llm.updateSettings(s)
+            await mcpManager.refreshTools()
+        }
     }
 
     // MARK: - Profile 管理
@@ -135,6 +157,9 @@ class SettingsViewModel: ObservableObject {
         draftMaxTokens = Double(s.maxTokens)
         draftTemperature = s.temperature
         draftSandboxDir = s.sandboxDir
+        draftThemePreference = s.themePreference
+        draftLanguagePreference = s.languagePreference
+        draftRequireCommandReturnToSend = s.requireCommandReturnToSend
         draftProfiles = s.profiles
         selectedProfileId = s.activeProfileId ?? s.profiles.first?.id
     }
@@ -166,6 +191,227 @@ class SettingsViewModel: ObservableObject {
             try skillManager.uninstallSkill(skill)
         } catch {
             skillManager.lastErrorMessage = error.localizedDescription
+        }
+    }
+
+    var mcpServers: [MCPServerConfig] { mcpManager.servers }
+
+    var mcpUserConfigURL: URL { mcpManager.userConfigURL }
+
+    var mcpProjectConfigURL: URL? { mcpManager.projectConfigURL }
+
+    func mcpState(for serverID: UUID) -> MCPServerRuntimeState {
+        mcpManager.state(for: serverID)
+    }
+
+    func mcpTools(for serverID: UUID) -> [MCPToolDescriptor] {
+        mcpManager.tools(for: serverID)
+    }
+
+    func mcpResources(for serverID: UUID) -> [MCPResourceDescriptor] {
+        mcpManager.resources(for: serverID)
+    }
+
+    func mcpPrompts(for serverID: UUID) -> [MCPPromptDescriptor] {
+        mcpManager.prompts(for: serverID)
+    }
+
+    func mcpLogs(for serverID: UUID) -> [MCPActivityLog] {
+        mcpManager.logs(for: serverID)
+    }
+
+    func editableMCPServer(_ serverID: UUID) -> MCPServerConfig? {
+        mcpManager.editableServerConfig(for: serverID)
+    }
+
+    func refreshMCPTools() {
+        Task {
+            await mcpManager.refreshTools()
+        }
+    }
+
+    func addMCPServer(
+        name: String,
+        transportKind: MCPTransportKind,
+        command: String,
+        argumentsText: String,
+        environmentText: String,
+        workingDirectory: String,
+        endpointURL: String,
+        authKind: MCPAuthorizationKind,
+        authToken: String,
+        authHeaderName: String,
+        additionalHeadersText: String,
+        toolExecutionPolicy: MCPToolExecutionPolicy,
+        allowedToolsText: String,
+        blockedToolsText: String
+    ) {
+        let arguments = lineValues(from: argumentsText)
+        let environment = keyValuePairs(from: environmentText)
+        let additionalHeaders = keyValuePairs(from: additionalHeadersText)
+        let allowedToolNames = lineValues(from: allowedToolsText)
+        let blockedToolNames = lineValues(from: blockedToolsText)
+
+        Task {
+            await mcpManager.addServer(
+                name: name,
+                transportKind: transportKind,
+                command: command,
+                arguments: arguments,
+                environment: environment,
+                workingDirectory: workingDirectory,
+                endpointURL: endpointURL,
+                authKind: authKind,
+                authToken: authToken,
+                authHeaderName: authHeaderName,
+                additionalHeaders: additionalHeaders,
+                toolExecutionPolicy: toolExecutionPolicy,
+                allowedToolNames: allowedToolNames,
+                blockedToolNames: blockedToolNames
+            )
+        }
+    }
+
+    func updateMCPServer(
+        serverID: UUID,
+        name: String,
+        transportKind: MCPTransportKind,
+        command: String,
+        argumentsText: String,
+        environmentText: String,
+        workingDirectory: String,
+        endpointURL: String,
+        authKind: MCPAuthorizationKind,
+        authToken: String,
+        authHeaderName: String,
+        additionalHeadersText: String,
+        toolExecutionPolicy: MCPToolExecutionPolicy,
+        allowedToolsText: String,
+        blockedToolsText: String
+    ) {
+        let arguments = lineValues(from: argumentsText)
+        let environment = keyValuePairs(from: environmentText)
+        let additionalHeaders = keyValuePairs(from: additionalHeadersText)
+        let allowedToolNames = lineValues(from: allowedToolsText)
+        let blockedToolNames = lineValues(from: blockedToolsText)
+
+        Task {
+            await mcpManager.updateServer(
+                serverID: serverID,
+                name: name,
+                transportKind: transportKind,
+                command: command,
+                arguments: arguments,
+                environment: environment,
+                workingDirectory: workingDirectory,
+                endpointURL: endpointURL,
+                authKind: authKind,
+                authToken: authToken,
+                authHeaderName: authHeaderName,
+                additionalHeaders: additionalHeaders,
+                toolExecutionPolicy: toolExecutionPolicy,
+                allowedToolNames: allowedToolNames,
+                blockedToolNames: blockedToolNames
+            )
+        }
+    }
+
+    func removeMCPServer(_ serverID: UUID) {
+        Task {
+            await mcpManager.removeServer(serverID)
+        }
+    }
+
+    func setMCPServerEnabled(_ isEnabled: Bool, serverID: UUID) {
+        Task {
+            await mcpManager.setEnabled(isEnabled, for: serverID)
+        }
+    }
+
+    func setMCPToolExecutionPolicy(_ policy: MCPToolExecutionPolicy, serverID: UUID) {
+        mcpManager.setToolExecutionPolicy(policy, for: serverID)
+    }
+
+    func setMCPAllowedToolNames(_ text: String, serverID: UUID) {
+        mcpManager.setAllowedToolNames(toolRuleNames(from: text), for: serverID)
+    }
+
+    func setMCPBlockedToolNames(_ text: String, serverID: UUID) {
+        mcpManager.setBlockedToolNames(toolRuleNames(from: text), for: serverID)
+    }
+
+    func mcpToolRuleSelection(for toolName: String, serverID: UUID) -> MCPToolRuleSelection {
+        mcpManager.toolRuleSelection(for: toolName, serverID: serverID)
+    }
+
+    func setMCPToolRuleSelection(_ selection: MCPToolRuleSelection, toolName: String, serverID: UUID) {
+        mcpManager.setToolRuleSelection(selection, for: toolName, serverID: serverID)
+    }
+
+    func exportMCPServers(to url: URL) throws {
+        try mcpManager.exportServers(to: url)
+    }
+
+    func importMCPServers(from url: URL) {
+        Task {
+            do {
+                _ = try await mcpManager.importServers(from: url)
+            } catch {
+                mcpManager.lastErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func toolRuleNames(from text: String) -> [String] {
+        lineValues(from: text)
+    }
+
+    private func lineValues(from text: String) -> [String] {
+        text
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private func keyValuePairs(from text: String) -> [String: String] {
+        var result: [String: String] = [:]
+        text.components(separatedBy: .newlines).forEach { line in
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  let separator = trimmed.firstIndex(of: "=") else { return }
+            let key = String(trimmed[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = String(trimmed[trimmed.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else { return }
+            result[key] = value
+        }
+        return result
+    }
+
+    func runMCPToolTest(callName: String, arguments: String) async -> String {
+        await mcpManager.testTool(callName: callName, arguments: arguments)
+    }
+
+    func runMCPResourceTest(serverID: UUID, uri: String) async -> String {
+        await mcpManager.testResource(serverID: serverID, uri: uri)
+    }
+
+    func runMCPPromptTest(serverID: UUID, name: String, arguments: String) async -> String {
+        await mcpManager.testPrompt(serverID: serverID, name: name, arguments: arguments)
+    }
+
+    func refreshLogs(limit: Int = 250) {
+        isLoadingLogs = true
+        logsErrorMessage = nil
+        Task {
+            let entries = await Task.detached(priority: .userInitiated) {
+                LogFileReader.loadRecentEvents(limit: limit)
+            }.value
+            let files = await Task.detached(priority: .utility) {
+                LogFileReader.availableLogFiles()
+            }.value
+            self.logEntries = entries
+            self.logFiles = files
+            self.isLoadingLogs = false
         }
     }
 }

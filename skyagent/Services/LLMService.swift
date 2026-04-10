@@ -28,7 +28,6 @@ actor LLMService {
         config.timeoutIntervalForRequest = Self.initialResponseTimeout
         config.timeoutIntervalForResource = Self.overallResponseTimeout
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        config.httpShouldUsePipelining = true
         self.session = URLSession(configuration: config)
     }
 
@@ -81,12 +80,14 @@ actor LLMService {
     struct ChatMessage: Codable {
         let role: String
         let content: String
+        let imageDataURL: String?
         let toolCallId: String?
         let toolCalls: [ToolCallRecord]?
 
-        init(role: String, content: String, toolCallId: String? = nil, toolCalls: [ToolCallRecord]? = nil) {
+        init(role: String, content: String, imageDataURL: String? = nil, toolCallId: String? = nil, toolCalls: [ToolCallRecord]? = nil) {
             self.role = role
             self.content = content
+            self.imageDataURL = imageDataURL
             self.toolCallId = toolCallId
             self.toolCalls = toolCalls
         }
@@ -99,7 +100,12 @@ actor LLMService {
         let toolCalls: [ToolCallRecord]
     }
 
-    func complete(messages: [ChatMessage], toolDefinitions: [[String: Any]]? = nil, onDelta: @escaping StreamCallback) async throws -> CompletionResponse {
+    func complete(
+        messages: [ChatMessage],
+        toolDefinitions: [[String: Any]]? = nil,
+        traceContext: TraceContext? = nil,
+        onDelta: @escaping StreamCallback
+    ) async throws -> CompletionResponse {
         guard !settings.apiKey.isEmpty else {
             throw LLMError.noAPIKey
         }
@@ -111,9 +117,15 @@ actor LLMService {
             throw LLMError.networkUnavailable
         }
 
+        var messagesPayload = messages.map { messagePayload(for: $0) }
+
+        if !settings.systemPrompt.isEmpty {
+            messagesPayload.insert(["role": "system", "content": settings.systemPrompt], at: 0)
+        }
+
         var body: [String: Any] = [
             "model": settings.model,
-            "messages": messages.map { messagePayload(for: $0) },
+            "messages": messagesPayload,
             "max_tokens": settings.maxTokens,
             "temperature": settings.temperature,
             "stream": true
@@ -123,104 +135,171 @@ actor LLMService {
             body["tools"] = toolDefinitions
         }
 
-        // System prompt
-        if !settings.systemPrompt.isEmpty {
-            var msgs: [[String: Any]] = [["role": "system", "content": settings.systemPrompt]]
-            let existingMsgs = body["messages"] as! [[String: Any]]
-            for msg in existingMsgs {
-                msgs.append(msg)
-            }
-            body["messages"] = msgs
-        }
-
         var request = URLRequest(url: requestURL)
         request.httpMethod = "POST"
         request.setValue("Bearer \(settings.apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         request.timeoutInterval = Self.initialResponseTimeout
+        let requestStartedAt = Date()
+        await LoggerService.shared.log(
+            category: .llm,
+            event: "llm_request_started",
+            traceContext: traceContext,
+            status: .started,
+            summary: "开始请求模型",
+            metadata: [
+                "model": .string(settings.model),
+                "message_count": .int(messages.count),
+                "payload_message_count": .int(messagesPayload.count),
+                "tool_definition_count": .int(toolDefinitions?.count ?? 0),
+                "system_prompt_length": .int(settings.systemPrompt.count)
+            ]
+        )
 
         let requestTask = Task<CompletionResponse, Error> {
-            let (bytes, response): (URLSession.AsyncBytes, URLResponse)
             do {
-                let result = try await session.bytes(for: request)
-                bytes = result.0
-                response = result.1
-                isNetworkAvailable = true
-            } catch {
-                if isConnectivityError(error) {
-                    isNetworkAvailable = false
-                    throw LLMError.networkUnavailable
-                }
-                if isTimeoutError(error) {
-                    throw LLMError.requestTimedOut
-                }
-                throw error
-            }
-
-            guard let httpResponse = response as? HTTPURLResponse else {
-                throw LLMError.invalidResponse
-            }
-
-            if httpResponse.statusCode != 200 {
-                let body = try? await String.collectingErrorBody(from: bytes)
-                if [408, 504, 524].contains(httpResponse.statusCode) {
-                    throw LLMError.requestTimedOut
-                }
-                throw LLMError.httpError(httpResponse.statusCode, body ?? "")
-            }
-
-            var toolCallsBuffer: [Int: PartialToolCall] = [:]
-            var collectedContent = ""
-
-            for try await line in bytes.lines {
-                try Task.checkCancellation()
-
-                guard line.hasPrefix("data: ") else { continue }
-                let payload = String(line.dropFirst(6))
-                if payload == "[DONE]" { break }
-
-                guard let data = payload.data(using: .utf8),
-                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let choices = json["choices"] as? [[String: Any]],
-                      let delta = choices.first?["delta"] as? [String: Any] else {
-                    continue
+                let (bytes, response): (URLSession.AsyncBytes, URLResponse)
+                do {
+                    let result = try await session.bytes(for: request)
+                    bytes = result.0
+                    response = result.1
+                    isNetworkAvailable = true
+                } catch {
+                    if isConnectivityError(error) {
+                        isNetworkAvailable = false
+                        throw LLMError.networkUnavailable
+                    }
+                    if isTimeoutError(error) {
+                        throw LLMError.requestTimedOut
+                    }
+                    throw error
                 }
 
-                if let content = delta["content"] as? String {
-                    collectedContent += content
-                    await onDelta(content)
+                guard let httpResponse = response as? HTTPURLResponse else {
+                    throw LLMError.invalidResponse
                 }
 
-                if let toolCalls = delta["tool_calls"] as? [[String: Any]] {
-                    for tc in toolCalls {
-                        let index = tc["index"] as? Int ?? 0
-                        if toolCallsBuffer[index] == nil {
-                            toolCallsBuffer[index] = PartialToolCall()
-                        }
-                        if let id = tc["id"] as? String {
-                            toolCallsBuffer[index]?.id = id
-                        }
-                        if let fn = tc["function"] as? [String: Any] {
-                            if let name = fn["name"] as? String {
-                                toolCallsBuffer[index]?.name = name
+                if httpResponse.statusCode != 200 {
+                    let body = try? await String.collectingErrorBody(from: bytes)
+                    if [408, 504, 524].contains(httpResponse.statusCode) {
+                        throw LLMError.requestTimedOut
+                    }
+                    throw LLMError.httpError(httpResponse.statusCode, body ?? "")
+                }
+
+                var toolCallsBuffer: [Int: PartialToolCall] = [:]
+                var collectedContent = ""
+                var firstResponseLogged = false
+
+                for try await line in bytes.lines {
+                    try Task.checkCancellation()
+
+                    guard line.hasPrefix("data: ") else { continue }
+                    let payload = String(line.dropFirst(6))
+                    if payload == "[DONE]" { break }
+
+                    guard let data = payload.data(using: .utf8),
+                          let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                          let choices = json["choices"] as? [[String: Any]],
+                          let delta = choices.first?["delta"] as? [String: Any] else {
+                        continue
+                    }
+
+                    if !firstResponseLogged,
+                       (delta["content"] as? String)?.isEmpty == false || delta["tool_calls"] != nil {
+                        firstResponseLogged = true
+                        await LoggerService.shared.log(
+                            category: .llm,
+                            event: "llm_first_token_received",
+                            traceContext: traceContext,
+                            status: .progress,
+                            durationMs: Date().timeIntervalSince(requestStartedAt) * 1000,
+                            summary: "收到模型首个增量"
+                        )
+                    }
+
+                    if let content = delta["content"] as? String {
+                        collectedContent += content
+                        await onDelta(content)
+                    }
+
+                    if let toolCalls = delta["tool_calls"] as? [[String: Any]] {
+                        for tc in toolCalls {
+                            let index = tc["index"] as? Int ?? 0
+                            if toolCallsBuffer[index] == nil {
+                                toolCallsBuffer[index] = PartialToolCall()
                             }
-                            if let args = fn["arguments"] as? String {
-                                toolCallsBuffer[index]?.arguments += args
+                            if let id = tc["id"] as? String {
+                                toolCallsBuffer[index]?.id = id
+                            }
+                            if let fn = tc["function"] as? [String: Any] {
+                                if let name = fn["name"] as? String {
+                                    toolCallsBuffer[index]?.name = name
+                                }
+                                if let args = fn["arguments"] as? String {
+                                    toolCallsBuffer[index]?.arguments += args
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            let toolCalls = toolCallsBuffer.keys.sorted().compactMap { idx -> ToolCallRecord? in
-                guard let tc = toolCallsBuffer[idx],
-                      let id = tc.id,
-                      let name = tc.name else { return nil }
-                return ToolCallRecord(id: id, name: name, arguments: tc.arguments)
-            }
+                let toolCalls = toolCallsBuffer.keys.sorted().compactMap { idx -> ToolCallRecord? in
+                    guard let tc = toolCallsBuffer[idx],
+                          let id = tc.id,
+                          let name = tc.name else { return nil }
+                    return ToolCallRecord(id: id, name: name, arguments: tc.arguments)
+                }
 
-            return CompletionResponse(content: collectedContent, toolCalls: toolCalls)
+                if !toolCalls.isEmpty {
+                    await LoggerService.shared.log(
+                        category: .llm,
+                        event: "llm_tool_calls_ready",
+                        traceContext: traceContext,
+                        status: .progress,
+                        durationMs: Date().timeIntervalSince(requestStartedAt) * 1000,
+                        summary: "模型已返回工具调用",
+                        metadata: [
+                            "tool_call_count": .int(toolCalls.count)
+                        ]
+                    )
+                }
+
+                await LoggerService.shared.log(
+                    category: .llm,
+                    event: "llm_stream_finished",
+                    traceContext: traceContext,
+                    status: .succeeded,
+                    durationMs: Date().timeIntervalSince(requestStartedAt) * 1000,
+                    summary: "模型流式响应完成",
+                    metadata: [
+                        "content_length": .int(collectedContent.count),
+                        "tool_call_count": .int(toolCalls.count)
+                    ]
+                )
+
+                return CompletionResponse(content: collectedContent, toolCalls: toolCalls)
+            } catch {
+                await LoggerService.shared.log(
+                    level: .error,
+                    category: .llm,
+                    event: "llm_request_failed",
+                    traceContext: traceContext,
+                    status: .failed,
+                    durationMs: Date().timeIntervalSince(requestStartedAt) * 1000,
+                    summary: "模型请求失败",
+                    metadata: LogMetadataBuilder.failure(
+                        errorKind: logErrorKind(for: error),
+                        recoveryAction: .retry,
+                        isUserVisible: false,
+                        extra: [
+                            "error_message": .string(error.localizedDescription)
+                        ]
+                    )
+                )
+                throw error
+            }
         }
 
         let taskID = UUID()
@@ -242,15 +321,53 @@ actor LLMService {
         }
     }
 
+    private func logErrorKind(for error: Error) -> LogErrorKind {
+        if case LLMError.requestTimedOut = error {
+            return .timeout
+        }
+        if case LLMError.networkUnavailable = error {
+            return .network
+        }
+        if case LLMError.connectionLost = error {
+            return .network
+        }
+        let nsError = error as NSError
+        if nsError.domain == NSURLErrorDomain {
+            switch nsError.code {
+            case NSURLErrorTimedOut:
+                return .timeout
+            case NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost, NSURLErrorCannotConnectToHost, NSURLErrorCannotFindHost:
+                return .network
+            default:
+                break
+            }
+        }
+        return .unknown
+    }
+
     func chat(messages: [ChatMessage], toolDefinitions: [[String: Any]]? = nil, onDelta: @escaping StreamCallback) async throws {
         _ = try await complete(messages: messages, toolDefinitions: toolDefinitions, onDelta: onDelta)
     }
 
     private func messagePayload(for message: ChatMessage) -> [String: Any] {
-        var payload: [String: Any] = [
-            "role": message.role,
-            "content": message.content
-        ]
+        var payload: [String: Any] = ["role": message.role]
+
+        if let imageDataURL = message.imageDataURL, message.role == "user" {
+            payload["content"] = [
+                [
+                    "type": "text",
+                    "text": message.content.isEmpty ? "请分析这张图片。" : message.content
+                ],
+                [
+                    "type": "image_url",
+                    "image_url": [
+                        "url": imageDataURL
+                    ]
+                ]
+            ]
+        } else {
+            payload["content"] = message.content
+        }
 
         if let toolCallId = message.toolCallId {
             payload["tool_call_id"] = toolCallId
@@ -280,7 +397,7 @@ actor LLMService {
             }
 
             let monitor = NWPathMonitor()
-            let queue = DispatchQueue(label: "MiniAgent.NetworkProbe")
+            let queue = DispatchQueue(label: "SkyAgent.NetworkProbe")
             let state = FinishState()
 
             let finish: @Sendable (Bool) -> Void = { value in
@@ -313,10 +430,16 @@ actor LLMService {
     }
 }
 
-private struct PartialToolCall {
+private struct PartialToolCall: Sendable {
     var id: String?
     var name: String?
     var arguments: String = ""
+
+    nonisolated init(id: String? = nil, name: String? = nil, arguments: String = "") {
+        self.id = id
+        self.name = name
+        self.arguments = arguments
+    }
 }
 
 // MARK: - Errors

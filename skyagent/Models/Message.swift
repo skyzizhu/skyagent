@@ -1,18 +1,18 @@
 import Foundation
 
-struct ToolCallRecord: Identifiable, Codable, Equatable {
+struct ToolCallRecord: Identifiable, Codable, Equatable, Sendable {
     let id: String
     let name: String
     let arguments: String
 
-    init(id: String, name: String, arguments: String) {
+    nonisolated init(id: String, name: String, arguments: String) {
         self.id = id
         self.name = name
         self.arguments = arguments
     }
 }
 
-struct ToolExecutionRecord: Identifiable, Codable, Equatable {
+struct ToolExecutionRecord: Identifiable, Codable, Equatable, Sendable {
     let id: String
     let name: String
     let arguments: String
@@ -27,6 +27,7 @@ struct Message: Identifiable, Codable, Equatable {
     var toolExecution: ToolExecutionRecord?
     var hiddenFromTranscript: Bool?
     var attachmentID: String?
+    var imageDataURL: String?
     var previewImagePath: String?
     var previewImagePaths: [String]?
 
@@ -41,6 +42,7 @@ struct Message: Identifiable, Codable, Equatable {
         toolExecution: ToolExecutionRecord? = nil,
         hiddenFromTranscript: Bool? = nil,
         attachmentID: String? = nil,
+        imageDataURL: String? = nil,
         previewImagePath: String? = nil,
         previewImagePaths: [String]? = nil
     ) {
@@ -52,6 +54,7 @@ struct Message: Identifiable, Codable, Equatable {
         self.toolExecution = toolExecution
         self.hiddenFromTranscript = hiddenFromTranscript
         self.attachmentID = attachmentID
+        self.imageDataURL = imageDataURL
         self.previewImagePath = previewImagePath
         self.previewImagePaths = previewImagePaths
     }

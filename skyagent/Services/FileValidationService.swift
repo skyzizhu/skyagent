@@ -337,7 +337,7 @@ final class FileValidationService {
         process.waitUntilExit()
         guard process.terminationStatus == 0 else {
             let message = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            throw NSError(domain: "MiniAgent.Validation", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "读取压缩目录失败" : message])
+            throw NSError(domain: "SkyAgent.Validation", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "读取压缩目录失败" : message])
         }
         let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         return output.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
@@ -356,7 +356,7 @@ final class FileValidationService {
         let data = stdout.fileHandleForReading.readDataToEndOfFile()
         guard process.terminationStatus == 0 else {
             let message = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            throw NSError(domain: "MiniAgent.Validation", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "读取压缩文件条目失败: \(entry)" : message])
+            throw NSError(domain: "SkyAgent.Validation", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "读取压缩文件条目失败: \(entry)" : message])
         }
         return data
     }

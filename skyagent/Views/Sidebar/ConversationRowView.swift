@@ -3,9 +3,6 @@ import SwiftUI
 struct ConversationRowView: View {
     let conv: Conversation
     let isCurrent: Bool
-    let onRename: () -> Void
-    let onClear: () -> Void
-    let onDelete: () -> Void
 
     @State private var isHovered = false
 
@@ -39,29 +36,31 @@ struct ConversationRowView: View {
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            RoundedRectangle(cornerRadius: 999, style: .continuous)
-                .fill(isCurrent ? Color.primary.opacity(0.78) : modeColor.opacity(isHovered ? 0.42 : 0.26))
-                .frame(width: 3, height: 34)
-                .padding(.top, 2)
-
-            VStack(alignment: .leading, spacing: 6) {
+        HStack(alignment: .top, spacing: 0) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text(conv.title)
-                    .font(.system(size: 12.5, weight: isCurrent ? .semibold : .medium, design: .rounded))
+                    .font(.system(size: 11.5, weight: isCurrent ? .semibold : .medium, design: .rounded))
                     .foregroundStyle(.primary)
-                    .lineLimit(2)
+                    .lineLimit(1)
                     .multilineTextAlignment(.leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
 
                 Text(previewText)
-                    .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                    .font(.system(size: 9, weight: .medium, design: .rounded))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
 
                 HStack(spacing: 6) {
+                    if conv.isFavorite {
+                        Image(systemName: "star.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.yellow.opacity(0.9))
+                    }
+
                     Text(modeText)
                         .font(.system(size: 9.5, weight: .semibold, design: .rounded))
                         .foregroundStyle(modeColor.opacity(0.88))
@@ -78,8 +77,8 @@ struct ConversationRowView: View {
                 }
             }
         }
-        .padding(.vertical, 9)
-        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .padding(.horizontal, 8)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(backgroundFill)
@@ -89,46 +88,36 @@ struct ConversationRowView: View {
                 .stroke(borderColor, lineWidth: 0.8)
         )
         .shadow(color: shadowColor, radius: isCurrent ? 10 : 4, x: 0, y: 2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .animation(.easeOut(duration: 0.16), value: isCurrent)
         .animation(.easeOut(duration: 0.16), value: isHovered)
         .onHover { hovering in
             isHovered = hovering
         }
-        .contextMenu {
-            Button(L10n.tr("common.rename")) {
-                onRename()
-            }
-            Button(L10n.tr("conversation.clear_messages")) {
-                onClear()
-            }
-            Divider()
-            Button(L10n.tr("common.delete"), role: .destructive) {
-                onDelete()
-            }
-        }
     }
 
     private var backgroundFill: Color {
         if isCurrent {
-            return Color.primary.opacity(0.08)
+            return Color.primary.opacity(0.075)
         }
         if isHovered {
-            return Color.primary.opacity(0.04)
+            return Color.primary.opacity(0.03)
         }
         return Color.clear
     }
 
     private var borderColor: Color {
         if isCurrent {
-            return Color.primary.opacity(0.1)
+            return Color.primary.opacity(0.09)
         }
         if isHovered {
-            return Color.primary.opacity(0.06)
+            return Color.primary.opacity(0.05)
         }
         return Color.clear
     }
 
     private var shadowColor: Color {
-        Color.black.opacity(isCurrent ? 0.035 : 0.01)
+        Color.black.opacity(isCurrent ? 0.025 : 0.008)
     }
 }

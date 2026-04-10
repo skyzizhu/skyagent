@@ -130,6 +130,8 @@ final class SkillManager: ObservableObject {
         5. 如果用户明确要求下载、安装新的 skill，请调用 install_skill；新 skill 必须安装到 ~/.skyagent/skills。
         6. 如果用户要求“下载并使用”某个 skill，安装成功后不要停下，必须继续 activate_skill，并继续用这个 skill 完成当前任务。
         7. 运行已激活 skill 的脚本时，优先使用 run_skill_script；不要自己用 shell 去 cd 到 skill 目录再手动 bash/python 执行脚本。
+        8. 如果当前请求强匹配某个 skill 的 name、description、trigger hints、default_prompt 等元数据，先 activate_skill，再继续处理任务。
+        9. 当 skill 已经能覆盖当前任务时，不要先做与 skill 无关的通用目录探索；只有在用户明确要求本地文件作为依据，或 skill 自己的说明要求读取本地文件时，才去 list_files、read_file。
         选择 skill 时，优先激活描述最具体、触发示例最贴近当前需求、名字最明确匹配用户说法的那一个。
         不要重复激活已经激活过的 skill，也不要在未激活前盲目读取 skill 资源。
         \(catalogSection)
@@ -137,29 +139,62 @@ final class SkillManager: ObservableObject {
     }
 
     func likelyTriggeredSkills(in text: String, excluding activeSkillIDs: [String] = []) -> [AgentSkill] {
+        likelyTriggeredSkillMatches(in: text, excluding: activeSkillIDs).map(\.skill)
+    }
+
+    func likelyTriggeredSkillMatches(in text: String, excluding activeSkillIDs: [String] = []) -> [SkillMatchCandidate] {
         let normalizedMessage = normalizeSkillKey(text)
         guard !normalizedMessage.isEmpty else { return [] }
 
         let activeSet = Set(activeSkillIDs)
-        let scored = availableSkills.compactMap { skill -> (skill: AgentSkill, score: Int)? in
+        let scored = availableSkills.compactMap { skill -> SkillMatchCandidate? in
             guard !activeSet.contains(skill.id) else { return nil }
 
             var bestScore = 0
-            for key in candidateKeys(for: skill) where explicitMentionKeyIsUseful(key) {
-                guard normalizedMessage.contains(key) else { continue }
-                bestScore = max(bestScore, 120 + min(key.count, 24))
+            var matchedSignals: [SkillMatchSignal] = []
+            for signal in explicitMatchSignals(for: skill) {
+                let normalizedPhrase = normalizeSkillKey(signal.phrase)
+                guard explicitMentionKeyIsUseful(normalizedPhrase),
+                      normalizedMessage.contains(normalizedPhrase) else {
+                    continue
+                }
+                bestScore = max(bestScore, 120 + min(normalizedPhrase.count, 24))
+                matchedSignals.append(signal)
             }
 
-            for phrase in triggerCandidates(for: skill) {
-                let normalizedPhrase = normalizeSkillKey(phrase)
+            if !skill.allowImplicitInvocation && bestScore == 0 {
+                return nil
+            }
+
+            var metadataScore = 0
+            for signal in positiveRoutingSignals(for: skill) {
+                let normalizedPhrase = normalizeSkillKey(signal.phrase)
                 guard normalizedPhrase.count >= 2 else { continue }
                 if normalizedMessage.contains(normalizedPhrase) {
-                    bestScore = max(bestScore, 80 + min(normalizedPhrase.count, 24))
+                    metadataScore = max(metadataScore, 80 + min(normalizedPhrase.count, 24))
+                    matchedSignals.append(signal)
                 }
             }
 
+            var blockedSignals: [SkillMatchSignal] = []
+            for signal in negativeRoutingSignals(for: skill) {
+                let normalizedPhrase = normalizeSkillKey(signal.phrase)
+                guard normalizedPhrase.count >= 2 else { continue }
+                if normalizedMessage.contains(normalizedPhrase) {
+                    metadataScore -= max(10, min(normalizedPhrase.count, 20))
+                    blockedSignals.append(signal)
+                }
+            }
+
+            bestScore = max(bestScore, metadataScore)
+
             guard bestScore > 0 else { return nil }
-            return (skill, bestScore)
+            return SkillMatchCandidate(
+                skill: skill,
+                score: bestScore,
+                matchedSignals: deduplicateSignals(matchedSignals),
+                blockedSignals: deduplicateSignals(blockedSignals)
+            )
         }
 
         return scored
@@ -169,7 +204,18 @@ final class SkillManager: ObservableObject {
                 }
                 return sortSkillsForCatalog(lhs.skill, rhs.skill)
             }
-            .map(\.skill)
+    }
+
+    private func deduplicateSignals(_ signals: [SkillMatchSignal]) -> [SkillMatchSignal] {
+        var seen: Set<String> = []
+        var ordered: [SkillMatchSignal] = []
+        for signal in signals {
+            let key = "\(signal.source.rawValue)::\(normalizeSkillKey(signal.phrase))"
+            guard !seen.contains(key) else { continue }
+            seen.insert(key)
+            ordered.append(signal)
+        }
+        return ordered
     }
 
     func installSkillFromRemote(
@@ -508,7 +554,9 @@ final class SkillManager: ObservableObject {
             : "No description"
         let aliases = parseListField(from: frontmatter, keys: ["aliases", "alias", "keywords"])
         let body = stripFrontmatter(from: content)
+        let openAIConfig = parseOpenAIConfig(in: url)
         let triggerHints = extractTriggerHints(from: body)
+        let antiTriggerHints = extractAntiTriggerHints(from: body)
         let requiredEnvironmentVariables = extractRequiredEnvironmentVariables(from: body)
         let resources = enumerateResources(in: url)
 
@@ -516,9 +564,15 @@ final class SkillManager: ObservableObject {
             id: "skill:\(url.standardizedFileURL.path)",
             name: name,
             description: description,
+            displayName: openAIConfig["interface.display_name"]?.nilIfEmpty,
+            shortDescription: openAIConfig["interface.short_description"]?.nilIfEmpty,
+            defaultPrompt: openAIConfig["interface.default_prompt"]?.nilIfEmpty,
             aliases: aliases,
             triggerHints: triggerHints,
+            antiTriggerHints: antiTriggerHints,
+            allowImplicitInvocation: parseBool(openAIConfig["policy.allow_implicit_invocation"]) ?? true,
             requiredEnvironmentVariables: requiredEnvironmentVariables,
+            scriptTimeoutSeconds: parseScriptTimeoutSeconds(frontmatter: frontmatter, openAIConfig: openAIConfig),
             skillDirectory: url.standardizedFileURL.path,
             skillFile: skillFile.standardizedFileURL.path,
             sourceType: sourceType,
@@ -634,8 +688,9 @@ final class SkillManager: ObservableObject {
     }
 
     private func extractTriggerHints(from body: String) -> [String] {
-        let lines = body.components(separatedBy: .newlines)
-        let triggerHeadings = Set([
+        extractSectionBullets(
+            from: body,
+            headings: Set([
             "## when to use",
             "### when to use",
             "## use cases",
@@ -650,8 +705,32 @@ final class SkillManager: ObservableObject {
             "### 何时使用",
             "## 适用场景",
             "### 适用场景"
-        ])
+            ])
+        )
+    }
 
+    private func extractAntiTriggerHints(from body: String) -> [String] {
+        extractSectionBullets(
+            from: body,
+            headings: Set([
+                "## when not to use",
+                "### when not to use",
+                "## avoid",
+                "### avoid",
+                "## do not use",
+                "### do not use",
+                "## 不要使用",
+                "### 不要使用",
+                "## 何时不要使用",
+                "### 何时不要使用",
+                "## 不适用场景",
+                "### 不适用场景"
+            ])
+        )
+    }
+
+    private func extractSectionBullets(from body: String, headings: Set<String>) -> [String] {
+        let lines = body.components(separatedBy: .newlines)
         var collecting = false
         var results: [String] = []
 
@@ -659,7 +738,7 @@ final class SkillManager: ObservableObject {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             let normalizedLine = line.lowercased()
 
-            if triggerHeadings.contains(normalizedLine) {
+            if headings.contains(normalizedLine) {
                 collecting = true
                 continue
             }
@@ -678,7 +757,7 @@ final class SkillManager: ObservableObject {
             }
         }
 
-        return Array(results.prefix(5))
+        return Array(results.prefix(6))
     }
 
     private func extractRequiredEnvironmentVariables(from body: String) -> [String] {
@@ -784,11 +863,25 @@ final class SkillManager: ObservableObject {
     private func candidateKeys(for skill: AgentSkill) -> Set<String> {
         var keys = Set<String>()
         keys.insert(normalizeSkillKey(skill.name))
+        if let displayName = skill.displayName {
+            keys.insert(normalizeSkillKey(displayName))
+        }
         keys.insert(normalizeSkillKey(URL(fileURLWithPath: skill.skillDirectory).lastPathComponent))
         for alias in skill.aliases {
             keys.insert(normalizeSkillKey(alias))
         }
         return keys.filter { !$0.isEmpty }
+    }
+
+    private func explicitMatchSignals(for skill: AgentSkill) -> [SkillMatchSignal] {
+        var signals: [SkillMatchSignal] = [
+            SkillMatchSignal(source: .name, phrase: skill.name)
+        ]
+        if let displayName = skill.displayName, !displayName.isEmpty {
+            signals.append(SkillMatchSignal(source: .displayName, phrase: displayName))
+        }
+        signals.append(contentsOf: skill.aliases.map { SkillMatchSignal(source: .alias, phrase: $0) })
+        return signals
     }
 
     private func explicitMentionKeyIsUseful(_ key: String) -> Bool {
@@ -798,21 +891,58 @@ final class SkillManager: ObservableObject {
         return containsChinese ? key.count >= 2 : key.count >= 4
     }
 
-    private func triggerCandidates(for skill: AgentSkill) -> [String] {
-        var candidates: [String] = []
-        candidates.append(skill.name)
-        candidates.append(contentsOf: skill.aliases)
-        candidates.append(contentsOf: extractQuotedPhrases(from: skill.description))
+    private func positiveRoutingSignals(for skill: AgentSkill) -> [SkillMatchSignal] {
+        var candidates: [SkillMatchSignal] = [
+            SkillMatchSignal(source: .name, phrase: skill.name)
+        ]
+        if let displayName = skill.displayName {
+            candidates.append(SkillMatchSignal(source: .displayName, phrase: displayName))
+        }
+        if let shortDescription = skill.shortDescription {
+            candidates.append(SkillMatchSignal(source: .shortDescription, phrase: shortDescription))
+        }
+        if let defaultPrompt = skill.defaultPrompt {
+            candidates.append(SkillMatchSignal(source: .defaultPrompt, phrase: defaultPrompt))
+        }
+        candidates.append(contentsOf: skill.aliases.map { SkillMatchSignal(source: .alias, phrase: $0) })
+        candidates.append(contentsOf: extractQuotedPhrases(from: skill.description).map { SkillMatchSignal(source: .description, phrase: $0) })
+        candidates.append(contentsOf: extractQuotedPhrases(from: skill.shortDescription ?? "").map { SkillMatchSignal(source: .shortDescription, phrase: $0) })
+        candidates.append(contentsOf: extractQuotedPhrases(from: skill.defaultPrompt ?? "").map { SkillMatchSignal(source: .defaultPrompt, phrase: $0) })
 
         for hint in skill.triggerHints {
-            candidates.append(hint)
-            candidates.append(contentsOf: extractQuotedPhrases(from: hint))
-            candidates.append(contentsOf: splitTriggerHintFragments(from: hint))
+            candidates.append(SkillMatchSignal(source: .triggerHint, phrase: hint))
+            candidates.append(contentsOf: extractQuotedPhrases(from: hint).map { SkillMatchSignal(source: .triggerHint, phrase: $0) })
+            candidates.append(contentsOf: splitTriggerHintFragments(from: hint).map { SkillMatchSignal(source: .triggerHint, phrase: $0) })
         }
 
-        candidates.append(contentsOf: splitTriggerHintFragments(from: skill.description))
-        let unique = NSOrderedSet(array: candidates.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
-        return (unique.array as? [String] ?? []).filter { !$0.isEmpty }
+        candidates.append(contentsOf: splitTriggerHintFragments(from: skill.description).map { SkillMatchSignal(source: .description, phrase: $0) })
+        candidates.append(contentsOf: splitTriggerHintFragments(from: skill.shortDescription ?? "").map { SkillMatchSignal(source: .shortDescription, phrase: $0) })
+        candidates.append(contentsOf: splitTriggerHintFragments(from: skill.defaultPrompt ?? "").map { SkillMatchSignal(source: .defaultPrompt, phrase: $0) })
+        return deduplicateSignals(
+            candidates.map {
+                SkillMatchSignal(
+                    source: $0.source,
+                    phrase: $0.phrase.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+            }.filter { !$0.phrase.isEmpty }
+        )
+    }
+
+    private func negativeRoutingSignals(for skill: AgentSkill) -> [SkillMatchSignal] {
+        var candidates: [SkillMatchSignal] = []
+        for hint in skill.antiTriggerHints {
+            candidates.append(SkillMatchSignal(source: .antiTriggerHint, phrase: hint))
+            candidates.append(contentsOf: extractQuotedPhrases(from: hint).map { SkillMatchSignal(source: .antiTriggerHint, phrase: $0) })
+            candidates.append(contentsOf: splitTriggerHintFragments(from: hint).map { SkillMatchSignal(source: .antiTriggerHint, phrase: $0) })
+        }
+        return deduplicateSignals(
+            candidates.map {
+                SkillMatchSignal(
+                    source: $0.source,
+                    phrase: $0.phrase.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+            }.filter { !$0.phrase.isEmpty }
+        )
     }
 
     private func extractQuotedPhrases(from text: String) -> [String] {
@@ -854,6 +984,100 @@ final class SkillManager: ObservableObject {
             .filter { $0.count >= 2 }
     }
 
+    private func parseOpenAIConfig(in skillRoot: URL) -> [String: String] {
+        let candidates = [
+            skillRoot.appendingPathComponent("agents/openai.yaml"),
+            skillRoot.appendingPathComponent("openai.yaml")
+        ]
+
+        for url in candidates {
+            guard fm.fileExists(atPath: url.path),
+                  let content = try? String(contentsOf: url, encoding: .utf8) else {
+                continue
+            }
+            return parseSimpleYAML(content)
+        }
+
+        return [:]
+    }
+
+    private func parseSimpleYAML(_ content: String) -> [String: String] {
+        let lines = content.components(separatedBy: .newlines)
+        var values: [String: String] = [:]
+        var stack: [(indent: Int, key: String)] = []
+
+        for rawLine in lines {
+            if rawLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
+            if rawLine.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("#") { continue }
+
+            let indent = rawLine.prefix { $0 == " " }.count
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let separator = trimmed.firstIndex(of: ":") else { continue }
+
+            let key = String(trimmed[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
+            var value = String(trimmed[trimmed.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+
+            while let last = stack.last, indent <= last.indent {
+                stack.removeLast()
+            }
+
+            if value.isEmpty {
+                stack.append((indent: indent, key: key))
+                continue
+            }
+
+            if value.hasPrefix("\""), value.hasSuffix("\""), value.count >= 2 {
+                value.removeFirst()
+                value.removeLast()
+            }
+
+            let path = (stack.map(\.key) + [key]).joined(separator: ".")
+            values[path] = value
+        }
+
+        return values
+    }
+
+    private func parseBool(_ value: String?) -> Bool? {
+        guard let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+            return nil
+        }
+        switch normalized {
+        case "true", "yes", "1":
+            return true
+        case "false", "no", "0":
+            return false
+        default:
+            return nil
+        }
+    }
+
+    private func parseScriptTimeoutSeconds(frontmatter: [String: String], openAIConfig: [String: String]) -> Int? {
+        let candidates: [String?] = [
+            frontmatter["script_timeout_seconds"],
+            frontmatter["skill_timeout_seconds"],
+            frontmatter["timeout_seconds"],
+            openAIConfig["execution.script_timeout_seconds"],
+            openAIConfig["runtime.script_timeout_seconds"],
+            openAIConfig["runtime.timeout_seconds"]
+        ]
+
+        for candidate in candidates {
+            guard let candidate else { continue }
+            if let parsed = parsePositiveInteger(candidate) {
+                return min(max(parsed, 1), 300)
+            }
+        }
+        return nil
+    }
+
+    private func parsePositiveInteger(_ value: String) -> Int? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard let integer = Int(trimmed), integer > 0 else { return nil }
+        return integer
+    }
+
     private func skillCatalogLine(for skill: AgentSkill) -> String {
         var segments: [String] = []
         if !skill.aliases.isEmpty {
@@ -861,6 +1085,9 @@ final class SkillManager: ObservableObject {
         }
         if !skill.triggerHints.isEmpty {
             segments.append("触发示例：\(skill.triggerHints.joined(separator: "；"))")
+        }
+        if let shortDescription = skill.shortDescription, !shortDescription.isEmpty {
+            segments.append("补充说明：\(shortDescription)")
         }
         let suffix = segments.isEmpty ? "" : " [" + segments.joined(separator: " | ") + "]"
         return "- \(skill.name): \(skill.description)\(suffix)"

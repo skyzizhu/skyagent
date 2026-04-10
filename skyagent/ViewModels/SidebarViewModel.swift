@@ -3,16 +3,30 @@ import Combine
 
 @MainActor
 class SidebarViewModel: ObservableObject {
+    enum ConversationFilter: String, CaseIterable {
+        case all
+        case favorites
+    }
+
     let store: ConversationStore
     let skillManager: SkillManager
 
     @Published var searchText = ""
     @Published var showNewConversationSheet = false
+    @Published var selectedFilter: ConversationFilter = .all
 
     var filteredConversations: [Conversation] {
-        if searchText.isEmpty { return store.conversations }
+        let baseConversations: [Conversation]
+        switch selectedFilter {
+        case .all:
+            baseConversations = store.conversations
+        case .favorites:
+            baseConversations = store.conversations.filter(\.isFavorite)
+        }
+
+        if searchText.isEmpty { return baseConversations }
         let q = searchText.lowercased()
-        return store.conversations.filter {
+        return baseConversations.filter {
             $0.title.localizedCaseInsensitiveContains(searchText) ||
             $0.messages.contains { $0.content.localizedCaseInsensitiveContains(q) }
         }
@@ -44,14 +58,17 @@ class SidebarViewModel: ObservableObject {
         store.deleteConversation(id)
     }
 
+    func toggleFavoriteConversation(_ id: UUID) {
+        store.toggleFavoriteConversation(id)
+    }
+
     func renameConversation(_ id: UUID, newTitle: String) {
         guard !newTitle.isEmpty else { return }
         store.updateConversationTitle(id, title: newTitle)
         store.saveConversations()
     }
 
-    func clearMessages() {
-        guard let convId = store.currentConversationId else { return }
-        store.clearMessages(convId)
+    func clearMessages(_ id: UUID) {
+        store.clearMessages(id)
     }
 }

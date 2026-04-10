@@ -2,6 +2,11 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct SidebarView: View {
+    private enum PendingDangerousAction {
+        case clearMessages(UUID)
+        case deleteConversation(UUID)
+    }
+
     @ObservedObject var viewModel: SidebarViewModel
     @ObservedObject var store: ConversationStore
     @State private var renamingId: UUID? = nil
@@ -9,6 +14,7 @@ struct SidebarView: View {
     @State private var showSearch = false
     @State private var permissionChangeTarget: UUID?
     @State private var showOpenModeConfirmation = false
+    @State private var pendingDangerousAction: PendingDangerousAction?
     @Environment(\.openSettings) private var openSettings
 
     init(viewModel: SidebarViewModel) {
@@ -19,12 +25,24 @@ struct SidebarView: View {
     var body: some View {
         VStack(spacing: 0) {
             toolbar
+            filterTabs
             if showSearch {
                 searchField
             }
             Divider()
+                .overlay(Color.primary.opacity(0.04))
             conversationList
         }
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(nsColor: .windowBackgroundColor),
+                    Color.primary.opacity(0.012)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
         .alert(L10n.tr("sidebar.rename.title"), isPresented: Binding(
             get: { renamingId != nil },
             set: { if !$0 { renamingId = nil } }
@@ -56,6 +74,19 @@ struct SidebarView: View {
         } message: {
             Text(L10n.tr("sidebar.open_mode.message"))
         }
+        .alert(sidebarDangerTitle, isPresented: Binding(
+            get: { pendingDangerousAction != nil },
+            set: { if !$0 { pendingDangerousAction = nil } }
+        )) {
+            Button(L10n.tr("common.cancel"), role: .cancel) {
+                pendingDangerousAction = nil
+            }
+            Button(sidebarDangerConfirmTitle, role: .destructive) {
+                performPendingDangerousAction()
+            }
+        } message: {
+            Text(sidebarDangerMessage)
+        }
     }
 
     private var toolbar: some View {
@@ -68,15 +99,15 @@ struct SidebarView: View {
                         .font(.system(size: 13, weight: .semibold, design: .rounded))
                 }
                 .foregroundStyle(.primary)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
+                .padding(.horizontal, 13)
+                .padding(.vertical, 9)
                 .background(
                     Capsule()
-                        .fill(Color.primary.opacity(0.05))
+                        .fill(Color.primary.opacity(0.045))
                 )
                 .overlay(
                     Capsule()
-                        .stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
+                        .stroke(Color.primary.opacity(0.075), lineWidth: 0.8)
                 )
             }
             .buttonStyle(.plain)
@@ -91,24 +122,20 @@ struct SidebarView: View {
                     if !showSearch { viewModel.searchText = "" }
                 }
             } label: {
-                Image(systemName: showSearch ? "xmark.circle" : "magnifyingglass")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary.opacity(0.9))
+                toolbarIcon(showSearch ? "xmark.circle" : "magnifyingglass")
             }
             .buttonStyle(.plain)
             .help(L10n.tr("sidebar.search.help"))
 
             Button { openSettings() } label: {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary.opacity(0.9))
+                toolbarIcon("gearshape")
             }
             .buttonStyle(.plain)
-            .padding(.trailing, 4)
+            .padding(.trailing, 8)
             .help(L10n.tr("sidebar.settings.help"))
         }
-        .padding(.top, 14)
-        .padding(.bottom, 10)
+        .padding(.top, 12)
+        .padding(.bottom, 12)
     }
 
     private var searchField: some View {
@@ -136,15 +163,62 @@ struct SidebarView: View {
         .padding(.vertical, 6)
         .background(
             RoundedRectangle(cornerRadius: 8)
-                .fill(Color.primary.opacity(0.04))
+                .fill(Color.primary.opacity(0.035))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
+                .stroke(Color.primary.opacity(0.065), lineWidth: 0.8)
         )
-        .padding(.horizontal, 10)
-        .padding(.bottom, 6)
+        .padding(.horizontal, 12)
+        .padding(.bottom, 8)
         .transition(.move(edge: .top).combined(with: .opacity))
+    }
+
+    private var filterTabs: some View {
+        HStack(spacing: 6) {
+            filterTabButton(
+                title: L10n.tr("sidebar.filter.all"),
+                systemImage: "text.bubble",
+                filter: .all
+            )
+            filterTabButton(
+                title: L10n.tr("sidebar.filter.favorites"),
+                systemImage: "star",
+                filter: .favorites
+            )
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.bottom, 8)
+    }
+
+    private func filterTabButton(title: String, systemImage: String, filter: SidebarViewModel.ConversationFilter) -> some View {
+        let isSelected = viewModel.selectedFilter == filter
+
+        return Button {
+            withAnimation(.easeInOut(duration: 0.18)) {
+                viewModel.selectedFilter = filter
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 10.5, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+            }
+            .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                Capsule()
+                    .fill(isSelected ? Color.primary.opacity(0.06) : Color.primary.opacity(0.025))
+            )
+            .overlay(
+                Capsule()
+                    .stroke(isSelected ? Color.primary.opacity(0.09) : Color.primary.opacity(0.04), lineWidth: 0.7)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     private var conversationList: some View {
@@ -157,15 +231,19 @@ struct SidebarView: View {
                         } label: {
                             ConversationRowView(
                                 conv: conv,
-                                isCurrent: store.currentConversationId == conv.id,
-                                onRename: { renameText = conv.title; renamingId = conv.id },
-                                onClear: { if store.currentConversationId == conv.id { viewModel.clearMessages() } },
-                                onDelete: { viewModel.deleteConversation(conv.id) }
+                                isCurrent: store.currentConversationId == conv.id
                             )
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .buttonStyle(.plain)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
                         .id(conv.id)
                         .contextMenu {
+                            Button(conv.isFavorite ? L10n.tr("sidebar.unfavorite") : L10n.tr("sidebar.favorite")) {
+                                viewModel.toggleFavoriteConversation(conv.id)
+                            }
+                            Divider()
                             Button(L10n.tr("common.rename")) {
                                 renameText = conv.title; renamingId = conv.id
                             }
@@ -186,16 +264,16 @@ struct SidebarView: View {
                             }
                             Divider()
                             Button(L10n.tr("conversation.clear_messages")) {
-                                if store.currentConversationId == conv.id { viewModel.clearMessages() }
+                                pendingDangerousAction = .clearMessages(conv.id)
                             }
                             Button(L10n.tr("common.delete"), role: .destructive) {
-                                viewModel.deleteConversation(conv.id)
+                                pendingDangerousAction = .deleteConversation(conv.id)
                             }
                         }
                     }
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 8)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 10)
             }
             .onChange(of: store.currentConversationId) {
                 guard let currentId = store.currentConversationId else { return }
@@ -211,6 +289,18 @@ struct SidebarView: View {
                     }
                 }
             }
+        }
+    }
+
+    private func toolbarIcon(_ systemName: String) -> some View {
+        ZStack {
+            Circle()
+                .fill(Color.primary.opacity(0.04))
+                .frame(width: 28, height: 28)
+
+            Image(systemName: systemName)
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(.secondary.opacity(0.9))
         }
     }
 
@@ -243,6 +333,68 @@ struct SidebarView: View {
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
             try? md.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
+    private var sidebarDangerTitle: String {
+        switch pendingDangerousAction {
+        case .clearMessages:
+            return L10n.tr("sidebar.danger.clear.title")
+        case .deleteConversation:
+            return L10n.tr("sidebar.danger.delete.title")
+        case nil:
+            return ""
+        }
+    }
+
+    private var sidebarDangerMessage: String {
+        switch pendingDangerousAction {
+        case .clearMessages:
+            return L10n.tr("sidebar.danger.clear.message", pendingDangerousConversationTitle)
+        case .deleteConversation:
+            return L10n.tr("sidebar.danger.delete.message", pendingDangerousConversationTitle)
+        case nil:
+            return ""
+        }
+    }
+
+    private var sidebarDangerConfirmTitle: String {
+        switch pendingDangerousAction {
+        case .clearMessages:
+            return L10n.tr("conversation.clear_messages")
+        case .deleteConversation:
+            return L10n.tr("common.delete")
+        case nil:
+            return L10n.tr("common.confirm")
+        }
+    }
+
+    private var pendingDangerousConversationTitle: String {
+        let convId: UUID?
+        switch pendingDangerousAction {
+        case .clearMessages(let id), .deleteConversation(let id):
+            convId = id
+        case nil:
+            convId = nil
+        }
+
+        guard let convId,
+              let conversation = store.conversations.first(where: { $0.id == convId }) else {
+            return L10n.tr("conversation.new")
+        }
+        return conversation.title
+    }
+
+    private func performPendingDangerousAction() {
+        defer { pendingDangerousAction = nil }
+
+        switch pendingDangerousAction {
+        case .clearMessages(let convId):
+            viewModel.clearMessages(convId)
+        case .deleteConversation(let convId):
+            viewModel.deleteConversation(convId)
+        case nil:
+            break
         }
     }
 }

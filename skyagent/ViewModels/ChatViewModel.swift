@@ -19,6 +19,14 @@ struct FileIntentStatus: Equatable {
     let badges: [String]
 }
 
+struct SkillRoutingStatus: Equatable {
+    let conversationID: UUID
+    let title: String
+    let detail: String
+    let reason: String?
+    let badges: [String]
+}
+
 struct PendingResponseStatus: Equatable {
     let title: String
     let detail: String
@@ -73,6 +81,10 @@ enum ActivityAccentStyle: Equatable {
     case skill
     case network
     case shell
+    case approval
+    case warning
+    case error
+    case success
 }
 
 @MainActor
@@ -84,8 +96,10 @@ class ChatViewModel: ObservableObject {
     @Published var pendingResponseStatus: PendingResponseStatus?
     @Published var streamingResponseStatus: StreamingResponseStatus?
     @Published var fileIntentStatus: FileIntentStatus?
+    @Published var skillRoutingStatus: SkillRoutingStatus?
     @Published var conversationRecoveryStatus: ConversationRecoveryStatus?
     @Published var completedActivityStatus: ConversationActivityStatus?
+    @Published private(set) var contextUsageStatus: ContextUsageStatus?
 
     let store: ConversationStore
     private var llm: LLMService
@@ -95,9 +109,12 @@ class ChatViewModel: ObservableObject {
     private var pendingAssistantDeltaConversationId: UUID?
     private var assistantDeltaFlushTask: Task<Void, Never>?
     private var assistantActivityFallbackTask: Task<Void, Never>?
+    private var contextUsageRefreshTask: Task<Void, Never>?
     private var lastAssistantDeltaAt: Date?
     private var completedActivityDismissTask: Task<Void, Never>?
     private var approvalContinuation: CheckedContinuation<Bool, Never>?
+    private var currentTraceContext: TraceContext?
+    private var currentAssistantTurnStartedAt: Date?
 
     private let maxRetries = 2
     @Published var networkStatus: NetworkStatus = .unknown
@@ -122,69 +139,16 @@ class ChatViewModel: ObservableObject {
         return "\(count) msgs"
     }
 
-    var contextUsageStatus: ContextUsageStatus? {
-        guard let conversation = store.currentConversation else { return nil }
-        return buildContextUsageStatus(for: conversation)
-    }
-
     var currentActivityStatus: ConversationActivityStatus? {
-        if let runningToolStatus {
-            return ConversationActivityStatus(
-                title: runningToolStatus.title,
-                detail: runningToolStatus.detail,
-                context: runningToolStatus.context,
-                badges: runningToolStatus.badges,
-                phaseLabel: runningToolStatus.phaseLabel,
-                isBusy: true,
-                iconName: iconName(for: runningToolStatus.toolName),
-                accentStyle: accentStyle(for: runningToolStatus.toolName)
-            )
-        }
-
-        if let streamingResponseStatus, streamingResponseStatus.forceVisible || !hasVisibleStreamingAssistantContent {
-            return ConversationActivityStatus(
-                title: streamingResponseStatus.title,
-                detail: streamingResponseStatus.detail,
-                context: streamingResponseStatus.context,
-                badges: streamingResponseStatus.badges,
-                phaseLabel: L10n.tr("chat.phase.running"),
-                isBusy: true,
-                iconName: "text.cursor",
-                accentStyle: .thinking
-            )
-        }
-
-        if let pendingResponseStatus {
-            return ConversationActivityStatus(
-                title: pendingResponseStatus.title,
-                detail: pendingResponseStatus.detail,
-                context: pendingResponseStatus.context,
-                badges: pendingResponseStatus.badges,
-                phaseLabel: L10n.tr("chat.phase.preparing"),
-                isBusy: true,
-                iconName: "brain.head.profile",
-                accentStyle: .thinking
-            )
-        }
-
-        if case .reconnecting = networkStatus {
-            return ConversationActivityStatus(
-                title: L10n.tr("chat.waiting.retry.title"),
-                detail: L10n.tr("chat.waiting.retry.detail"),
-                context: nil,
-                badges: [],
-                phaseLabel: L10n.tr("chat.phase.running"),
-                isBusy: true,
-                iconName: "arrow.triangle.2.circlepath",
-                accentStyle: .network
-            )
-        }
-
-        if let completedActivityStatus {
-            return completedActivityStatus
-        }
-
-        return nil
+        ChatStatusComposer.makeCurrentActivityStatus(
+            pendingApproval: pendingApproval,
+            runningToolStatus: runningToolStatus,
+            streamingResponseStatus: streamingResponseStatus,
+            pendingResponseStatus: pendingResponseStatus,
+            isReconnecting: networkStatus == .reconnecting,
+            hasVisibleStreamingAssistantContent: hasVisibleStreamingAssistantContent,
+            errorMessage: errorMessage
+        ) ?? completedActivityStatus
     }
 
     private var hasVisibleStreamingAssistantContent: Bool {
@@ -201,38 +165,15 @@ class ChatViewModel: ObservableObject {
 
     var conversationContextOverviewStatus: ConversationContextOverviewStatus? {
         guard let conversation = store.currentConversation else { return nil }
-        let contextState = conversation.contextState
-        guard !contextState.isEmpty else { return nil }
+        return ChatStatusComposer.makeConversationContextOverviewStatus(for: conversation)
+    }
 
-        let title = contextState.taskSummary.isEmpty ? L10n.tr("context.overview.title") : contextState.taskSummary
-
-        let target = contextState.activeTargets.first?.replacingOccurrences(of: "优先目标文件：", with: "")
-        let constraint = contextState.activeConstraints.first
-        let detailParts = [target, constraint].compactMap { $0 }.prefix(2)
-        let detail = detailParts.isEmpty
-            ? L10n.tr("context.overview.detail")
-            : detailParts.joined(separator: " · ")
-
-        let hasPreservedBackground = MemoryService.shared.loadSummary(convId: conversation.id) != nil || conversation.messages.count > 20
-        let context = hasPreservedBackground ? L10n.tr("context.overview.background") : nil
-
-        var badges: [String] = []
-        if !contextState.activeTargets.isEmpty {
-            badges.append(L10n.tr("context.badge.targets", String(contextState.activeTargets.count)))
+    var activeSkillRoutingStatus: SkillRoutingStatus? {
+        guard let currentConversationID = store.currentConversationId,
+              skillRoutingStatus?.conversationID == currentConversationID else {
+            return nil
         }
-        if !contextState.activeConstraints.isEmpty {
-            badges.append(L10n.tr("context.badge.constraints", String(contextState.activeConstraints.count)))
-        }
-        if !contextState.activeSkillNames.isEmpty {
-            badges.append(contentsOf: contextState.activeSkillNames.prefix(2))
-        }
-
-        return ConversationContextOverviewStatus(
-            title: title,
-            detail: detail,
-            context: context,
-            badges: badges
-        )
+        return skillRoutingStatus
     }
 
     init(store: ConversationStore, llm: LLMService, orchestrator: AgentOrchestrator) {
@@ -240,6 +181,7 @@ class ChatViewModel: ObservableObject {
         self.llm = llm
         self.orchestrator = orchestrator
         refreshConversationRecoveryStatus()
+        scheduleContextUsageRefresh(immediately: true)
     }
 
     func updateLLM(_ newLLM: LLMService) {
@@ -254,7 +196,7 @@ class ChatViewModel: ObservableObject {
         return "\(value)"
     }
 
-    func sendMessage(_ text: String, hiddenSystemContext: String? = nil, attachmentID: String? = nil) async {
+    func sendMessage(_ text: String, hiddenSystemContext: String? = nil, attachmentID: String? = nil, imageDataURL: String? = nil) async {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || hiddenSystemContext != nil else { return }
 
@@ -270,6 +212,7 @@ class ChatViewModel: ObservableObject {
             )
         }
         fileIntentStatus = fileIntentAnalysis.flatMap(buildFileIntentStatus(from:))
+        skillRoutingStatus = nil
         completedActivityDismissTask?.cancel()
         completedActivityStatus = nil
         let fileIntentContext = fileIntentAnalysis?.systemContext()
@@ -278,7 +221,20 @@ class ChatViewModel: ObservableObject {
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
 
-        let userMsg = Message(role: .user, content: trimmed)
+        let userMsg = Message(role: .user, content: trimmed, attachmentID: attachmentID, imageDataURL: imageDataURL)
+        let traceContext = TraceContext(conversationID: convId, messageID: userMsg.id)
+        await LoggerService.shared.log(
+            category: .conversation,
+            event: "message_submit_started",
+            traceContext: traceContext,
+            status: .started,
+            summary: "用户提交消息",
+            metadata: [
+                "input_length": .int(trimmed.count),
+                "has_attachment": .bool(attachmentID != nil),
+                "has_hidden_context": .bool(!mergedHiddenContext.isEmpty)
+            ]
+        )
         store.appendMessage(userMsg, to: convId)
         conversationRecoveryStatus = nil
         completedActivityDismissTask?.cancel()
@@ -294,6 +250,8 @@ class ChatViewModel: ObservableObject {
             store.appendMessage(hiddenMessage, to: convId)
         }
 
+        scheduleContextUsageRefresh()
+
         if store.userMessageCount(convId) == 1 {
             store.updateConversationTitle(convId, title: String(trimmed.prefix(30)))
         }
@@ -301,137 +259,58 @@ class ChatViewModel: ObservableObject {
         preactivateLikelySkillsIfNeeded(convId: convId, userText: trimmed)
 
         requestTask?.cancel()
+        currentTraceContext = traceContext
         requestTask = Task { [weak self] in
-            await self?.performChat(convId: convId)
+            await self?.performChat(convId: convId, traceContext: traceContext)
         }
+        await LoggerService.shared.log(
+            category: .conversation,
+            event: "message_submit_finished",
+            traceContext: traceContext,
+            status: .succeeded,
+            summary: "消息已入队处理",
+            metadata: [
+                "conversation_message_count": .int(store.currentConversation?.messages.count ?? 0)
+            ]
+        )
         await requestTask?.value
     }
 
-    private func buildContextUsageStatus(for conversation: Conversation) -> ContextUsageStatus {
+    private func scheduleContextUsageRefresh(immediately: Bool = false) {
+        contextUsageRefreshTask?.cancel()
+
+        guard let conversation = store.currentConversation else {
+            contextUsageStatus = nil
+            return
+        }
+
+        let conversationID = conversation.id
+        let delay: UInt64 = immediately ? 0 : 120_000_000
+        let snapshot = conversation
+        let modelName = store.settings.model
+        let maxTokens = store.settings.maxTokens
         let availableSkills = SkillManager.shared.availableSkills
         let activatedSkillMessages = SkillManager.shared.activationMessages(for: conversation.activatedSkillIDs)
-        var rawMessages = conversation.messages
-        let isCompressed = MemoryService.shared.shouldCompress(messages: rawMessages)
-
-        if isCompressed {
-            rawMessages = MemoryService.shared.compress(messages: rawMessages, contextState: conversation.contextState)
-        }
-
-        var preparedMessages: [Message] = []
-        if let summary = MemoryService.shared.loadSummary(convId: conversation.id), !summary.isEmpty {
-            preparedMessages.append(Message(role: .system, content: "[本次对话的历史摘要]\n\(summary)", hiddenFromTranscript: true))
-        }
-        if let catalogPrompt = SkillManager.shared.buildCatalogPrompt(for: availableSkills) {
-            preparedMessages.append(Message(role: .system, content: catalogPrompt, hiddenFromTranscript: true))
-        }
-        let contextPrompt = conversation.contextState.systemContext()
-        if !contextPrompt.isEmpty {
-            preparedMessages.append(Message(role: .system, content: contextPrompt, hiddenFromTranscript: true))
-        }
-        preparedMessages.append(contentsOf: activatedSkillMessages.map {
-            Message(role: .system, content: $0, hiddenFromTranscript: true)
-        })
-        preparedMessages.append(contentsOf: rawMessages)
-
-        let estimatedUsedTokens = preparedMessages.reduce(into: 0) { partialResult, message in
-            partialResult += estimatedTokenCount(for: message.content)
-            partialResult += message.toolCalls?.reduce(0, { $0 + estimatedTokenCount(for: $1.name) + estimatedTokenCount(for: $1.arguments) }) ?? 0
-            partialResult += message.toolExecution.map { estimatedTokenCount(for: $0.name) + estimatedTokenCount(for: $0.arguments) } ?? 0
-        }
-        let estimatedBudgetTokens = estimatedContextBudget(for: store.settings.model, completionBudget: store.settings.maxTokens)
-        return ContextUsageStatus(
-            usedTokens: max(1, estimatedUsedTokens),
-            budgetTokens: estimatedBudgetTokens,
-            isCompressed: isCompressed
+        let usageSnapshot = ChatContextUsageEstimator.makeSnapshot(
+            for: snapshot,
+            modelName: modelName,
+            maxTokens: maxTokens,
+            availableSkills: availableSkills,
+            activatedSkillMessages: activatedSkillMessages
         )
-    }
-
-    private func estimatedContextBudget(for modelName: String, completionBudget: Int) -> Int {
-        let lowercased = modelName.lowercased()
-        if lowercased.contains("claude") {
-            return 200_000
-        }
-        if lowercased.contains("gpt-4o") || lowercased.contains("gpt-4.1") || lowercased.contains("o3") || lowercased.contains("o4") {
-            return 128_000
-        }
-        if lowercased.contains("gemini") {
-            return 128_000
-        }
-        if lowercased.contains("deepseek") {
-            return 64_000
-        }
-        if lowercased.contains("glm") {
-            return 32_768
-        }
-        if lowercased.contains("qwen") {
-            return 32_768
-        }
-        return max(8_192, completionBudget * 8)
-    }
-
-    private func estimatedTokenCount(for text: String) -> Int {
-        guard !text.isEmpty else { return 0 }
-
-        var total = 0
-        var latinRun = 0
-        var digitRun = 0
-
-        func flushLatinRun() {
-            guard latinRun > 0 else { return }
-            total += Int(ceil(Double(latinRun) / 4.0))
-            latinRun = 0
-        }
-
-        func flushDigitRun() {
-            guard digitRun > 0 else { return }
-            total += Int(ceil(Double(digitRun) / 3.0))
-            digitRun = 0
-        }
-
-        for scalar in text.unicodeScalars {
-            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
-                flushLatinRun()
-                flushDigitRun()
-                continue
+        contextUsageRefreshTask = Task { [weak self] in
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: delay)
             }
 
-            if CharacterSet.decimalDigits.contains(scalar) {
-                flushLatinRun()
-                digitRun += 1
-                continue
-            }
-
-            if CharacterSet.letters.contains(scalar), scalar.value < 128 {
-                flushDigitRun()
-                latinRun += 1
-                continue
-            }
-
-            flushLatinRun()
-            flushDigitRun()
-
-            if isCJKScalar(scalar) {
-                total += 1
-            } else {
-                total += 1
-            }
-        }
-
-        flushLatinRun()
-        flushDigitRun()
-        return total
-    }
-
-    private func isCJKScalar(_ scalar: Unicode.Scalar) -> Bool {
-        switch scalar.value {
-        case 0x3400...0x4DBF,
-             0x4E00...0x9FFF,
-             0xF900...0xFAFF,
-             0x3040...0x30FF,
-             0xAC00...0xD7AF:
-            return true
-        default:
-            return false
+            guard let self, !Task.isCancelled else { return }
+            let status = await Task.detached(priority: .utility) {
+                ChatContextUsageEstimator.estimate(from: usageSnapshot)
+            }.value
+            guard let currentConversation = self.store.currentConversation,
+                  currentConversation.id == conversationID else { return }
+            guard !Task.isCancelled else { return }
+            self.contextUsageStatus = status
         }
     }
 
@@ -450,8 +329,13 @@ class ChatViewModel: ObservableObject {
         }
 
         requestTask?.cancel()
+        let traceContext = TraceContext(
+            conversationID: convId,
+            messageID: conv.messages.last(where: { $0.role == .user })?.id
+        )
+        currentTraceContext = traceContext
         requestTask = Task { [weak self] in
-            await self?.performChat(convId: convId)
+            await self?.performChat(convId: convId, traceContext: traceContext)
         }
         await requestTask?.value
     }
@@ -483,6 +367,7 @@ class ChatViewModel: ObservableObject {
         } else {
             store.saveConversations()
         }
+        scheduleContextUsageRefresh()
     }
 
     func respondToPendingApproval(_ approved: Bool) {
@@ -510,7 +395,9 @@ class ChatViewModel: ObservableObject {
 
     // MARK: - Private
 
-    private func performChat(convId: UUID, retryCount: Int = 0) async {
+    private func performChat(convId: UUID, traceContext: TraceContext? = nil, retryCount: Int = 0) async {
+        let effectiveTraceContext = traceContext ?? currentTraceContext ?? TraceContext(conversationID: convId)
+        currentTraceContext = effectiveTraceContext
         isLoading = true
         errorMessage = nil
         runningToolStatus = nil
@@ -522,6 +409,31 @@ class ChatViewModel: ObservableObject {
         conversationRecoveryStatus = nil
         completedActivityDismissTask?.cancel()
         completedActivityStatus = nil
+        if retryCount == 0 {
+            currentAssistantTurnStartedAt = Date()
+            await LoggerService.shared.log(
+                category: .conversation,
+                event: "assistant_turn_started",
+                traceContext: effectiveTraceContext,
+                status: .started,
+                summary: "开始处理本轮对话"
+            )
+        } else {
+            await LoggerService.shared.log(
+                level: .warn,
+                category: .conversation,
+                event: "assistant_turn_retried",
+                traceContext: effectiveTraceContext,
+                status: .retrying,
+                summary: "本轮对话正在重试",
+                metadata: LogMetadataBuilder.failure(
+                    errorKind: .unknown,
+                    retryCount: retryCount,
+                    recoveryAction: .retry,
+                    isUserVisible: false
+                )
+            )
+        }
 
         guard let conv = store.conversations.first(where: { $0.id == convId }) else {
             isLoading = false
@@ -532,6 +444,7 @@ class ChatViewModel: ObservableObject {
             try await orchestrator.run(
                 conversation: conv,
                 settings: store.settings,
+                traceContext: effectiveTraceContext,
                 requestApproval: { [weak self] preview in
                     guard let self else { return false }
                     return await self.requestApproval(preview)
@@ -541,19 +454,12 @@ class ChatViewModel: ObservableObject {
                 await self.handleAgentEvent(event, convId: convId)
             }
 
+            if storeHasDanglingEmptyAssistantMessage(in: convId) {
+                throw AgentError.emptyAssistantResponse
+            }
+
             // 发送成功，重置状态
             networkStatus = .connected
-
-            // 记忆处理
-            if let updatedConv = store.conversations.first(where: { $0.id == convId }) {
-                await MemoryService.shared.processConversationEnd(
-                    convId: convId,
-                    title: updatedConv.title,
-                    messages: updatedConv.messages,
-                    llmService: nil,
-                    settings: store.settings
-                )
-            }
         } catch {
             if error is CancellationError {
                 flushPendingAssistantDelta()
@@ -575,6 +481,23 @@ class ChatViewModel: ObservableObject {
                 completedActivityStatus = nil
                 store.removeTrailingEmptyAssistantMessage(convId)
                 store.saveConversations()
+                scheduleContextUsageRefresh()
+                await LoggerService.shared.log(
+                    level: .warn,
+                    category: .conversation,
+                    event: "assistant_turn_cancelled",
+                    traceContext: effectiveTraceContext,
+                    status: .cancelled,
+                    durationMs: elapsedMilliseconds(since: currentAssistantTurnStartedAt),
+                    summary: "本轮对话已取消",
+                    metadata: LogMetadataBuilder.failure(
+                        errorKind: .cancelled,
+                        recoveryAction: .abort,
+                        isUserVisible: false
+                    )
+                )
+                currentAssistantTurnStartedAt = nil
+                currentTraceContext = nil
                 return
             }
 
@@ -598,7 +521,7 @@ class ChatViewModel: ObservableObject {
                     let delay = pow(2.0, Double(retryCount))
                     try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                     isLoading = false
-                    await performChat(convId: convId, retryCount: retryCount + 1)
+                    await performChat(convId: convId, traceContext: effectiveTraceContext, retryCount: retryCount + 1)
                     return
                 } else {
                     networkStatus = .disconnected
@@ -610,7 +533,7 @@ class ChatViewModel: ObservableObject {
                     store.removeLastAssistantMessage(in: convId)
                 }
                 isLoading = false
-                await performChat(convId: convId, retryCount: retryCount + 1)
+                await performChat(convId: convId, traceContext: effectiveTraceContext, retryCount: retryCount + 1)
                 return
             } else {
                 errorMessage = error.localizedDescription
@@ -630,6 +553,79 @@ class ChatViewModel: ObservableObject {
         requestTask = nil
         store.refreshConversationContext(convId)
         store.saveConversations()
+        scheduleContextUsageRefresh()
+        let turnDurationMs = elapsedMilliseconds(since: currentAssistantTurnStartedAt)
+        if let errorMessage {
+            let errorKind = logErrorKind(for: errorMessage)
+            await LoggerService.shared.log(
+                level: .error,
+                category: .conversation,
+                event: "assistant_turn_failed",
+                traceContext: effectiveTraceContext,
+                status: .failed,
+                durationMs: turnDurationMs,
+                summary: "本轮对话执行失败",
+                metadata: LogMetadataBuilder.failure(
+                    errorKind: errorKind,
+                    retryCount: retryCount,
+                    recoveryAction: retryCount < maxRetries ? .retry : .abort,
+                    isUserVisible: true,
+                    extra: ["error_message": .string(errorMessage)]
+                )
+            )
+        } else {
+            await LoggerService.shared.log(
+                category: .conversation,
+                event: "assistant_turn_finished",
+                traceContext: effectiveTraceContext,
+                status: .succeeded,
+                durationMs: turnDurationMs,
+                summary: "本轮对话处理完成",
+                metadata: [
+                    "message_count": .int(store.currentConversation?.messages.count ?? 0)
+                ]
+            )
+        }
+        currentAssistantTurnStartedAt = nil
+        currentTraceContext = nil
+
+        if let updatedConv = store.conversations.first(where: { $0.id == convId }) {
+            let summaryConversation = updatedConv
+            let llmService = llm
+            let settingsSnapshot = store.settings
+            let fallbackSandboxDir = settingsSnapshot.ensureSandboxDir()
+            Task.detached(priority: .utility) {
+                let refreshedContextState = ConversationContextService.shared.buildState(
+                    for: summaryConversation,
+                    fallbackSandboxDir: fallbackSandboxDir
+                )
+                await MemoryService.shared.processConversationEnd(
+                    convId: convId,
+                    title: summaryConversation.title,
+                    messages: summaryConversation.messages,
+                    contextState: refreshedContextState,
+                    llmService: llmService,
+                    settings: settingsSnapshot
+                )
+            }
+        }
+    }
+
+    private func elapsedMilliseconds(since startedAt: Date?) -> Double? {
+        guard let startedAt else { return nil }
+        return Date().timeIntervalSince(startedAt) * 1000
+    }
+
+    private func storeHasDanglingEmptyAssistantMessage(in convId: UUID) -> Bool {
+        guard let conversation = store.conversations.first(where: { $0.id == convId }),
+              let last = conversation.messages.last else {
+            return false
+        }
+
+        return last.role == .assistant &&
+            last.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            (last.toolCalls?.isEmpty ?? true) &&
+            last.toolExecution == nil
     }
 
     private func handleAgentEvent(_ event: AgentEvent, convId: UUID) async {
@@ -650,17 +646,20 @@ class ChatViewModel: ObservableObject {
             lastAssistantDeltaAt = nil
             let assistantMsg = Message(role: .assistant, content: "")
             store.appendMessage(assistantMsg, to: convId)
+            scheduleContextUsageRefresh()
 
         case .assistantDelta(let delta):
             if !delta.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 pendingResponseStatus = nil
                 lastAssistantDeltaAt = Date()
                 if runningToolStatus == nil {
+                    let intentContext = runningIntentContext()
+                    let intentBadges = Array((fileIntentStatus?.badges ?? activeSkillRoutingStatus?.badges ?? []).prefix(3))
                     streamingResponseStatus = StreamingResponseStatus(
                         title: L10n.tr("chat_input.generating"),
                         detail: nil,
-                        context: nil,
-                        badges: [],
+                        context: intentContext,
+                        badges: intentBadges,
                         forceVisible: false
                     )
                 }
@@ -674,6 +673,7 @@ class ChatViewModel: ObservableObject {
         case .assistantToolCalls(let toolCalls):
             flushPendingAssistantDelta()
             store.updateLastAssistantToolCalls(convId, toolCalls: toolCalls)
+            scheduleContextUsageRefresh()
 
         case .toolStarted(let execution, let summary):
             flushPendingAssistantDelta()
@@ -701,7 +701,7 @@ class ChatViewModel: ObservableObject {
                 runningToolStatus = RunningToolStatus(
                     id: execution.id,
                     toolName: execution.name,
-                    title: friendlyToolTitle(for: execution.name),
+                    title: ChatStatusComposer.friendlyToolTitle(for: execution.name),
                     detail: detail,
                     phaseLabel: L10n.tr("chat.phase.running"),
                     badges: [],
@@ -734,12 +734,48 @@ class ChatViewModel: ObservableObject {
             streamingResponseStatus = nil
             assistantActivityFallbackTask?.cancel()
             assistantActivityFallbackTask = nil
-            setCompletedActivityStatus(for: execution, operation: operation)
+            completedActivityDismissTask?.cancel()
+            completedActivityStatus = ChatStatusComposer.makeCompletedActivityStatus(
+                for: execution,
+                result: result,
+                operation: operation,
+                activatedSkillID: activatedSkillID,
+                intentContext: runningIntentContext()
+            )
+            scheduleCompletedActivityDismiss()
+            scheduleContextUsageRefresh()
+        }
+    }
+
+    private func scheduleCompletedActivityDismiss() {
+        completedActivityDismissTask?.cancel()
+        completedActivityDismissTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_800_000_000)
+            await MainActor.run {
+                self?.completedActivityStatus = nil
+            }
         }
     }
 
     private func buildPendingResponseStatus() -> PendingResponseStatus {
         if let intent = fileIntentStatus {
+            let combinedBadges = intent.badges.joined(separator: " ")
+            let looksLikeLongformWriting =
+                combinedBadges.contains("创建文件") ||
+                combinedBadges.contains("重写文档") ||
+                combinedBadges.localizedCaseInsensitiveContains(".md") ||
+                combinedBadges.localizedCaseInsensitiveContains("markdown") ||
+                combinedBadges.localizedCaseInsensitiveContains("txt")
+
+            if looksLikeLongformWriting {
+                return PendingResponseStatus(
+                    title: "正在整理正文",
+                    detail: intent.detail,
+                    context: intent.reason,
+                    badges: intent.badges
+                )
+            }
+
             return PendingResponseStatus(
                 title: intent.title,
                 detail: L10n.tr("chat.waiting.file.detail"),
@@ -808,6 +844,7 @@ class ChatViewModel: ObservableObject {
         pendingAssistantDeltaBuffer = ""
         pendingAssistantDeltaConversationId = nil
         store.updateLastMessageContent(convId, appending: delta, refreshContext: false)
+        scheduleContextUsageRefresh()
     }
 
     private func requestApproval(_ preview: OperationPreview) async -> Bool {
@@ -819,248 +856,29 @@ class ChatViewModel: ObservableObject {
     }
 
     private func buildFileIntentStatus(from analysis: FileIntentAnalysis) -> FileIntentStatus? {
-        guard analysis.kind != .unknown else { return nil }
-
-        let targetName = analysis.targetPath.map { ($0 as NSString).lastPathComponent }
-            ?? analysis.referencedAttachmentID.map { L10n.tr("chat.intent.attachment_target", String($0.prefix(6))) }
-            ?? L10n.tr("chat.intent.unspecified_target")
-        let title = L10n.tr("chat.intent.title", targetName)
-
-        let detail: String
-        if let writeConfirmationQuestion = analysis.writeConfirmationQuestion, !writeConfirmationQuestion.isEmpty {
-            detail = writeConfirmationQuestion
-        } else if let clarificationQuestion = analysis.clarificationQuestion, !clarificationQuestion.isEmpty {
-            detail = clarificationQuestion
-        } else if let executionPlan = analysis.executionPlan, !executionPlan.isEmpty {
-            detail = executionPlan
-        } else {
-            detail = analysis.summary
-        }
-
-        return FileIntentStatus(
-            title: title,
-            detail: detail,
-            reason: explainabilityContext(for: analysis),
-            badges: Array(analysis.badges.prefix(4))
-        )
-    }
-
-    private func explainabilityContext(for analysis: FileIntentAnalysis) -> String? {
-        if let writeConfirmationQuestion = analysis.writeConfirmationQuestion,
-           !writeConfirmationQuestion.isEmpty {
-            return L10n.tr("chat.intent.context.high_risk")
-        }
-
-        if let clarificationQuestion = analysis.clarificationQuestion,
-           !clarificationQuestion.isEmpty {
-            return L10n.tr("chat.intent.context.clarify")
-        }
-
-        var parts: [String] = []
-
-        switch analysis.kind {
-        case .buildWebPage:
-            if analysis.suggestedTools.contains(.writeMultipleFiles) {
-                parts.append(L10n.tr("chat.intent.context.web_batch_write"))
-            }
-        case .updateSpreadsheetCell, .appendSpreadsheetRows:
-            parts.append(L10n.tr("chat.intent.context.spreadsheet_precise"))
-        case .replaceDocumentSection, .insertDocumentSection:
-            parts.append(L10n.tr("chat.intent.context.document_precise"))
-        default:
-            break
-        }
-
-        if let targetReason = analysis.targetReason, !targetReason.isEmpty {
-            parts.append(targetReason)
-        } else if let note = analysis.note, !note.isEmpty {
-            parts.append(note)
-        }
-
-        let unique = Array(NSOrderedSet(array: parts)) as? [String] ?? parts
-        return unique.isEmpty ? nil : unique.joined(separator: " ")
+        ChatStatusComposer.makeFileIntentStatus(from: analysis)
     }
 
     private func humanReadableRunningStatus(for execution: ToolExecutionRecord, intentContext: String?) -> RunningToolStatus? {
-        guard let tool = ToolDefinition.ToolName(rawValue: execution.name),
-              let params = decodeToolParams(execution.arguments, tool: tool) else {
-            return nil
-        }
-
-        func fileName(from path: String?) -> String {
-            guard let path, !path.isEmpty else { return L10n.tr("chat.file.untitled") }
-            return (path as NSString).lastPathComponent
-        }
-
-        func countLabel(_ count: Int, key: String) -> String {
-            L10n.tr(key, String(max(count, 0)))
-        }
-
-        func makeStatus(title: String, detail: String, badges: [String]) -> RunningToolStatus {
-            RunningToolStatus(
-                id: execution.id,
-                toolName: execution.name,
-                title: title,
-                detail: detail,
-                phaseLabel: L10n.tr("chat.phase.running"),
-                badges: badges,
-                context: intentContext
-            )
-        }
-
-        switch tool {
-        case .previewImage:
-            let path = params["path"] as? String
-            return makeStatus(
-                title: L10n.tr("chat.run.preview_image.title", fileName(from: path)),
-                detail: L10n.tr("chat.run.preview_image.detail"),
-                badges: [L10n.tr("chat.badge.image_preview")]
-            )
-        case .writeFile:
-            let path = params["path"] as? String
-            return makeStatus(
-                title: L10n.tr("chat.run.write_file.title", fileName(from: path)),
-                detail: L10n.tr("chat.run.write_file.detail"),
-                badges: [L10n.tr("chat.badge.file_write")]
-            )
-        case .writeMultipleFiles:
-            let files = params["files"] as? [[String: Any]] ?? []
-            let count = files.count
-            let firstName = files.first.flatMap { $0["path"] as? String }.map(fileName(from:)) ?? L10n.tr("chat.file.untitled")
-            let detail = count > 1
-                ? L10n.tr("chat.run.write_multiple_files.detail_many", String(count), firstName)
-                : L10n.tr("chat.run.write_multiple_files.detail_one", firstName)
-            return makeStatus(
-                title: count > 1 ? L10n.tr("chat.run.write_multiple_files.title", String(count)) : L10n.tr("chat.tool.write_file"),
-                detail: detail,
-                badges: [L10n.tr("chat.badge.file_write"), L10n.tr("chat.count.files", String(count))]
-            )
-        case .writeDOCX:
-            let path = params["path"] as? String
-            let title = (params["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return makeStatus(
-                title: L10n.tr("chat.run.write_docx.title", fileName(from: path)),
-                detail: title?.isEmpty == false ? L10n.tr("chat.run.write_docx.detail_with_title", title!) : L10n.tr("chat.run.write_docx.detail"),
-                badges: [L10n.tr("chat.badge.word"), L10n.tr("chat.badge.full_write")]
-            )
-        case .writeXLSX:
-            let path = params["path"] as? String
-            let sheetCount = (params["sheets"] as? [[String: Any]])?.count ?? 0
-            return makeStatus(
-                title: L10n.tr("chat.run.write_xlsx.title", fileName(from: path)),
-                detail: L10n.tr("chat.run.write_xlsx.detail", countLabel(sheetCount, key: "chat.count.sheets")),
-                badges: [L10n.tr("chat.badge.excel"), L10n.tr("chat.badge.full_write")]
-            )
-        case .replaceDOCXSection:
-            let path = params["path"] as? String
-            let section = params["section_title"] as? String ?? L10n.tr("chat.word.untitled_section")
-            return makeStatus(
-                title: L10n.tr("chat.run.update_file.title", fileName(from: path)),
-                detail: L10n.tr("chat.run.replace_docx_section.detail", section),
-                badges: [L10n.tr("chat.badge.word"), L10n.tr("chat.badge.section_replace"), section]
-            )
-        case .insertDOCXSection:
-            let path = params["path"] as? String
-            let section = params["section_title"] as? String ?? L10n.tr("chat.word.untitled_section")
-            let after = (params["after_section_title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let detail = (after?.isEmpty == false)
-                ? L10n.tr("chat.run.insert_docx_section.detail_after", after!, section)
-                : L10n.tr("chat.run.insert_docx_section.detail_end", section)
-            return makeStatus(
-                title: L10n.tr("chat.run.update_file.title", fileName(from: path)),
-                detail: detail,
-                badges: [L10n.tr("chat.badge.word"), L10n.tr("chat.badge.section_insert"), section]
-            )
-        case .appendXLSXRows:
-            let path = params["path"] as? String
-            let sheet = params["sheet_name"] as? String ?? L10n.tr("chat.excel.untitled_sheet")
-            let rows = (params["rows"] as? [[Any]])?.count ?? (params["rows"] as? [[String]])?.count ?? 0
-            return makeStatus(
-                title: L10n.tr("chat.run.update_file.title", fileName(from: path)),
-                detail: L10n.tr("chat.run.append_xlsx_rows.detail", sheet, countLabel(rows, key: "chat.count.rows")),
-                badges: [L10n.tr("chat.badge.excel"), sheet, countLabel(rows, key: "chat.count.rows")]
-            )
-        case .updateXLSXCell:
-            let path = params["path"] as? String
-            let sheet = params["sheet_name"] as? String ?? L10n.tr("chat.excel.untitled_sheet")
-            let cell = params["cell"] as? String ?? L10n.tr("chat.excel.unknown_cell")
-            let value = params["value"] as? String ?? ""
-            let preview = value.count > 24 ? String(value.prefix(24)) + "…" : value
-            return makeStatus(
-                title: L10n.tr("chat.run.update_file.title", fileName(from: path)),
-                detail: L10n.tr("chat.run.update_xlsx_cell.detail", sheet, cell, preview),
-                badges: [L10n.tr("chat.badge.excel"), sheet, cell]
-            )
-        case .exportPDF, .exportDOCX, .exportXLSX:
-            let path = params["path"] as? String
-            return makeStatus(
-                title: L10n.tr("chat.run.export.title", fileName(from: path)),
-                detail: L10n.tr("chat.run.export.detail"),
-                badges: [L10n.tr("chat.badge.file_export")]
-            )
-        case .importFile, .importDirectory:
-            let destination = params["destination_path"] as? String
-            return makeStatus(
-                title: L10n.tr("chat.run.import.title", fileName(from: destination)),
-                detail: L10n.tr("chat.run.import.detail"),
-                badges: [L10n.tr("chat.badge.file_import")]
-            )
-        default:
-            return nil
-        }
-    }
-
-    private func decodeToolParams(_ arguments: String, tool: ToolDefinition.ToolName) -> [String: Any]? {
-        ToolArgumentParser.parse(arguments: arguments, for: tool)
+        ChatStatusComposer.makeRunningToolStatus(for: execution, intentContext: intentContext)
     }
 
     private func runningIntentContext() -> String? {
-        if let reason = fileIntentStatus?.reason?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !reason.isEmpty {
-            return reason
-        }
-        if let title = fileIntentStatus?.title.trimmingCharacters(in: .whitespacesAndNewlines),
-           !title.isEmpty {
-            return title
-        }
-        return nil
+        ChatStatusComposer.runningIntentContext(
+            fileIntentStatus: fileIntentStatus,
+            skillRoutingStatus: activeSkillRoutingStatus
+        )
     }
 
     func refreshConversationRecoveryStatus() {
         guard let conversation = store.currentConversation else {
             conversationRecoveryStatus = nil
+            contextUsageStatus = nil
             return
         }
 
-        let summary = MemoryService.shared.loadSummary(convId: conversation.id)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let detail = (summary?.isEmpty == false)
-            ? summary!
-            : (conversation.contextState.taskSummary.isEmpty ? L10n.tr("context.recovery.detail") : conversation.contextState.taskSummary)
-
-        var badges: [String] = []
-        if !conversation.contextState.activeTargets.isEmpty {
-            badges.append(L10n.tr("context.badge.targets", String(conversation.contextState.activeTargets.count)))
-        }
-        if !conversation.contextState.activeConstraints.isEmpty {
-            badges.append(L10n.tr("context.badge.constraints", String(conversation.contextState.activeConstraints.count)))
-        }
-        if !conversation.contextState.activeSkillNames.isEmpty {
-            badges.append(contentsOf: conversation.contextState.activeSkillNames.prefix(2))
-        }
-
-        let contextSummaryParts = [
-            !conversation.contextState.activeTargets.isEmpty ? L10n.tr("context.recovery.targets") : nil,
-            !conversation.contextState.activeConstraints.isEmpty ? L10n.tr("context.recovery.constraints") : nil,
-            !conversation.contextState.activeSkillNames.isEmpty ? L10n.tr("context.recovery.skills") : nil
-        ].compactMap { $0 }
-
-        conversationRecoveryStatus = ConversationRecoveryStatus(
-            title: L10n.tr("context.recovery.title", conversation.title),
-            detail: detail,
-            context: contextSummaryParts.isEmpty ? nil : contextSummaryParts.joined(separator: " · "),
-            badges: badges
-        )
+        conversationRecoveryStatus = ChatStatusComposer.makeConversationRecoveryStatus(for: conversation)
+        scheduleContextUsageRefresh()
     }
 
     private func isNetworkRelated(_ error: Error) -> Bool {
@@ -1089,156 +907,48 @@ class ChatViewModel: ObservableObject {
         return false
     }
 
+    private func logErrorKind(for errorMessage: String) -> LogErrorKind {
+        let normalized = errorMessage.lowercased()
+        if normalized.contains("timed out") || normalized.contains("超时") {
+            return .timeout
+        }
+        if normalized.contains("network") || normalized.contains("网络") || normalized.contains("connection") {
+            return .network
+        }
+        if normalized.contains("permission") || normalized.contains("权限") {
+            return .permission
+        }
+        return .unknown
+    }
+
     private func preactivateLikelySkillsIfNeeded(convId: UUID, userText: String) {
         guard let conv = store.conversations.first(where: { $0.id == convId }) else { return }
-        let matches = SkillManager.shared.likelyTriggeredSkills(in: userText, excluding: conv.activatedSkillIDs)
+        let matches = SkillManager.shared.likelyTriggeredSkillMatches(in: userText, excluding: conv.activatedSkillIDs)
         guard !matches.isEmpty else { return }
 
-        for skill in matches.prefix(2) {
-            store.markSkillActivated(skill.id, in: convId)
-        }
-    }
-
-    private func friendlyToolTitle(for toolName: String) -> String {
-        switch ToolDefinition.ToolName(rawValue: toolName) {
-        case .activateSkill:
-            return L10n.tr("chat.tool.activate_skill")
-        case .installSkill:
-            return L10n.tr("chat.tool.install_skill")
-        case .readSkillResource:
-            return L10n.tr("chat.tool.read_skill_resource")
-        case .runSkillScript:
-            return L10n.tr("chat.tool.run_skill_script")
-        case .readUploadedAttachment:
-            return L10n.tr("chat.tool.read_uploaded_attachment")
-        case .previewImage:
-            return L10n.tr("chat.tool.preview_image")
-        case .readFile:
-            return L10n.tr("chat.tool.read_file")
-        case .writeFile:
-            return L10n.tr("chat.tool.write_file")
-        case .writeMultipleFiles:
-            return L10n.tr("chat.tool.write_multiple_files")
-        case .writeDOCX:
-            return L10n.tr("chat.tool.write_docx")
-        case .writeXLSX:
-            return L10n.tr("chat.tool.write_xlsx")
-        case .replaceDOCXSection:
-            return L10n.tr("chat.tool.replace_docx_section")
-        case .insertDOCXSection:
-            return L10n.tr("chat.tool.insert_docx_section")
-        case .appendXLSXRows:
-            return L10n.tr("chat.tool.append_xlsx_rows")
-        case .updateXLSXCell:
-            return L10n.tr("chat.tool.update_xlsx_cell")
-        case .listFiles:
-            return L10n.tr("chat.tool.list_files")
-        case .webFetch:
-            return L10n.tr("chat.tool.web_fetch")
-        case .importFile, .importDirectory:
-            return L10n.tr("chat.tool.import_file")
-        case .exportFile, .exportDirectory:
-            return L10n.tr("chat.tool.export_file")
-        case .exportPDF:
-            return L10n.tr("chat.tool.export_pdf")
-        case .exportDOCX:
-            return L10n.tr("chat.tool.export_docx")
-        case .exportXLSX:
-            return L10n.tr("chat.tool.export_xlsx")
-        case .importFileContent:
-            return L10n.tr("chat.tool.import_file_content")
-        case .listExternalFiles:
-            return L10n.tr("chat.tool.list_external_files")
-        case .shell:
-            return L10n.tr("chat.tool.shell")
-        case .none:
-            return L10n.tr("chat.tool.default")
-        }
-    }
-
-    private func setCompletedActivityStatus(for execution: ToolExecutionRecord, operation: FileOperationRecord?) {
-        let title: String
-        let detail: String?
-
-        if let operation {
-            title = L10n.tr("chat.activity.completed")
-            detail = operation.summary.isEmpty ? operation.title : operation.summary
-        } else {
-            title = L10n.tr("chat.activity.completed")
-            detail = friendlyToolTitle(for: execution.name)
-        }
-
-        completedActivityStatus = ConversationActivityStatus(
-            title: title,
-            detail: detail,
-            context: nil,
-            badges: [friendlyToolTitle(for: execution.name)],
-            phaseLabel: L10n.tr("chat.phase.done"),
-            isBusy: false,
-            iconName: "checkmark.circle.fill",
-            accentStyle: .neutral
-        )
-
-        completedActivityDismissTask?.cancel()
-        let status = completedActivityStatus
-        completedActivityDismissTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 1_800_000_000)
-            guard let self, !Task.isCancelled else { return }
-            if self.completedActivityStatus == status {
-                withAnimation(.easeOut(duration: 0.22)) {
-                    self.completedActivityStatus = nil
-                }
+        if let topMatch = matches.first {
+            skillRoutingStatus = ChatStatusComposer.makeSkillRoutingStatus(from: topMatch, conversationID: convId)
+            let traceContext = (currentTraceContext ?? TraceContext(conversationID: convId)).with(conversationID: convId)
+            Task {
+                await LoggerService.shared.log(
+                    category: .skill,
+                    event: "skill_route_selected",
+                    traceContext: traceContext,
+                    status: .succeeded,
+                    summary: "已命中候选 skill：\(topMatch.skill.name)",
+                    metadata: [
+                        "skill_name": .string(topMatch.skill.name),
+                        "score": .int(topMatch.score),
+                        "matched_sources": .strings(topMatch.matchedSignals.map(\.source.rawValue)),
+                        "matched_phrases": .strings(topMatch.matchedSignals.map(\.phrase)),
+                        "blocked_sources": .strings(topMatch.blockedSignals.map(\.source.rawValue))
+                    ]
+                )
             }
         }
-    }
 
-    private func iconName(for toolName: String) -> String {
-        switch ToolDefinition.ToolName(rawValue: toolName) {
-        case .activateSkill:
-            return "wand.and.stars"
-        case .installSkill:
-            return "square.and.arrow.down"
-        case .readSkillResource, .readUploadedAttachment, .readFile, .importFileContent:
-            return "doc.text.magnifyingglass"
-        case .previewImage:
-            return "photo"
-        case .runSkillScript:
-            return "terminal"
-        case .writeFile, .writeMultipleFiles:
-            return "square.and.pencil"
-        case .writeDOCX, .replaceDOCXSection, .insertDOCXSection:
-            return "doc.richtext"
-        case .writeXLSX, .appendXLSXRows, .updateXLSXCell:
-            return "tablecells"
-        case .listFiles, .listExternalFiles:
-            return "folder"
-        case .webFetch:
-            return "globe"
-        case .importFile, .importDirectory:
-            return "square.and.arrow.down.on.square"
-        case .exportFile, .exportDirectory, .exportPDF, .exportDOCX, .exportXLSX:
-            return "square.and.arrow.up"
-        case .shell:
-            return "chevron.left.forwardslash.chevron.right"
-        case .none:
-            return "gearshape.2"
-        }
-    }
-
-    private func accentStyle(for toolName: String) -> ActivityAccentStyle {
-        switch ToolDefinition.ToolName(rawValue: toolName) {
-        case .readSkillResource, .readUploadedAttachment, .readFile, .importFileContent, .listFiles, .listExternalFiles, .webFetch, .previewImage:
-            return .reading
-        case .writeFile, .writeMultipleFiles, .writeDOCX, .writeXLSX, .replaceDOCXSection, .insertDOCXSection, .appendXLSXRows, .updateXLSXCell, .exportFile, .exportDirectory, .exportPDF, .exportDOCX, .exportXLSX:
-            return .writing
-        case .activateSkill, .installSkill, .runSkillScript:
-            return .skill
-        case .shell:
-            return .shell
-        case .importFile, .importDirectory:
-            return .reading
-        case .none:
-            return .neutral
+        for match in matches.prefix(1) {
+            store.markSkillActivated(match.skill.id, in: convId)
         }
     }
 }

@@ -9,8 +9,8 @@ struct NewConversationSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     private var defaultSandboxDir: String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return (home as NSString).appendingPathComponent("SkyAgent")
+        AppStoragePaths.prepareDataDirectories()
+        return AppStoragePaths.workspaceDir.path
     }
 
     var body: some View {

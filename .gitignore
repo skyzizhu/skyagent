@@ -7,6 +7,7 @@ xcuserdata/
 # Build products
 build/
 DerivedData/
+.deriveddata/
 
 # Swift Package / Xcode caches
 .build/

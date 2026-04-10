@@ -7,6 +7,7 @@ struct MessageBubbleView: View, Equatable {
     var onEditUserMessage: ((UUID, String) -> Void)?
     var isLastAssistant: Bool
     var isStreamingAssistant: Bool
+    var activityStatus: ConversationActivityStatus?
 
     private static let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -20,7 +21,8 @@ struct MessageBubbleView: View, Equatable {
         onRegenerate: (() -> Void)? = nil,
         onEditUserMessage: ((UUID, String) -> Void)? = nil,
         isLastAssistant: Bool = false,
-        isStreamingAssistant: Bool = false
+        isStreamingAssistant: Bool = false,
+        activityStatus: ConversationActivityStatus? = nil
     ) {
         self.message = message
         self.onDelete = onDelete
@@ -28,12 +30,14 @@ struct MessageBubbleView: View, Equatable {
         self.onEditUserMessage = onEditUserMessage
         self.isLastAssistant = isLastAssistant
         self.isStreamingAssistant = isStreamingAssistant
+        self.activityStatus = activityStatus
     }
 
     static func == (lhs: MessageBubbleView, rhs: MessageBubbleView) -> Bool {
         lhs.message == rhs.message &&
         lhs.isLastAssistant == rhs.isLastAssistant &&
-        lhs.isStreamingAssistant == rhs.isStreamingAssistant
+        lhs.isStreamingAssistant == rhs.isStreamingAssistant &&
+        lhs.activityStatus == rhs.activityStatus
     }
 
     private var timeString: String {
@@ -70,24 +74,24 @@ struct MessageBubbleView: View, Equatable {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(message.content, forType: .string)
             } label: {
-                Label("复制内容", systemImage: "doc.on.doc")
+                Label(L10n.tr("message.action.copy"), systemImage: "doc.on.doc")
             }
 
             if message.role == .user && onEditUserMessage != nil {
                 Button { showEditAlert() } label: {
-                    Label("编辑消息", systemImage: "pencil")
+                    Label(L10n.tr("message.action.edit"), systemImage: "pencil")
                 }
             }
 
             if onDelete != nil {
                 Button(role: .destructive) { onDelete?() } label: {
-                    Label("删除消息", systemImage: "trash")
+                    Label(L10n.tr("message.action.delete"), systemImage: "trash")
                 }
             }
 
             if isLastAssistant && onRegenerate != nil {
                 Button { onRegenerate?() } label: {
-                    Label("重新生成", systemImage: "arrow.clockwise")
+                    Label(L10n.tr("message.action.regenerate"), systemImage: "arrow.clockwise")
                 }
             }
         }
@@ -115,14 +119,12 @@ struct MessageBubbleView: View, Equatable {
     private var bubbleContent: some View {
         switch message.role {
         case .assistant:
-            if message.content.isEmpty {
+            if !message.content.isEmpty {
                 assistantFlowSurface {
-                    TypingIndicatorView()
+                    MarkdownContentView(content: message.content, isStreaming: isStreamingAssistant)
                 }
             } else {
-                assistantFlowSurface {
-                    MarkdownContentView(content: message.content)
-                }
+                EmptyView()
             }
 
         case .tool:
@@ -192,13 +194,13 @@ struct MessageBubbleView: View, Equatable {
 
     private func showEditAlert() {
         let alert = NSAlert()
-        alert.messageText = "编辑消息"
-        alert.informativeText = "修改后将从这条消息开始重新生成回复"
+        alert.messageText = L10n.tr("message.edit.title")
+        alert.informativeText = L10n.tr("message.edit.message")
         let textField = NSTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
         textField.stringValue = message.content
         alert.accessoryView = textField
-        alert.addButton(withTitle: "确定")
-        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: L10n.tr("common.confirm"))
+        alert.addButton(withTitle: L10n.tr("common.cancel"))
         alert.window.initialFirstResponder = textField
 
         if alert.runModal() == .alertFirstButtonReturn {

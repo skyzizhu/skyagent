@@ -12,7 +12,12 @@ class ConversationStore: ObservableObject {
 
     private let attachmentStore: UploadedAttachmentStore
     private let saveDirURL: URL
+    private let persistenceQueue = DispatchQueue(label: "SkyAgent.ConversationPersistence", qos: .utility)
+    private let contextRefreshQueue = DispatchQueue(label: "SkyAgent.ContextRefresh", qos: .utility)
+    private let attachmentCleanupQueue = DispatchQueue(label: "SkyAgent.AttachmentCleanup", qos: .utility)
     private var pendingSaveWorkItem: DispatchWorkItem?
+    private var contextRefreshWorkItems: [UUID: DispatchWorkItem] = [:]
+    private var pendingAttachmentCleanupWorkItem: DispatchWorkItem?
 
     var currentConversation: Conversation? {
         conversations.first { $0.id == currentConversationId }
@@ -20,12 +25,12 @@ class ConversationStore: ObservableObject {
 
     init(
         settings: AppSettings? = nil,
-        attachmentStore: UploadedAttachmentStore = .shared,
+        attachmentStore: UploadedAttachmentStore? = nil,
         saveDir: URL? = nil
     ) {
         AppStoragePaths.migrateLegacyDataIfNeeded()
         self.settings = settings ?? AppSettings.load()
-        self.attachmentStore = attachmentStore
+        self.attachmentStore = attachmentStore ?? UploadedAttachmentStore.shared
         self.saveDirURL = saveDir ?? AppStoragePaths.dataDir
         try? FileManager.default.createDirectory(at: self.saveDirURL, withIntermediateDirectories: true)
         loadConversations()
@@ -38,18 +43,34 @@ class ConversationStore: ObservableObject {
 
     @discardableResult
     func newConversation() -> Conversation {
-        let conv = Conversation(title: "新对话")
+        let conv = Conversation(title: L10n.tr("conversation.new"))
         conversations.insert(conv, at: 0)
-        refreshConversationContext(conv.id)
+        refreshConversationContext(conv.id, immediately: true)
         currentConversationId = conv.id
         saveConversations()
         return conv
     }
 
     func selectConversation(_ id: UUID) {
-        guard conversations.contains(where: { $0.id == id }) else { return }
-        refreshConversationContext(id)
+        guard let conversation = conversations.first(where: { $0.id == id }) else { return }
         currentConversationId = id
+        let fallbackSandboxDir = settings.ensureSandboxDir()
+        let snapshot = conversation
+        let workItem = DispatchWorkItem { [weak self] in
+            let state = ConversationContextService.shared.buildState(
+                for: snapshot,
+                fallbackSandboxDir: fallbackSandboxDir
+            )
+            DispatchQueue.main.async {
+                guard let self,
+                      self.currentConversationId == id,
+                      let idx = self.conversations.firstIndex(where: { $0.id == id }) else { return }
+                self.conversations[idx].contextState = state
+            }
+        }
+        contextRefreshWorkItems[id]?.cancel()
+        contextRefreshWorkItems[id] = workItem
+        contextRefreshQueue.async(execute: workItem)
     }
 
     func deleteConversation(_ id: UUID) {
@@ -102,6 +123,13 @@ class ConversationStore: ObservableObject {
         guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
         conversations[idx].title = title
         refreshConversationContext(id)
+        saveConversations()
+    }
+
+    func toggleFavoriteConversation(_ id: UUID) {
+        guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
+        conversations[idx].isFavorite.toggle()
+        conversations[idx].lastActiveAt = Date()
         saveConversations()
     }
 
@@ -234,6 +262,7 @@ class ConversationStore: ObservableObject {
             LLMService.ChatMessage(
                 role: message.role.rawValue,
                 content: message.content,
+                imageDataURL: message.imageDataURL,
                 toolCallId: message.toolExecution?.id,
                 toolCalls: message.toolCalls
             )
@@ -292,8 +321,11 @@ class ConversationStore: ObservableObject {
         pendingSaveWorkItem?.cancel()
         pendingSaveWorkItem = nil
         let url = saveDir.appendingPathComponent("conversations.json")
-        if let data = try? JSONEncoder().encode(conversations) {
-            try? data.write(to: url)
+        let snapshot = conversations
+        persistenceQueue.async {
+            if let data = try? JSONEncoder().encode(snapshot) {
+                try? data.write(to: url, options: .atomic)
+            }
         }
     }
 
@@ -302,10 +334,10 @@ class ConversationStore: ObservableObject {
         guard let data = try? Data(contentsOf: url),
               let loaded = try? JSONDecoder().decode([Conversation].self, from: data) else { return }
         conversations = loaded
-        for conversation in conversations {
-            refreshConversationContext(conversation.id)
-        }
         currentConversationId = conversations.first?.id
+        if let currentConversationId {
+            refreshConversationContext(currentConversationId, immediately: true)
+        }
     }
 
     private var saveDir: URL {
@@ -313,15 +345,31 @@ class ConversationStore: ObservableObject {
     }
 
     private func cleanupStaleAttachments() {
-        cleanupUnusedAttachments(removeAllOrphans: false)
+        scheduleAttachmentCleanup(removeAllOrphans: false, delay: 0)
     }
 
     private func cleanupUnusedAttachments(removeAllOrphans: Bool) {
+        scheduleAttachmentCleanup(removeAllOrphans: removeAllOrphans, delay: 0.12)
+    }
+
+    private func scheduleAttachmentCleanup(removeAllOrphans: Bool, delay: TimeInterval) {
         let retainedIDs = referencedAttachmentIDs()
-        _ = attachmentStore.cleanupOrphanedDocuments(
-            retaining: retainedIDs,
-            olderThan: removeAllOrphans ? nil : Self.staleAttachmentLifetime
-        )
+        let age = removeAllOrphans ? nil : Self.staleAttachmentLifetime
+        pendingAttachmentCleanupWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem { [attachmentStore] in
+            _ = attachmentStore.cleanupOrphanedDocuments(
+                retaining: retainedIDs,
+                olderThan: age
+            )
+        }
+        pendingAttachmentCleanupWorkItem = workItem
+
+        if delay <= 0 {
+            attachmentCleanupQueue.async(execute: workItem)
+        } else {
+            attachmentCleanupQueue.asyncAfter(deadline: .now() + delay, execute: workItem)
+        }
     }
 
     private func referencedAttachmentIDs() -> Set<String> {
@@ -330,12 +378,36 @@ class ConversationStore: ObservableObject {
         })
     }
 
-    func refreshConversationContext(_ convId: UUID) {
+    func refreshConversationContext(_ convId: UUID, immediately: Bool = false) {
         guard let idx = conversations.firstIndex(where: { $0.id == convId }) else { return }
-        conversations[idx].contextState = ConversationContextService.shared.buildState(
-            for: conversations[idx],
-            fallbackSandboxDir: settings.ensureSandboxDir()
-        )
+
+        let snapshot = conversations[idx]
+        let expectedMessageCount = snapshot.messages.count
+        let expectedLastMessageID = snapshot.messages.last?.id
+        let fallbackSandboxDir = settings.ensureSandboxDir()
+
+        contextRefreshWorkItems[convId]?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            let state = ConversationContextService.shared.buildState(
+                for: snapshot,
+                fallbackSandboxDir: fallbackSandboxDir
+            )
+
+            DispatchQueue.main.async {
+                guard let self else { return }
+                defer { self.contextRefreshWorkItems[convId] = nil }
+                guard let currentIndex = self.conversations.firstIndex(where: { $0.id == convId }) else { return }
+                guard self.conversations[currentIndex].messages.count == expectedMessageCount,
+                      self.conversations[currentIndex].messages.last?.id == expectedLastMessageID else { return }
+                self.conversations[currentIndex].contextState = state
+            }
+        }
+        contextRefreshWorkItems[convId] = workItem
+        if immediately {
+            contextRefreshQueue.async(execute: workItem)
+        } else {
+            contextRefreshQueue.asyncAfter(deadline: .now() + 0.12, execute: workItem)
+        }
     }
 
     private func scheduleSaveConversations(delay: TimeInterval = 0.35) {
@@ -346,5 +418,10 @@ class ConversationStore: ObservableObject {
         }
         pendingSaveWorkItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    deinit {
+        pendingAttachmentCleanupWorkItem?.cancel()
+        contextRefreshWorkItems.values.forEach { $0.cancel() }
     }
 }

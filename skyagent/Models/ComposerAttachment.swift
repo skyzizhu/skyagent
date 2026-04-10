@@ -16,44 +16,53 @@ struct ComposerAttachment: Identifiable {
     let previewImage: NSImage?
     let userVisibleLabel: String
     let modelContext: String
+    let imageDataURL: String?
     let attachmentID: String?
     let structureSummary: String?
     let structureItems: [String]
 
-    private static let maxDocumentCharacters = 24_000
-    private static let maxPDFOCRPages = 12
-    private static let maxUploadFileSizeBytes = 25 * 1024 * 1024
-    private static let chunkSize = 3_500
-    private static let previewChunkLength = 900
-    private static let supportedTextExtensions: Set<String> = [
+    nonisolated private static let maxDocumentCharacters = 24_000
+    nonisolated private static let maxPDFOCRPages = 12
+    nonisolated private static let maxUploadFileSizeBytes = 25 * 1024 * 1024
+    nonisolated private static let chunkSize = 3_500
+    nonisolated private static let previewChunkLength = 900
+    nonisolated private static let supportedTextExtensions: Set<String> = [
         "txt", "md", "markdown", "csv", "json", "xml", "yaml", "yml",
         "html", "css", "js", "jsx", "ts", "tsx", "py", "swift", "java",
         "c", "cc", "cpp", "h", "hpp", "go", "rs", "rb", "sh", "zsh",
         "bash", "sql", "kt", "m", "mm", "php", "vue"
     ]
-    private static let imageExtensions: Set<String> = [
+    nonisolated private static let imageExtensions: Set<String> = [
         "png", "jpg", "jpeg", "gif", "tiff", "bmp", "heic", "heif", "webp"
     ]
-    private static let officeExtensions: Set<String> = ["docx", "xlsx", "pptx"]
+    nonisolated private static let officeExtensions: Set<String> = ["docx", "xlsx", "pptx"]
 
-    static var supportedFileExtensions: [String] {
+    nonisolated static var supportedFileExtensions: [String] {
         Array(imageExtensions.union(supportedTextExtensions).union(officeExtensions).union(["pdf"])).sorted()
     }
 
-    static func fromImage(_ image: NSImage, fileName: String = "image.png") throws -> ComposerAttachment {
-        guard let tiffData = image.tiffRepresentation,
+    nonisolated static func fromImage(_ image: NSImage, fileName: String = "image.png") throws -> ComposerAttachment {
+        guard let imageData = image.tiffRepresentation else {
+            throw AttachmentError.failedToReadImage
+        }
+        return try fromImageData(imageData, fileName: fileName)
+    }
+
+    nonisolated static func fromImageData(_ imageData: Data, fileName: String = "image.png") throws -> ComposerAttachment {
+        guard let image = NSImage(data: imageData),
+              let tiffData = image.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiffData),
               let pngData = bitmap.representation(using: .png, properties: [:]) else {
             throw AttachmentError.failedToReadImage
         }
 
         let base64 = pngData.base64EncodedString()
+        let dataURL = "data:image/png;base64,\(base64)"
         let context = """
         [上传图片]
         文件名: \(fileName)
         MIME: image/png
-        说明: 用户上传了一张图片，请结合用户的问题分析这张图片。
-        [图片:data:image/png;base64,\(base64)]
+        说明: 用户上传了一张图片，请结合用户的问题直接分析图片内容。
         [/上传图片]
         """
 
@@ -64,21 +73,19 @@ struct ComposerAttachment: Identifiable {
             previewImage: image,
             userVisibleLabel: "[已上传图片：\(fileName)]",
             modelContext: context,
+            imageDataURL: dataURL,
             attachmentID: nil,
             structureSummary: nil,
             structureItems: []
         )
     }
 
-    static func fromFile(url: URL) throws -> ComposerAttachment {
+    nonisolated static func fromFile(url: URL) throws -> ComposerAttachment {
         let fileName = url.lastPathComponent
         let ext = url.pathExtension.lowercased()
 
         if imageExtensions.contains(ext) {
-            guard let image = NSImage(contentsOf: url) else {
-                throw AttachmentError.failedToReadImage
-            }
-            return try fromImage(image, fileName: fileName)
+            return try fromImageData(Data(contentsOf: url), fileName: fileName)
         }
 
         let values = try url.resourceValues(forKeys: [.fileSizeKey])
@@ -159,6 +166,7 @@ struct ComposerAttachment: Identifiable {
                 previewImage: nil,
                 userVisibleLabel: "[已上传文件：\(fileName) · \(usedOCR ? "PDF(OCR)" : "PDF")]",
                 modelContext: context,
+                imageDataURL: nil,
                 attachmentID: document.id,
                 structureSummary: "共 \(pages.count) 页",
                 structureItems: pages.enumerated().map { "第\($0.offset + 1)页" }
@@ -221,6 +229,7 @@ struct ComposerAttachment: Identifiable {
                 previewImage: nil,
                 userVisibleLabel: "[已上传文件：\(fileName) · \(extracted.typeName)]",
                 modelContext: context,
+                imageDataURL: nil,
                 attachmentID: document.id,
                 structureSummary: structureSummary(for: ext, segments: extracted.segments),
                 structureItems: extracted.segments.map(\.title)
@@ -266,20 +275,21 @@ struct ComposerAttachment: Identifiable {
             previewImage: nil,
             userVisibleLabel: "[已上传文件：\(fileName) · \(typeName)]",
             modelContext: context,
+            imageDataURL: nil,
             attachmentID: document.id,
             structureSummary: "共 \(document.segments.count) 个片段",
             structureItems: document.segments.map(\.title)
         )
     }
 
-    private static func decodeText(_ data: Data) -> String {
+    nonisolated private static func decodeText(_ data: Data) -> String {
         if let text = String(data: data, encoding: .utf8) { return text }
         if let text = String(data: data, encoding: .unicode) { return text }
         if let text = String(data: data, encoding: .utf16) { return text }
         return String(decoding: data, as: UTF8.self)
     }
 
-    private static func clippedContent(_ content: String) -> (content: String, notice: String) {
+    nonisolated private static func clippedContent(_ content: String) -> (content: String, notice: String) {
         let normalized = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard normalized.count > maxDocumentCharacters else {
             return (normalized, "")
@@ -289,7 +299,7 @@ struct ComposerAttachment: Identifiable {
         return (clipped, "注意：原文件内容较长，这里只附加了前 \(maxDocumentCharacters) 个字符。")
     }
 
-    private static func storeChunkedDocument(
+    nonisolated private static func storeChunkedDocument(
         fileName: String,
         typeName: String,
         detail: String,
@@ -306,7 +316,7 @@ struct ComposerAttachment: Identifiable {
         )
     }
 
-    private static func makeChunks(from content: String) -> [UploadedAttachmentChunk] {
+    nonisolated private static func makeChunks(from content: String) -> [UploadedAttachmentChunk] {
         let normalized = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else {
             return [UploadedAttachmentChunk(index: 1, title: "第1块", content: "")]
@@ -344,7 +354,7 @@ struct ComposerAttachment: Identifiable {
         return chunks.isEmpty ? [UploadedAttachmentChunk(index: 1, title: "第1块", content: normalized)] : chunks
     }
 
-    private static func makeSemanticSegments(from content: String) -> [UploadedAttachmentSegment] {
+    nonisolated private static func makeSemanticSegments(from content: String) -> [UploadedAttachmentSegment] {
         let normalized = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else {
             return [UploadedAttachmentSegment(index: 1, kind: .segment, title: "第1段", content: "")]
@@ -400,7 +410,7 @@ struct ComposerAttachment: Identifiable {
         }
     }
 
-    private static func isSemanticHeading(_ line: String) -> Bool {
+    nonisolated private static func isSemanticHeading(_ line: String) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         if trimmed.hasPrefix("#") { return true }
@@ -415,7 +425,7 @@ struct ComposerAttachment: Identifiable {
         return false
     }
 
-    private static func cleanedHeadingTitle(from line: String) -> String {
+    nonisolated private static func cleanedHeadingTitle(from line: String) -> String {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasPrefix("#") {
             let stripped = trimmed.replacingOccurrences(of: #"^#+\s*"#, with: "", options: .regularExpression)
@@ -424,7 +434,7 @@ struct ComposerAttachment: Identifiable {
         return semanticTitle(from: trimmed, fallback: "未命名片段")
     }
 
-    private static func semanticTitle(from content: String, fallback: String) -> String {
+    nonisolated private static func semanticTitle(from content: String, fallback: String) -> String {
         let lines = content
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -434,7 +444,7 @@ struct ComposerAttachment: Identifiable {
         return title.isEmpty ? fallback : title
     }
 
-    private static func codeFenceLanguage(for ext: String) -> String {
+    nonisolated private static func codeFenceLanguage(for ext: String) -> String {
         switch ext {
         case "md", "markdown": return "markdown"
         case "csv": return "csv"
@@ -465,7 +475,7 @@ struct ComposerAttachment: Identifiable {
         }
     }
 
-    private static func typeDisplayName(for ext: String) -> String {
+    nonisolated private static func typeDisplayName(for ext: String) -> String {
         switch ext {
         case "txt": return "文本"
         case "md", "markdown": return "Markdown"
@@ -484,7 +494,7 @@ struct ComposerAttachment: Identifiable {
         }
     }
 
-    private static func structureSummary(for ext: String, segments: [UploadedAttachmentSegment]) -> String? {
+    nonisolated private static func structureSummary(for ext: String, segments: [UploadedAttachmentSegment]) -> String? {
         guard !segments.isEmpty else { return nil }
         switch ext {
         case "xlsx":
@@ -498,7 +508,7 @@ struct ComposerAttachment: Identifiable {
         }
     }
 
-    private static func extractOfficeDocument(at url: URL, ext: String) throws -> (typeName: String, content: String, segments: [UploadedAttachmentSegment]) {
+    nonisolated private static func extractOfficeDocument(at url: URL, ext: String) throws -> (typeName: String, content: String, segments: [UploadedAttachmentSegment]) {
         switch ext {
         case "docx":
             let xml = try unzipEntry("word/document.xml", from: url)
@@ -567,7 +577,7 @@ struct ComposerAttachment: Identifiable {
         }
     }
 
-    private static func listZipEntries(in url: URL) throws -> [String] {
+    nonisolated private static func listZipEntries(in url: URL) throws -> [String] {
         let output = try runProcess(launchPath: "/usr/bin/unzip", arguments: ["-Z1", url.path])
         return output
             .components(separatedBy: .newlines)
@@ -575,7 +585,7 @@ struct ComposerAttachment: Identifiable {
             .filter { !$0.isEmpty }
     }
 
-    private static func unzipEntry(_ entry: String, from url: URL) throws -> Data {
+    nonisolated private static func unzipEntry(_ entry: String, from url: URL) throws -> Data {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
         process.arguments = ["-p", url.path, entry]
@@ -596,7 +606,7 @@ struct ComposerAttachment: Identifiable {
         return data
     }
 
-    private static func runProcess(launchPath: String, arguments: [String]) throws -> String {
+    nonisolated private static func runProcess(launchPath: String, arguments: [String]) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: launchPath)
         process.arguments = arguments
@@ -620,7 +630,7 @@ struct ComposerAttachment: Identifiable {
         return decodeText(outputData)
     }
 
-    private static func normalizeWorkbookTarget(_ target: String) -> String {
+    nonisolated private static func normalizeWorkbookTarget(_ target: String) -> String {
         let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasPrefix("xl/") {
             return trimmed
@@ -637,7 +647,7 @@ struct ComposerAttachment: Identifiable {
         return "xl/\(trimmed)"
     }
 
-    private static func recognizeText(in page: PDFPage) -> String? {
+    nonisolated private static func recognizeText(in page: PDFPage) -> String? {
         let bounds = page.bounds(for: .mediaBox)
         let targetWidth: CGFloat = 1800
         let scale = max(targetWidth / max(bounds.width, 1), 1)
@@ -666,7 +676,7 @@ struct ComposerAttachment: Identifiable {
         return text.isEmpty ? nil : text
     }
 
-    private static func cgImage(from image: NSImage) -> CGImage? {
+    nonisolated private static func cgImage(from image: NSImage) -> CGImage? {
         var proposedRect = CGRect(origin: .zero, size: image.size)
         if let cgImage = image.cgImage(forProposedRect: &proposedRect, context: nil, hints: nil) {
             return cgImage
@@ -731,10 +741,14 @@ enum AttachmentError: LocalizedError {
 }
 
 private final class XMLTextExtractor: NSObject, XMLParserDelegate {
-    private var currentText = ""
-    private var blocks: [String] = []
+    nonisolated(unsafe) private var currentText = ""
+    nonisolated(unsafe) private var blocks: [String] = []
 
-    static func extractPlainText(from data: Data) -> String {
+    nonisolated override init() {
+        super.init()
+    }
+
+    nonisolated static func extractPlainText(from data: Data) -> String {
         let extractor = XMLTextExtractor()
         let parser = XMLParser(data: data)
         parser.delegate = extractor
@@ -745,11 +759,11 @@ private final class XMLTextExtractor: NSObject, XMLParserDelegate {
             .joined(separator: "\n")
     }
 
-    func parser(_ parser: XMLParser, foundCharacters string: String) {
+    nonisolated func parser(_ parser: XMLParser, foundCharacters string: String) {
         currentText += string
     }
 
-    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
+    nonisolated func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
         let element = qName ?? elementName
         if element.hasSuffix(":t") || element == "t" || element.hasSuffix(":v") || element == "v" {
             let text = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -764,11 +778,15 @@ private final class XMLTextExtractor: NSObject, XMLParserDelegate {
 }
 
 private final class SharedStringsExtractor: NSObject, XMLParserDelegate {
-    private var currentText = ""
-    private var currentItem = ""
-    private var strings: [String] = []
+    nonisolated(unsafe) private var currentText = ""
+    nonisolated(unsafe) private var currentItem = ""
+    nonisolated(unsafe) private var strings: [String] = []
 
-    static func extract(from data: Data) -> [String] {
+    nonisolated override init() {
+        super.init()
+    }
+
+    nonisolated static func extract(from data: Data) -> [String] {
         let extractor = SharedStringsExtractor()
         let parser = XMLParser(data: data)
         parser.delegate = extractor
@@ -776,11 +794,11 @@ private final class SharedStringsExtractor: NSObject, XMLParserDelegate {
         return extractor.strings
     }
 
-    func parser(_ parser: XMLParser, foundCharacters string: String) {
+    nonisolated func parser(_ parser: XMLParser, foundCharacters string: String) {
         currentText += string
     }
 
-    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
+    nonisolated func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
         let element = qName ?? elementName
         if element.hasSuffix(":t") || element == "t" {
             currentItem += currentText
@@ -793,18 +811,18 @@ private final class SharedStringsExtractor: NSObject, XMLParserDelegate {
 }
 
 private final class WorksheetExtractor: NSObject, XMLParserDelegate {
-    private let sharedStrings: [String]
-    private var rows: [String] = []
-    private var currentRow: [String] = []
-    private var currentCellType: String?
-    private var currentValue = ""
-    private var collectingValue = false
+    nonisolated private let sharedStrings: [String]
+    nonisolated(unsafe) private var rows: [String] = []
+    nonisolated(unsafe) private var currentRow: [String] = []
+    nonisolated(unsafe) private var currentCellType: String?
+    nonisolated(unsafe) private var currentValue = ""
+    nonisolated(unsafe) private var collectingValue = false
 
-    init(sharedStrings: [String]) {
+    nonisolated init(sharedStrings: [String]) {
         self.sharedStrings = sharedStrings
     }
 
-    static func extractRows(from data: Data, sharedStrings: [String]) -> [String] {
+    nonisolated static func extractRows(from data: Data, sharedStrings: [String]) -> [String] {
         let extractor = WorksheetExtractor(sharedStrings: sharedStrings)
         let parser = XMLParser(data: data)
         parser.delegate = extractor
@@ -812,7 +830,7 @@ private final class WorksheetExtractor: NSObject, XMLParserDelegate {
         return extractor.rows
     }
 
-    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String : String] = [:]) {
+    nonisolated func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String : String] = [:]) {
         let element = qName ?? elementName
         if element.hasSuffix(":row") || element == "row" {
             currentRow = []
@@ -825,13 +843,13 @@ private final class WorksheetExtractor: NSObject, XMLParserDelegate {
         }
     }
 
-    func parser(_ parser: XMLParser, foundCharacters string: String) {
+    nonisolated func parser(_ parser: XMLParser, foundCharacters string: String) {
         if collectingValue {
             currentValue += string
         }
     }
 
-    func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
+    nonisolated func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
         let element = qName ?? elementName
         if element.hasSuffix(":v") || element == "v" || element.hasSuffix(":t") || element == "t" {
             collectingValue = false
@@ -854,7 +872,7 @@ private final class WorksheetExtractor: NSObject, XMLParserDelegate {
         }
     }
 
-    private func resolvedCellValue() -> String {
+    nonisolated private func resolvedCellValue() -> String {
         let trimmed = currentValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "" }
         if currentCellType == "s", let index = Int(trimmed), sharedStrings.indices.contains(index) {
@@ -870,9 +888,13 @@ private struct WorkbookSheetMetadata {
 }
 
 private final class WorkbookSheetsExtractor: NSObject, XMLParserDelegate {
-    private var sheets: [WorkbookSheetMetadata] = []
+    nonisolated(unsafe) private var sheets: [WorkbookSheetMetadata] = []
 
-    static func extract(from data: Data) -> [WorkbookSheetMetadata] {
+    nonisolated override init() {
+        super.init()
+    }
+
+    nonisolated static func extract(from data: Data) -> [WorkbookSheetMetadata] {
         let extractor = WorkbookSheetsExtractor()
         let parser = XMLParser(data: data)
         parser.delegate = extractor
@@ -880,7 +902,7 @@ private final class WorkbookSheetsExtractor: NSObject, XMLParserDelegate {
         return extractor.sheets
     }
 
-    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String : String] = [:]) {
+    nonisolated func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String : String] = [:]) {
         let element = qName ?? elementName
         guard element.hasSuffix(":sheet") || element == "sheet" else { return }
         guard let name = attributeDict["name"],
@@ -890,9 +912,13 @@ private final class WorkbookSheetsExtractor: NSObject, XMLParserDelegate {
 }
 
 private final class WorkbookRelationshipsExtractor: NSObject, XMLParserDelegate {
-    private var relationships: [String: String] = [:]
+    nonisolated(unsafe) private var relationships: [String: String] = [:]
 
-    static func extract(from data: Data) -> [String: String] {
+    nonisolated override init() {
+        super.init()
+    }
+
+    nonisolated static func extract(from data: Data) -> [String: String] {
         let extractor = WorkbookRelationshipsExtractor()
         let parser = XMLParser(data: data)
         parser.delegate = extractor
@@ -900,7 +926,7 @@ private final class WorkbookRelationshipsExtractor: NSObject, XMLParserDelegate 
         return extractor.relationships
     }
 
-    func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String : String] = [:]) {
+    nonisolated func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String : String] = [:]) {
         let element = qName ?? elementName
         guard element.hasSuffix(":Relationship") || element == "Relationship" else { return }
         guard let id = attributeDict["Id"], let target = attributeDict["Target"] else { return }
