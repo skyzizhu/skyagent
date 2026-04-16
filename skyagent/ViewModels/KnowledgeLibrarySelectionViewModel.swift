@@ -17,11 +17,13 @@ final class KnowledgeLibrarySelectionViewModel: ObservableObject {
     @Published private(set) var importHealthByLibraryID: [String: LibraryImportHealth] = [:]
     @Published private(set) var suggestedLibraryIDs: Set<String> = []
     @Published var searchText = ""
+    @Published private(set) var visibleLibraries: [KnowledgeLibrary] = []
 
     private let conversationID: UUID
     private let store: ConversationStore
     private let service: KnowledgeBaseService
     private var refreshToken = UUID()
+    private var cancellables = Set<AnyCancellable>()
 
     private struct Snapshot {
         let libraries: [KnowledgeLibrary]
@@ -41,6 +43,7 @@ final class KnowledgeLibrarySelectionViewModel: ObservableObject {
         self.selectedLibraryIDs = Set(
             store.conversations.first(where: { $0.id == conversationID })?.knowledgeLibraryIDs ?? []
         )
+        bindSearch()
         refresh()
     }
 
@@ -49,16 +52,7 @@ final class KnowledgeLibrarySelectionViewModel: ObservableObject {
     }
 
     var filteredLibraries: [KnowledgeLibrary] {
-        let needle = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let base = libraries.sorted(by: shouldSortLibrary)
-        guard !needle.isEmpty else { return base }
-        return base.filter { library in
-            [
-                library.name,
-                library.sourceRoot ?? "",
-                library.id.uuidString
-            ].contains { $0.lowercased().contains(needle) }
-        }
+        visibleLibraries
     }
 
     func refresh() {
@@ -128,6 +122,7 @@ final class KnowledgeLibrarySelectionViewModel: ObservableObject {
                 self.workspaceLibraryID = snapshot.workspaceLibraryID
                 self.importHealthByLibraryID = snapshot.importHealthByLibraryID
                 self.suggestedLibraryIDs = snapshot.suggestedLibraryIDs
+                self.recomputeVisibleLibraries()
             }
         }
     }
@@ -140,6 +135,7 @@ final class KnowledgeLibrarySelectionViewModel: ObservableObject {
         } else {
             selectedLibraryIDs.removeAll()
         }
+        recomputeVisibleLibraries()
     }
 
     func toggleLibrary(_ libraryID: String) {
@@ -148,16 +144,19 @@ final class KnowledgeLibrarySelectionViewModel: ObservableObject {
         } else {
             selectedLibraryIDs.insert(libraryID)
         }
+        recomputeVisibleLibraries()
     }
 
     func applySuggestedLibraries() {
         guard !suggestedLibraryIDs.isEmpty else { return }
         selectedLibraryIDs.formUnion(suggestedLibraryIDs)
+        recomputeVisibleLibraries()
     }
 
     func replaceWithSuggestedLibraries() {
         guard !suggestedLibraryIDs.isEmpty else { return }
         selectedLibraryIDs = suggestedLibraryIDs
+        recomputeVisibleLibraries()
     }
 
     func applySelection() {
@@ -178,6 +177,7 @@ final class KnowledgeLibrarySelectionViewModel: ObservableObject {
         )
         refresh()
         selectedLibraryIDs.insert(library.id.uuidString)
+        recomputeVisibleLibraries()
         return library
     }
 
@@ -197,6 +197,33 @@ final class KnowledgeLibrarySelectionViewModel: ObservableObject {
 
     var conversationStore: ConversationStore {
         store
+    }
+
+    private func bindSearch() {
+        $searchText
+            .debounce(for: .milliseconds(120), scheduler: RunLoop.main)
+            .removeDuplicates()
+            .sink { [weak self] _ in
+                self?.recomputeVisibleLibraries()
+            }
+            .store(in: &cancellables)
+    }
+
+    private func recomputeVisibleLibraries() {
+        let needle = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let base = libraries.sorted(by: shouldSortLibrary)
+        guard !needle.isEmpty else {
+            visibleLibraries = base
+            return
+        }
+
+        visibleLibraries = base.filter { library in
+            [
+                library.name,
+                library.sourceRoot ?? "",
+                library.id.uuidString
+            ].contains { $0.lowercased().contains(needle) }
+        }
     }
 
     private func shouldSortLibrary(_ lhs: KnowledgeLibrary, _ rhs: KnowledgeLibrary) -> Bool {

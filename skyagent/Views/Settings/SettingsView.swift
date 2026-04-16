@@ -46,6 +46,8 @@ struct SettingsView: View {
         var traceIDsCount: Int = 0
         var errorCount: Int = 0
         var slowTraces: [SlowTraceSummary] = []
+        var focusedTraceID: String?
+        var focusedTraceEntries: [PersistedLogEvent] = []
     }
 
     enum LogQuickFilter: String, CaseIterable, Identifiable {
@@ -1048,8 +1050,8 @@ struct SettingsView: View {
                     let categoryOptions = logAnalysisSnapshot.categoryOptions
                     let traceIDsCount = logAnalysisSnapshot.traceIDsCount
                     let errorCount = logAnalysisSnapshot.errorCount
-                    let focusedTraceID = activeLogTraceID
-                    let focusedTraceEntries = focusedTraceID.map { traceLogEntries(traceID: $0) } ?? []
+                    let focusedTraceID = logAnalysisSnapshot.focusedTraceID
+                    let focusedTraceEntries = logAnalysisSnapshot.focusedTraceEntries
                     let slowTraces = logAnalysisSnapshot.slowTraces
 
                     HStack(spacing: 10) {
@@ -1091,7 +1093,7 @@ struct SettingsView: View {
                     labeledTextField("Trace ID", text: $logTraceFilter)
 
                     if let focusedTraceID, !focusedTraceEntries.isEmpty {
-                        logTracePanel(traceID: focusedTraceID)
+                        logTracePanel(traceID: focusedTraceID, entries: focusedTraceEntries)
                     }
 
                     if !slowTraces.isEmpty {
@@ -2142,12 +2144,6 @@ struct SettingsView: View {
         return selectedLogTraceID
     }
 
-    private func traceLogEntries(traceID: String) -> [PersistedLogEvent] {
-        viewModel.logEntries
-            .filter { $0.traceID == traceID }
-            .sorted { $0.timestamp < $1.timestamp }
-    }
-
     private func logRequestScope(_ entry: PersistedLogEvent) -> String? {
         entry.metadata["request_scope"]?.lowercased()
     }
@@ -2160,9 +2156,7 @@ struct SettingsView: View {
         logRequestScope(entry) == "background_memory"
     }
 
-    private func traceTimingSummary(traceID: String) -> TraceTimingSummary {
-        let entries = traceLogEntries(traceID: traceID)
-
+    private func traceTimingSummary(entries: [PersistedLogEvent]) -> TraceTimingSummary {
         func latestDuration(for eventNames: Set<String>) -> Int? {
             entries
                 .reversed()
@@ -2191,9 +2185,7 @@ struct SettingsView: View {
         )
     }
 
-    private func traceStageSummaries(traceID: String) -> [TraceStageSummary] {
-        let entries = traceLogEntries(traceID: traceID)
-
+    private func traceStageSummaries(entries: [PersistedLogEvent]) -> [TraceStageSummary] {
         func firstEvent(_ names: Set<String>) -> PersistedLogEvent? {
             entries.first(where: { names.contains($0.event) })
         }
@@ -2441,12 +2433,26 @@ struct SettingsView: View {
         .prefix(6)
         .map { $0 }
 
+        let focusedTraceID: String?
+        let focusedTraceEntries: [PersistedLogEvent]
+        if traceFilter.isEmpty {
+            focusedTraceID = nil
+            focusedTraceEntries = []
+        } else {
+            focusedTraceID = traceFilter
+            focusedTraceEntries = entries
+                .filter { $0.traceID == traceFilter }
+                .sorted { $0.timestamp < $1.timestamp }
+        }
+
         return LogAnalysisSnapshot(
             categoryOptions: categoryOptions,
             filteredEntries: filteredEntries,
             traceIDsCount: traceIDsCount,
             errorCount: errorCount,
-            slowTraces: slowTraces
+            slowTraces: slowTraces,
+            focusedTraceID: focusedTraceID,
+            focusedTraceEntries: focusedTraceEntries
         )
     }
 
@@ -2486,13 +2492,12 @@ struct SettingsView: View {
         .font(.system(size: 10.5, weight: .semibold, design: .rounded))
     }
 
-    private func logTracePanel(traceID: String) -> some View {
-        let entries = traceLogEntries(traceID: traceID)
+    private func logTracePanel(traceID: String, entries: [PersistedLogEvent]) -> some View {
         let errorCount = entries.filter { $0.level.lowercased() == "error" }.count
         let timeoutCount = entries.filter(isTimeoutLog(_:)).count
         let totalDuration = max(0, (entries.last?.timestamp.timeIntervalSince(entries.first?.timestamp ?? Date()) ?? 0) * 1_000)
-        let timing = traceTimingSummary(traceID: traceID)
-        let stageSummaries = traceStageSummaries(traceID: traceID)
+        let timing = traceTimingSummary(entries: entries)
+        let stageSummaries = traceStageSummaries(entries: entries)
 
         return VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 12) {
