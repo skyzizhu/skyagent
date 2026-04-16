@@ -89,6 +89,45 @@ private struct SummaryRecord {
 /// 记忆系统：手动记忆 + 语义记忆 + 对话级摘要 + 智能压缩
 final class MemoryService {
     static let shared = MemoryService()
+    nonisolated private static let allowedGlobalPreferenceSlots: [String] = [
+        "response_language",
+        "delivery_style",
+        "answer_structure",
+        "output_format",
+        "overwrite_strategy",
+        "tool_preference"
+    ]
+    nonisolated private static let allowedGlobalPreferenceSlotSet = Set(allowedGlobalPreferenceSlots)
+    nonisolated private static let explicitLongTermSignals: [String] = [
+        "以后默认", "默认都", "默认用", "以后都", "以后请", "今后默认", "长期偏好", "全局偏好", "习惯上",
+        "以後預設", "預設都", "預設用", "以後都", "以後請", "今後預設", "長期偏好", "全域偏好",
+        "by default", "default to", "prefer by default", "going forward", "always use", "long-term preference", "global preference",
+        "今後はデフォルト", "以後はデフォルト", "長期設定", "グローバル設定", "常に使う",
+        "앞으로 기본", "기본적으로", "장기 선호", "전역 선호", "항상 사용",
+        "standardmäßig", "künftig standardmäßig", "langfristige präferenz", "globale präferenz", "immer verwenden",
+        "par défaut", "à l'avenir", "préférence long terme", "préférence globale", "toujours utiliser"
+    ]
+    nonisolated private static let localizedPreferenceKeywords: [String] = [
+        "语言", "中文", "繁體中文", "英文", "日文", "韩文", "德文", "法文",
+        "語言", "繁體中文", "英文", "日文", "韓文", "德文", "法文",
+        "风格", "簡潔", "简洁", "详细", "結構", "结构", "格式", "覆盖", "保留原文件", "不要覆盖", "输出", "偏好",
+        "language", "english", "chinese", "japanese", "korean", "german", "french", "style", "concise", "detailed", "structure", "format", "overwrite", "keep original file", "output", "preference",
+        "言語", "英語", "中国語", "日本語", "韓国語", "ドイツ語", "フランス語", "文体", "簡潔", "詳細", "構成", "形式", "上書き", "元ファイル", "出力", "設定",
+        "언어", "영어", "중국어", "일본어", "한국어", "독일어", "프랑스어", "스타일", "간결", "자세히", "구조", "형식", "덮어쓰기", "원본 파일", "출력", "선호",
+        "sprache", "englisch", "chinesisch", "japanisch", "koreanisch", "deutsch", "französisch", "stil", "knapp", "detailliert", "struktur", "format", "überschreiben", "originaldatei", "ausgabe", "präferenz",
+        "langue", "anglais", "chinois", "japonais", "coréen", "allemand", "français", "style", "concis", "détaillé", "structure", "format", "écraser", "fichier d'origine", "sortie", "préférence",
+        "markdown", "pdf", "docx", "word", "excel", "xlsx",
+        "response_language", "delivery_style", "output_format", "overwrite_strategy", "answer_structure"
+    ]
+    nonisolated private static let localizedPreferencePrefixes: [String] = [
+        "语言:", "風格:", "风格:", "格式:", "輸出:", "输出:", "偏好:",
+        "語言:", "結構:", "覆盖策略:", "覆蓋策略:",
+        "language:", "style:", "format:", "output:", "preference:", "response_language:", "delivery_style:", "output_format:", "overwrite_strategy:", "answer_structure:",
+        "言語:", "文体:", "形式:", "出力:", "設定:",
+        "언어:", "스타일:", "형식:", "출력:", "선호:",
+        "sprache:", "stil:", "format:", "ausgabe:", "präferenz:",
+        "langue:", "style:", "format:", "sortie:", "préférence:"
+    ]
 
     private let memoryDir: URL
     private let manualMemoryURL: URL
@@ -113,6 +152,8 @@ final class MemoryService {
     private let compressThreshold = 14
     private let keepRecentCount = 8
     private let maxManualMemoryLength = 3000
+    private let maxGlobalSemanticEntries = 12
+    private let maxManualGlobalMemorySections = 12
 
     init() {
         AppStoragePaths.migrateLegacyDataIfNeeded()
@@ -124,6 +165,7 @@ final class MemoryService {
         try? FileManager.default.createDirectory(at: memoryDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: conversationSummaryDir, withIntermediateDirectories: true)
         stateQueue.sync {
+            _ = loadManualMemoryUnsafe()
             preloadSummaryCacheIfNeeded()
         }
     }
@@ -136,9 +178,15 @@ final class MemoryService {
         }
     }
 
+    @available(*, deprecated, message: "Use appendManualGlobalPreference(_:) for explicit long-term global preferences only.")
     func appendToGlobalMemory(_ entry: String) {
+        appendManualGlobalPreference(entry)
+    }
+
+    func appendManualGlobalPreference(_ entry: String) {
         let trimmedEntry = entry.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedEntry.isEmpty else { return }
+        guard shouldPersistManualGlobalMemory(entry: trimmedEntry) else { return }
 
         stateQueue.sync {
             var existing = loadManualMemoryUnsafe()
@@ -146,14 +194,7 @@ final class MemoryService {
             let newEntry = "\n## \(timestamp)\n\(trimmedEntry)\n"
             existing += newEntry
 
-            if existing.count > maxManualMemoryLength {
-                let truncated = String(existing.suffix(maxManualMemoryLength))
-                if let range = truncated.range(of: "## ") {
-                    existing = String(truncated[range.lowerBound...])
-                } else {
-                    existing = truncated
-                }
-            }
+            existing = trimmedManualGlobalMemory(existing)
 
             try? existing.write(to: manualMemoryURL, atomically: true, encoding: .utf8)
             cachedManualMemory = existing
@@ -161,7 +202,7 @@ final class MemoryService {
         }
     }
 
-    func buildMemoryContext(query: String, maxResults: Int = 4, maxTokens: Int = 500) -> String {
+    func buildMemoryContext(query: String, maxResults: Int = 4, maxTokens: Int = 120) -> String {
         stateQueue.sync {
             let normalizedQuery = normalizedMemoryContent(query).lowercased()
             let cacheKey = "\(maxTokens)|\(maxResults)|\(normalizedQuery)"
@@ -170,15 +211,15 @@ final class MemoryService {
                 return cached.context
             }
 
-            let sections = relevantMemorySectionsUnsafe(query: normalizedQuery, maxResults: maxResults)
-            guard !sections.isEmpty else { return "" }
+            let lines = relevantGlobalPreferenceLinesUnsafe(query: normalizedQuery, maxResults: maxResults)
+            guard !lines.isEmpty else { return "" }
 
-            let maxChars = maxTokens * 2
-            let context = truncateMemorySections(sections, maxChars: maxChars)
+            let maxChars = max(maxTokens * 2, 240)
+            let context = truncateMemorySections(lines, maxChars: maxChars)
             let built = """
-            [与你当前任务相关的记忆]
-            以下内容仅包含与当前任务最相关的长期记忆和历史约定。
-            只在确实相关时自然利用，不要主动提及“记忆系统”。
+            [与你当前任务相关的全局偏好]
+            以下仅包含与当前任务相关的用户长期偏好。
+            只在确实相关时自然利用。
 
             \(context)
             [记忆结束]
@@ -191,7 +232,7 @@ final class MemoryService {
     // MARK: - Summaries
 
     func generateSummary(messages: [Message], llmService: LLMService?, settings: AppSettings) async -> String {
-        await generateSummary(messages: messages, existingSummary: nil, llmService: llmService, settings: settings)
+        await generateSummary(messages: messages, existingSummary: nil, llmService: llmService, settings: settings, traceContext: nil)
     }
 
     func processConversationEnd(
@@ -228,19 +269,22 @@ final class MemoryService {
         guard let snapshot else { return }
 
         let summary: String
+        let memoryTraceContext = TraceContext(conversationID: convId)
         if snapshot.shouldUpdateIncrementally {
             summary = await generateSummary(
                 messages: snapshot.deltaMessages,
                 existingSummary: snapshot.previousSummary.isEmpty ? nil : snapshot.previousSummary,
                 llmService: llmService,
-                settings: settings
+                settings: settings,
+                traceContext: memoryTraceContext
             )
         } else {
             summary = await generateSummary(
                 messages: relevantMessages,
                 existingSummary: nil,
                 llmService: llmService,
-                settings: settings
+                settings: settings,
+                traceContext: memoryTraceContext
             )
         }
 
@@ -249,7 +293,8 @@ final class MemoryService {
             summary: summary,
             messages: snapshot.deltaMessages.isEmpty ? relevantMessages : snapshot.deltaMessages,
             llmService: llmService,
-            settings: settings
+            settings: settings,
+            traceContext: memoryTraceContext
         )
 
         stateQueue.sync {
@@ -396,7 +441,8 @@ final class MemoryService {
         messages: [Message],
         existingSummary: String?,
         llmService: LLMService?,
-        settings: AppSettings
+        settings: AppSettings,
+        traceContext: TraceContext?
     ) async -> String {
         if let llm = llmService, !settings.apiKey.isEmpty {
             let payload = summarizePayload(for: messages)
@@ -432,7 +478,16 @@ final class MemoryService {
 
             do {
                 let collector = StreamCollector()
-                try await llm.chat(messages: [LLMService.ChatMessage(role: "user", content: prompt)], toolDefinitions: nil) { delta in
+                try await llm.chat(
+                    messages: [LLMService.ChatMessage(role: "user", content: prompt)],
+                    toolDefinitions: nil,
+                    trackAsCurrentTask: false,
+                    traceContext: traceContext,
+                    extraLogMetadata: [
+                        "request_scope": .string("background_memory"),
+                        "request_purpose": .string("summary_generation")
+                    ]
+                ) { delta in
                     await collector.append(delta)
                 }
                 let result = await collector.value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -537,33 +592,37 @@ final class MemoryService {
         summary: String,
         messages: [Message],
         llmService: LLMService?,
-        settings: AppSettings
+        settings: AppSettings,
+        traceContext: TraceContext?
     ) async -> [SemanticMemoryCandidate] {
         if let llm = llmService, !settings.apiKey.isEmpty {
             do {
                 let collector = StreamCollector()
                 let prompt = """
-                你在维护一个 agent 的 semantic memory。
-                请从下面内容中提取“未来仍长期有用”的记忆，只保留：
-                1. 用户稳定偏好
-                2. 项目约定 / 输出格式约定
-                3. 长期有效的工作方式或工具偏好
-                4. 长期约束
+                你在维护一个 agent 的全局长期记忆。
+                请只提取“跨工作区、跨项目、未来仍长期有用”的用户级稳定偏好。
+                只有当用户明确表达了“以后默认这样”“今后都这样”“长期偏好”这类长期规则时，才允许写入全局记忆。
+                如果某条信息更像当前项目约定、当前工作区习惯、当前任务要求，就不要写入全局记忆。
+                只允许提取以下 slot：
+                - response_language
+                - delivery_style
+                - answer_structure
+                - output_format
+                - overwrite_strategy
+                - tool_preference
 
                 不要保留：
+                - 当前项目约定
+                - 当前工作区规则
                 - 一次性任务
                 - 临时文件名
                 - 短期执行结果
+                - 只对当前工作区有效的信息
                 - 明显只对当前一轮有效的信息
 
                 返回严格 JSON 数组，每项格式：
-                {"category":"preference|project|workflow|constraint","slot":"可选的稳定槽位","content":"..."}
-                其中 slot 仅在这类信息可被未来覆盖时填写，例如：
-                - output_format
-                - overwrite_strategy
-                - response_language
-                - delivery_style
-                - tool_preference
+                {"category":"preference","slot":"固定槽位名","content":"..."}
+                其中 category 必须始终为 preference，slot 必须是上面允许的固定值之一。
                 如果没有长期记忆，返回 []。
 
                 会话标题：
@@ -575,7 +634,16 @@ final class MemoryService {
                 最近消息：
                 \(summarizePayload(for: messages))
                 """
-                try await llm.chat(messages: [LLMService.ChatMessage(role: "user", content: prompt)], toolDefinitions: nil) { delta in
+                try await llm.chat(
+                    messages: [LLMService.ChatMessage(role: "user", content: prompt)],
+                    toolDefinitions: nil,
+                    trackAsCurrentTask: false,
+                    traceContext: traceContext,
+                    extraLogMetadata: [
+                        "request_scope": .string("background_memory"),
+                        "request_purpose": .string("semantic_memory_extraction")
+                    ]
+                ) { delta in
                     await collector.append(delta)
                 }
                 let response = await collector.value
@@ -600,15 +668,17 @@ final class MemoryService {
 
         return deduplicated(
             json.compactMap { item in
-                guard let category = item["category"] as? String,
-                      let content = item["content"] as? String else {
+                guard let content = item["content"] as? String else {
                     return nil
                 }
-                let normalizedCategory = normalizeCategory(category)
-                let normalizedSlot = normalizeSlot(item["slot"] as? String) ?? inferredSlot(for: content, category: normalizedCategory)
+                let normalizedSlot = normalizeSlot(item["slot"] as? String)
                 let trimmedContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmedContent.isEmpty else { return nil }
-                return SemanticMemoryCandidate(category: normalizedCategory, slot: normalizedSlot, content: trimmedContent)
+                guard !trimmedContent.isEmpty,
+                      let normalizedSlot,
+                      Self.allowedGlobalPreferenceSlotSet.contains(normalizedSlot) else {
+                    return nil
+                }
+                return SemanticMemoryCandidate(category: "preference", slot: normalizedSlot, content: trimmedContent)
             }
         )
     }
@@ -621,26 +691,61 @@ final class MemoryService {
             .joined(separator: "\n")
             .lowercased()
 
+        let hasExplicitLongTermSignal = Self.explicitLongTermSignals.contains { joinedUserText.contains($0) }
+        guard hasExplicitLongTermSignal else {
+            return []
+        }
+
         if joinedUserText.contains("markdown") || joinedUserText.contains(".md") {
-            candidates.append(.init(category: "project", slot: "output_format", content: "默认使用 Markdown 作为交付格式。"))
+            candidates.append(.init(category: "preference", slot: "output_format", content: "默认使用 Markdown 作为交付格式。"))
         }
         if joinedUserText.contains("pdf") {
-            candidates.append(.init(category: "project", slot: "output_format", content: "涉及正式导出时，优先输出结构完整且可校验的 PDF。"))
+            candidates.append(.init(category: "preference", slot: "output_format", content: "涉及正式导出时，优先输出 PDF。"))
         }
         if joinedUserText.contains("docx") || joinedUserText.contains("word") {
-            candidates.append(.init(category: "project", slot: "output_format", content: "涉及正式文档时，默认输出 Word / DOCX 格式。"))
+            candidates.append(.init(category: "preference", slot: "output_format", content: "涉及正式文档时，默认输出 Word / DOCX 格式。"))
         }
         if joinedUserText.contains("xlsx") || joinedUserText.contains("excel") {
-            candidates.append(.init(category: "project", slot: "output_format", content: "涉及结构化表格时，默认输出 Excel / XLSX 格式。"))
+            candidates.append(.init(category: "preference", slot: "output_format", content: "涉及结构化表格时，默认输出 Excel / XLSX 格式。"))
         }
         if summary.contains("不要覆盖") || summary.contains("保留原文件") {
-            candidates.append(.init(category: "constraint", slot: "overwrite_strategy", content: "修改文件时优先保留原文件，避免直接覆盖。"))
+            candidates.append(.init(category: "preference", slot: "overwrite_strategy", content: "修改文件时优先保留原文件，避免直接覆盖。"))
+        }
+        if summary.contains("覆盖原文件") || summary.contains("直接覆盖") {
+            candidates.append(.init(category: "preference", slot: "overwrite_strategy", content: "在用户明确要求时允许直接覆盖原文件。"))
         }
         if joinedUserText.contains("中文") || joinedUserText.contains("汉语") {
             candidates.append(.init(category: "preference", slot: "response_language", content: "默认使用中文沟通与输出。"))
         }
+        if joinedUserText.contains("繁體中文") || joinedUserText.contains("繁体中文") {
+            candidates.append(.init(category: "preference", slot: "response_language", content: "默认使用繁體中文沟通与输出。"))
+        }
         if joinedUserText.contains("英文") || joinedUserText.contains("english") {
             candidates.append(.init(category: "preference", slot: "response_language", content: "默认使用英文沟通与输出。"))
+        }
+        if joinedUserText.contains("日文") || joinedUserText.contains("日本語") || joinedUserText.contains("japanese") {
+            candidates.append(.init(category: "preference", slot: "response_language", content: "默认使用日文沟通与输出。"))
+        }
+        if joinedUserText.contains("韩文") || joinedUserText.contains("韓文") || joinedUserText.contains("한국어") || joinedUserText.contains("korean") {
+            candidates.append(.init(category: "preference", slot: "response_language", content: "默认使用韩文沟通与输出。"))
+        }
+        if joinedUserText.contains("德文") || joinedUserText.contains("deutsch") || joinedUserText.contains("german") {
+            candidates.append(.init(category: "preference", slot: "response_language", content: "默认使用德文沟通与输出。"))
+        }
+        if joinedUserText.contains("法文") || joinedUserText.contains("français") || joinedUserText.contains("french") {
+            candidates.append(.init(category: "preference", slot: "response_language", content: "默认使用法文沟通与输出。"))
+        }
+        if joinedUserText.contains("简洁") || joinedUserText.contains("精简") {
+            candidates.append(.init(category: "preference", slot: "delivery_style", content: "默认回答保持简洁直接，优先给结论。"))
+        }
+        if joinedUserText.contains("concise") || joinedUserText.contains("concis") || joinedUserText.contains("knapp") || joinedUserText.contains("간결") || joinedUserText.contains("簡潔") {
+            candidates.append(.init(category: "preference", slot: "delivery_style", content: "默认回答保持简洁直接，优先给结论。"))
+        }
+        if joinedUserText.contains("先给结论") || joinedUserText.contains("先说结论") {
+            candidates.append(.init(category: "preference", slot: "answer_structure", content: "回答时优先先给结论，再补充必要说明。"))
+        }
+        if joinedUserText.contains("answer first") || joinedUserText.contains("结论先行") || joinedUserText.contains("先給結論") {
+            candidates.append(.init(category: "preference", slot: "answer_structure", content: "回答时优先先给结论，再补充必要说明。"))
         }
 
         return deduplicated(candidates)
@@ -657,16 +762,18 @@ final class MemoryService {
             let normalizedContent = normalizedMemoryContent(candidate.content)
             guard !normalizedContent.isEmpty else { continue }
             let normalizedSlot = normalizeSlot(candidate.slot) ?? inferredSlot(for: normalizedContent, category: candidate.category)
+            guard let normalizedSlot,
+                  Self.allowedGlobalPreferenceSlotSet.contains(normalizedSlot) else {
+                continue
+            }
 
-            if let normalizedSlot {
-                for entry in entriesByID.values where effectiveSlot(for: entry) == normalizedSlot {
-                    entriesByID.removeValue(forKey: entry.id)
-                }
+            for entry in entriesByID.values where effectiveSlot(for: entry) == normalizedSlot {
+                entriesByID.removeValue(forKey: entry.id)
             }
 
             let id = semanticMemoryID(for: candidate.category, slot: normalizedSlot, content: normalizedContent)
             if var existingEntry = entriesByID[id] {
-                existingEntry.category = candidate.category
+                existingEntry.category = "preference"
                 existingEntry.slot = normalizedSlot
                 existingEntry.content = candidate.content
                 existingEntry.updatedAt = Date()
@@ -675,7 +782,7 @@ final class MemoryService {
             } else {
                 entriesByID[id] = SemanticMemoryEntry(
                     id: id,
-                    category: candidate.category,
+                    category: "preference",
                     slot: normalizedSlot,
                     content: candidate.content,
                     sourceConversationID: sourceConversationID,
@@ -685,33 +792,51 @@ final class MemoryService {
         }
 
         return entriesByID.values
+            .filter { entry in
+                entry.category == "preference" &&
+                effectiveSlot(for: entry).map(Self.allowedGlobalPreferenceSlotSet.contains) == true
+            }
             .sorted { lhs, rhs in
+                let lhsPriority = slotPriority(for: effectiveSlot(for: lhs))
+                let rhsPriority = slotPriority(for: effectiveSlot(for: rhs))
+                if lhsPriority != rhsPriority {
+                    return lhsPriority < rhsPriority
+                }
                 if lhs.updatedAt != rhs.updatedAt {
                     return lhs.updatedAt > rhs.updatedAt
                 }
                 return lhs.content < rhs.content
             }
-            .prefix(40)
+            .prefix(maxGlobalSemanticEntries)
             .map { $0 }
     }
 
     private func renderGeneratedMemoryUnsafe(entries: [SemanticMemoryEntry]) {
-        let grouped = Dictionary(grouping: entries, by: \.category)
-        let orderedCategories = ["preference", "project", "workflow", "constraint"]
+        let filtered = entries.filter {
+            $0.category == "preference" &&
+            effectiveSlot(for: $0).map(Self.allowedGlobalPreferenceSlotSet.contains) == true
+        }
+        let language = L10n.contentLanguage
         var lines: [String] = [
-            "# Generated Semantic Memory",
+            Self.generatedGlobalPreferencesTitle(for: language),
             "",
-            "以下内容由系统从历史对话中提炼，只保留长期有用的信息。",
+            Self.generatedGlobalPreferencesSubtitle(for: language),
             ""
         ]
 
-        for category in orderedCategories {
-            guard let items = grouped[category], !items.isEmpty else { continue }
-            lines.append("## \(displayTitle(for: category))")
-            for item in items.sorted(by: { $0.updatedAt > $1.updatedAt }) {
-                lines.append("- \(item.content)")
-            }
+        if filtered.isEmpty {
+            lines.append(Self.generatedGlobalPreferencesEmptyState(for: language))
             lines.append("")
+        } else {
+            for slot in Self.allowedGlobalPreferenceSlots {
+                let items = filtered.filter { effectiveSlot(for: $0) == slot }
+                guard !items.isEmpty else { continue }
+                lines.append("## \(displayTitle(for: slot))")
+                for item in items.sorted(by: { $0.updatedAt > $1.updatedAt }) {
+                    lines.append("- \(item.content)")
+                }
+                lines.append("")
+            }
         }
 
         let markdown = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -785,9 +910,13 @@ final class MemoryService {
         if let cachedManualMemory {
             return cachedManualMemory
         }
-        let content = (try? String(contentsOf: manualMemoryURL, encoding: .utf8)) ?? ""
-        cachedManualMemory = content
-        return content
+        let rawContent = (try? String(contentsOf: manualMemoryURL, encoding: .utf8)) ?? ""
+        let sanitizedContent = sanitizedManualGlobalMemory(rawContent)
+        if sanitizedContent != rawContent {
+            try? sanitizedContent.write(to: manualMemoryURL, atomically: true, encoding: .utf8)
+        }
+        cachedManualMemory = sanitizedContent
+        return sanitizedContent
     }
 
     private func loadGeneratedMemoryUnsafe() -> String {
@@ -894,22 +1023,146 @@ final class MemoryService {
     }
 
     private func displayTitle(for category: String) -> String {
+        let language = L10n.contentLanguage
         switch category {
         case "preference":
-            return "User Preferences"
+            return localizedMemoryLabel(
+                zhHans: "用户偏好", zhHant: "使用者偏好", en: "User Preferences", ja: "ユーザー設定",
+                ko: "사용자 선호", de: "Benutzerpräferenzen", fr: "Préférences utilisateur",
+                language: language
+            )
+        case "response_language":
+            return localizedMemoryLabel(
+                zhHans: "回复语言", zhHant: "回覆語言", en: "Response Language", ja: "応答言語",
+                ko: "응답 언어", de: "Antwortsprache", fr: "Langue de réponse",
+                language: language
+            )
+        case "delivery_style":
+            return localizedMemoryLabel(
+                zhHans: "表达风格", zhHant: "表達風格", en: "Delivery Style", ja: "表現スタイル",
+                ko: "표현 스타일", de: "Stil", fr: "Style de réponse",
+                language: language
+            )
+        case "answer_structure":
+            return localizedMemoryLabel(
+                zhHans: "回答结构", zhHant: "回答結構", en: "Answer Structure", ja: "回答構成",
+                ko: "답변 구조", de: "Antwortstruktur", fr: "Structure de réponse",
+                language: language
+            )
+        case "output_format":
+            return localizedMemoryLabel(
+                zhHans: "输出格式", zhHant: "輸出格式", en: "Output Format", ja: "出力形式",
+                ko: "출력 형식", de: "Ausgabeformat", fr: "Format de sortie",
+                language: language
+            )
+        case "overwrite_strategy":
+            return localizedMemoryLabel(
+                zhHans: "覆盖策略", zhHant: "覆蓋策略", en: "Overwrite Strategy", ja: "上書き方針",
+                ko: "덮어쓰기 전략", de: "Überschreibstrategie", fr: "Stratégie d'écrasement",
+                language: language
+            )
+        case "tool_preference":
+            return localizedMemoryLabel(
+                zhHans: "工具偏好", zhHant: "工具偏好", en: "Tool Preference", ja: "ツール設定",
+                ko: "도구 선호", de: "Tool-Präferenz", fr: "Préférence d'outil",
+                language: language
+            )
         case "project":
-            return "Project Conventions"
+            return localizedMemoryLabel(
+                zhHans: "项目约定", zhHant: "專案約定", en: "Project Conventions", ja: "プロジェクト規約",
+                ko: "프로젝트 규칙", de: "Projektregeln", fr: "Règles du projet",
+                language: language
+            )
         case "workflow":
-            return "Workflow Preferences"
+            return localizedMemoryLabel(
+                zhHans: "工作流偏好", zhHant: "工作流偏好", en: "Workflow Preferences", ja: "ワークフロー設定",
+                ko: "워크플로 선호", de: "Workflow-Präferenzen", fr: "Préférences de workflow",
+                language: language
+            )
         case "constraint":
-            return "Constraints"
+            return localizedMemoryLabel(
+                zhHans: "约束", zhHant: "約束", en: "Constraints", ja: "制約",
+                ko: "제약", de: "Einschränkungen", fr: "Contraintes",
+                language: language
+            )
         default:
-            return "General"
+            return localizedMemoryLabel(
+                zhHans: "通用", zhHant: "通用", en: "General", ja: "一般",
+                ko: "일반", de: "Allgemein", fr: "Général",
+                language: language
+            )
         }
     }
 
     private func renderSemanticMemoryEntry(_ entry: SemanticMemoryEntry) -> String {
-        "- [\(displayTitle(for: entry.category))] \(entry.content)"
+        if let slot = effectiveSlot(for: entry) {
+            return "- [\(displayTitle(for: slot))] \(entry.content)"
+        }
+        return "- [\(displayTitle(for: entry.category))] \(entry.content)"
+    }
+
+    private func renderCompactGlobalPreferenceEntry(_ entry: SemanticMemoryEntry) -> String {
+        if let slot = effectiveSlot(for: entry) {
+            return "- \(displayTitle(for: slot)): \(entry.content)"
+        }
+        return "- \(entry.content)"
+    }
+
+    private func localizedMemoryLabel(
+        zhHans: String,
+        zhHant: String,
+        en: String,
+        ja: String,
+        ko: String,
+        de: String,
+        fr: String,
+        language: AppContentLanguage
+    ) -> String {
+        switch language {
+        case .zhHans: return zhHans
+        case .zhHant: return zhHant
+        case .en: return en
+        case .ja: return ja
+        case .ko: return ko
+        case .de: return de
+        case .fr: return fr
+        }
+    }
+
+    private static func generatedGlobalPreferencesTitle(for language: AppContentLanguage) -> String {
+        switch language {
+        case .zhHans: return "# 自动提炼的全局偏好"
+        case .zhHant: return "# 自動提煉的全域偏好"
+        case .en: return "# Generated Global Preferences"
+        case .ja: return "# 自動抽出されたグローバル設定"
+        case .ko: return "# 자동 추출된 전역 선호"
+        case .de: return "# Automatisch extrahierte globale Präferenzen"
+        case .fr: return "# Préférences globales extraites automatiquement"
+        }
+    }
+
+    private static func generatedGlobalPreferencesSubtitle(for language: AppContentLanguage) -> String {
+        switch language {
+        case .zhHans: return "以下内容由系统从历史对话中提炼，只保留跨工作区仍然成立的用户长期偏好。"
+        case .zhHant: return "以下內容由系統從歷史對話中提煉，只保留跨工作區仍然成立的使用者長期偏好。"
+        case .en: return "These preferences were extracted from historical conversations and only keep long-term user preferences that still apply across workspaces."
+        case .ja: return "以下は過去の会話から抽出された内容で、ワークスペースをまたいで有効な長期的なユーザー設定のみを残しています。"
+        case .ko: return "아래 내용은 과거 대화에서 추출된 것으로, 워크스페이스를 넘어 계속 유효한 장기 사용자 선호만 남깁니다."
+        case .de: return "Die folgenden Inhalte wurden aus früheren Unterhaltungen extrahiert und behalten nur langfristige Benutzerpräferenzen bei, die über Workspaces hinweg gültig bleiben."
+        case .fr: return "Les éléments ci-dessous sont extraits des conversations passées et ne conservent que les préférences utilisateur durables valables à travers les espaces de travail."
+        }
+    }
+
+    private static func generatedGlobalPreferencesEmptyState(for language: AppContentLanguage) -> String {
+        switch language {
+        case .zhHans: return "暂无系统自动提炼的全局偏好。"
+        case .zhHant: return "暫無系統自動提煉的全域偏好。"
+        case .en: return "No generated global preferences yet."
+        case .ja: return "まだ自動抽出されたグローバル設定はありません。"
+        case .ko: return "아직 자동 추출된 전역 선호가 없습니다."
+        case .de: return "Noch keine automatisch extrahierten globalen Präferenzen."
+        case .fr: return "Aucune préférence globale extraite automatiquement pour le moment."
+        }
     }
 
     private func checkpointKey(convId: UUID, segmentStartedAt: Date?) -> String {
@@ -988,6 +1241,61 @@ final class MemoryService {
             .map(renderSemanticMemoryEntry)
         let fallbackManual = manualMemorySections(from: loadManualMemoryUnsafe()).suffix(1)
         return Array(fallbackSemantic) + fallbackManual
+    }
+
+    private func relevantGlobalPreferenceLinesUnsafe(query: String, maxResults: Int) -> [String] {
+        let queryTerms = tokenize(query)
+        let semanticMatches = loadMemoryIndexUnsafe().semanticEntries.compactMap { entry -> MemoryMatch? in
+            guard entry.category == "preference" else { return nil }
+            let slot = effectiveSlot(for: entry)
+            let haystack = [slot ?? "", entry.content].joined(separator: " ").lowercased()
+            let score = scoreMatch(in: haystack, queryTerms: queryTerms) + recencyBoost(for: entry.updatedAt) + 2
+            guard queryTerms.isEmpty ? slot != nil : score > 0 else { return nil }
+            return MemoryMatch(
+                rendered: renderCompactGlobalPreferenceEntry(entry),
+                score: score,
+                updatedAt: entry.updatedAt
+            )
+        }
+
+        let manualMatches = manualGlobalPreferenceLines(from: loadManualMemoryUnsafe()).compactMap { line -> MemoryMatch? in
+            let score = scoreMatch(in: line.lowercased(), queryTerms: queryTerms)
+            guard queryTerms.isEmpty ? true : score > 0 else { return nil }
+            return MemoryMatch(
+                rendered: "- \(line)",
+                score: max(score, queryTerms.isEmpty ? 1 : score),
+                updatedAt: .distantPast
+            )
+        }
+
+        let preferred = (semanticMatches + manualMatches)
+            .sorted { lhs, rhs in
+                if lhs.score != rhs.score {
+                    return lhs.score > rhs.score
+                }
+                if lhs.updatedAt != rhs.updatedAt {
+                    return lhs.updatedAt > rhs.updatedAt
+                }
+                return lhs.rendered.count < rhs.rendered.count
+            }
+            .prefix(maxResults)
+            .map(\.rendered)
+
+        if !preferred.isEmpty {
+            return deduplicated(preferred)
+        }
+
+        let fallbackSemantic = loadMemoryIndexUnsafe().semanticEntries
+            .filter { $0.category == "preference" }
+            .sorted { lhs, rhs in lhs.updatedAt > rhs.updatedAt }
+            .prefix(maxResults)
+            .map(renderCompactGlobalPreferenceEntry)
+
+        if !fallbackSemantic.isEmpty {
+            return deduplicated(Array(fallbackSemantic))
+        }
+
+        return deduplicated(manualGlobalPreferenceLines(from: loadManualMemoryUnsafe()).prefix(maxResults).map { "- \($0)" })
     }
 
     private func relevantMemoryMatchesUnsafe(queryTerms: [String], maxResults: Int) -> [MemoryMatch] {
@@ -1097,6 +1405,14 @@ final class MemoryService {
         return nil
     }
 
+    private func slotPriority(for slot: String?) -> Int {
+        guard let slot,
+              let index = Self.allowedGlobalPreferenceSlots.firstIndex(of: slot) else {
+            return Int.max
+        }
+        return index
+    }
+
     private func effectiveSlot(for entry: SemanticMemoryEntry) -> String? {
         normalizeSlot(entry.slot) ?? inferredSlot(for: entry.content, category: entry.category)
     }
@@ -1126,6 +1442,154 @@ final class MemoryService {
         memory.components(separatedBy: "## ")
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             .map { "## " + $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+    }
+
+    private func sanitizedManualGlobalMemory(_ memory: String) -> String {
+        let preferenceLines = manualGlobalPreferenceLines(from: memory)
+        guard !preferenceLines.isEmpty else {
+            return Self.manualGlobalMemoryTemplate(language: L10n.contentLanguage)
+        }
+
+        let renderedLines = deduplicated(preferenceLines).prefix(maxManualGlobalMemorySections).map { "- \($0)" }
+        return Self.manualGlobalMemoryTemplate(
+            language: L10n.contentLanguage,
+            preferenceLines: Array(renderedLines)
+        )
+    }
+
+    private static func manualGlobalMemoryTemplate(
+        language: AppContentLanguage,
+        preferenceLines: [String] = []
+    ) -> String {
+        let renderedPreferenceBlock = preferenceLines.isEmpty
+            ? ""
+            : "\n" + preferenceLines.joined(separator: "\n")
+
+        switch language {
+        case .zhHans:
+            return """
+            # GLOBAL SKYAGENT
+
+            这里保存跨项目、长期成立的个人偏好。
+            只写“以后默认如此”的规则，不要写一次性任务、项目细节或临时执行结果。
+
+            ## 长期偏好\(renderedPreferenceBlock)
+            """
+        case .zhHant:
+            return """
+            # GLOBAL SKYAGENT
+
+            這裡保存跨專案、長期成立的個人偏好。
+            只寫「之後預設如此」的規則，不要寫一次性的任務、專案細節或臨時執行結果。
+
+            ## 長期偏好\(renderedPreferenceBlock)
+            """
+        case .en:
+            return """
+            # GLOBAL SKYAGENT
+
+            Use this file for long-term personal preferences that should apply across projects.
+            Only write rules that should remain true by default. Do not put one-off tasks, project details, or temporary results here.
+
+            ## Long-term Preferences\(renderedPreferenceBlock)
+            """
+        case .ja:
+            return """
+            # GLOBAL SKYAGENT
+
+            このファイルには、プロジェクトをまたいで長期的に有効な個人設定だけを書いてください。
+            一時的なタスク、プロジェクト固有の詳細、臨時の実行結果は書かないでください。
+
+            ## 長期設定\(renderedPreferenceBlock)
+            """
+        case .ko:
+            return """
+            # GLOBAL SKYAGENT
+
+            이 파일에는 프로젝트 전반에 걸쳐 장기적으로 유지되는 개인 선호만 적어 주세요.
+            일회성 작업, 프로젝트 세부 정보, 임시 실행 결과는 적지 마세요.
+
+            ## 장기 선호\(renderedPreferenceBlock)
+            """
+        case .de:
+            return """
+            # GLOBAL SKYAGENT
+
+            Diese Datei ist für langfristige persönliche Präferenzen gedacht, die projektübergreifend gelten.
+            Schreiben Sie hier nur Regeln hinein, die standardmäßig dauerhaft gelten sollen. Keine einmaligen Aufgaben, Projektdetails oder temporären Ergebnisse.
+
+            ## Langfristige Präferenzen\(renderedPreferenceBlock)
+            """
+        case .fr:
+            return """
+            # GLOBAL SKYAGENT
+
+            Ce fichier sert à conserver les préférences personnelles durables qui doivent s'appliquer à travers les projets.
+            N'y mettez que des règles valables par défaut sur le long terme. N'ajoutez pas de tâches ponctuelles, de détails de projet ni de résultats temporaires.
+
+            ## Préférences Long Terme\(renderedPreferenceBlock)
+            """
+        }
+    }
+
+    private func manualGlobalPreferenceLines(from memory: String) -> [String] {
+        let lines = memory.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { line in
+                !line.isEmpty &&
+                !line.hasPrefix("#")
+            }
+            .map { line -> String in
+                if line.hasPrefix("- ") {
+                    return String(line.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                return line
+            }
+            .filter { isLikelyGlobalPreferenceLine($0) }
+            .filter { !$0.isEmpty }
+
+        return deduplicated(Array(lines.prefix(8)))
+    }
+
+    private func isLikelyGlobalPreferenceLine(_ line: String) -> Bool {
+        let normalized = line.lowercased()
+        if Self.explicitLongTermSignals.contains(where: { normalized.contains($0) }) {
+            return true
+        }
+
+        if Self.localizedPreferenceKeywords.contains(where: { normalized.contains($0) }) {
+            return true
+        }
+
+        if normalized.contains("：") || normalized.contains(":") {
+            let compact = normalized.replacingOccurrences(of: "：", with: ":")
+            if Self.localizedPreferencePrefixes.contains(where: { compact.hasPrefix($0) }) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func shouldPersistManualGlobalMemory(entry: String) -> Bool {
+        let normalized = entry.lowercased()
+        return Self.explicitLongTermSignals.contains { normalized.contains($0) }
+    }
+
+    private func trimmedManualGlobalMemory(_ memory: String) -> String {
+        let sections = manualMemorySections(from: memory)
+        let trimmedSections = Array(sections.suffix(maxManualGlobalMemorySections))
+        let rebuilt = trimmedSections.joined(separator: "\n\n")
+
+        if rebuilt.count <= maxManualMemoryLength {
+            return rebuilt
+        }
+
+        let truncated = String(rebuilt.suffix(maxManualMemoryLength))
+        if let range = truncated.range(of: "## ") {
+            return String(truncated[range.lowerBound...])
+        }
+        return truncated
     }
 
     private func truncateMemorySections(_ sections: [String], maxChars: Int) -> String {

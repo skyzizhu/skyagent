@@ -9,6 +9,11 @@ private extension Double {
 }
 
 struct SettingsView: View {
+    enum DisplayMode {
+        case modal
+        case embedded
+    }
+
     struct TraceTimingSummary {
         let firstTokenMs: Int?
         let llmTotalMs: Int?
@@ -35,8 +40,18 @@ struct SettingsView: View {
         let startedAt: Date
     }
 
+    struct LogAnalysisSnapshot {
+        var categoryOptions: [String] = []
+        var filteredEntries: [PersistedLogEvent] = []
+        var traceIDsCount: Int = 0
+        var errorCount: Int = 0
+        var slowTraces: [SlowTraceSummary] = []
+    }
+
     enum LogQuickFilter: String, CaseIterable, Identifiable {
         case all
+        case foreground
+        case background
         case errors
         case timeouts
         case slow
@@ -46,6 +61,8 @@ struct SettingsView: View {
         var title: String {
             switch self {
             case .all: return "All"
+            case .foreground: return "User"
+            case .background: return "Background"
             case .errors: return "Errors"
             case .timeouts: return "Timeouts"
             case .slow: return "Slow"
@@ -83,8 +100,8 @@ struct SettingsView: View {
             case .models: return L10n.tr("settings.nav.models")
             case .skills: return L10n.tr("settings.nav.skills")
             case .mcp: return L10n.tr("settings.nav.mcp")
-            case .logs: return "日志"
-            case .about: return "关于"
+            case .logs: return L10n.tr("settings.nav.logs")
+            case .about: return L10n.tr("settings.nav.about")
             }
         }
 
@@ -94,8 +111,8 @@ struct SettingsView: View {
             case .models: return L10n.tr("settings.nav.models.subtitle")
             case .skills: return L10n.tr("settings.nav.skills.subtitle")
             case .mcp: return L10n.tr("settings.nav.mcp.subtitle")
-            case .logs: return "查看最近的 trace、耗时、工具、MCP 与界面事件。"
-            case .about: return "版本、数据目录和当前安装信息。"
+            case .logs: return L10n.tr("settings.nav.logs.subtitle")
+            case .about: return L10n.tr("settings.nav.about.subtitle")
             }
         }
 
@@ -119,8 +136,11 @@ struct SettingsView: View {
     @State private var newProfileName = ""
     @State private var showSkillError = false
     @State private var selectedSkill: AgentSkill?
-    @State private var selectedTab: SettingsTab = .general
+    @State private var selectedKnowledgeLibrary: KnowledgeLibrary?
+    @State private var showKnowledgeOverview = false
+    @State private var selectedTab: SettingsTab
     @State private var selectedSkillLibraryTab: SkillLibraryTab = .standard
+    @State private var showEmbeddedSystemPrompt = false
     @State private var showMCPConfigPaths = false
     @State private var showNewMCPForm = false
     @State private var newMCPName = ""
@@ -170,23 +190,30 @@ struct SettingsView: View {
     @State private var selectedLogTraceID: String?
     @State private var selectedLogQuickFilter: LogQuickFilter = .all
     @State private var expandedLogIDs: Set<String> = []
+    @State private var knowledgeWebURL = ""
+    @State private var logAnalysisSnapshot = LogAnalysisSnapshot()
+    @State private var logAnalysisTask: Task<Void, Never>?
+    @State private var logAnalysisToken = UUID()
+    private let displayMode: DisplayMode
+    private let onClose: (() -> Void)?
 
-    init(viewModel: SettingsViewModel) {
+    init(
+        viewModel: SettingsViewModel,
+        initialTab: SettingsTab = .general,
+        displayMode: DisplayMode = .modal,
+        onClose: (() -> Void)? = nil
+    ) {
         self.viewModel = viewModel
         self._skillManager = ObservedObject(wrappedValue: viewModel.skillManager)
         self._mcpManager = ObservedObject(wrappedValue: viewModel.mcpManager)
+        self._selectedTab = State(initialValue: initialTab)
+        self.displayMode = displayMode
+        self.onClose = onClose
     }
 
     var body: some View {
-        HStack(spacing: 0) {
-            sidebar
-            Divider()
-                .overlay(Color.primary.opacity(0.045))
-            contentPanel
-        }
-        .frame(minWidth: 860, idealWidth: 960, maxWidth: 1180, minHeight: 680, idealHeight: 760, maxHeight: 920)
-        .background(Color(nsColor: .windowBackgroundColor))
-        .alert(L10n.tr("settings.profile.save_new_title"), isPresented: $showAddProfile) {
+        settingsBody
+            .alert(L10n.tr("settings.profile.save_new_title"), isPresented: $showAddProfile) {
             TextField(L10n.tr("settings.profile.name"), text: $newProfileName)
             Button(L10n.tr("common.save")) {
                 if !newProfileName.isEmpty {
@@ -210,16 +237,78 @@ struct SettingsView: View {
         .sheet(item: $selectedSkill) { skill in
             skillDetailSheet(skill)
         }
+        .sheet(item: $selectedKnowledgeLibrary) { library in
+            KnowledgeBaseLibraryView(
+                viewModel: KnowledgeBaseLibraryViewModel(
+                    library: library,
+                    conversationStore: viewModel.store
+                )
+            )
+        }
+        .sheet(isPresented: $showKnowledgeOverview) {
+            KnowledgeBaseOverviewView(
+                viewModel: KnowledgeBaseOverviewViewModel(
+                    conversationStore: viewModel.store
+                )
+            )
+        }
+        .onAppear {
+            scheduleLogAnalysisRefresh()
+        }
+        .onChange(of: viewModel.logEntries.count) { _, _ in
+            scheduleLogAnalysisRefresh()
+        }
+        .onChange(of: selectedLogCategory) { _, _ in
+            scheduleLogAnalysisRefresh()
+        }
+        .onChange(of: logSearchText) { _, _ in
+            scheduleLogAnalysisRefresh()
+        }
+        .onChange(of: logTraceFilter) { _, _ in
+            scheduleLogAnalysisRefresh()
+        }
+        .onChange(of: selectedLogTraceID) { _, _ in
+            scheduleLogAnalysisRefresh()
+        }
+        .onChange(of: selectedLogQuickFilter) { _, _ in
+            scheduleLogAnalysisRefresh()
+        }
+        .onDisappear {
+            logAnalysisTask?.cancel()
+        }
+    }
+
+    @ViewBuilder
+    private var settingsBody: some View {
+        let base = HStack(spacing: 0) {
+            sidebar
+            Divider()
+                .overlay(Color.primary.opacity(0.045))
+            contentPanel
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+
+        switch displayMode {
+        case .modal:
+            base
+                .frame(minWidth: 860, idealWidth: 960, maxWidth: 1180, minHeight: 680, idealHeight: 760, maxHeight: 920)
+        case .embedded:
+            base
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            VStack(alignment: .leading, spacing: 4) {
+        let isEmbedded = displayMode == .embedded
+        return VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: isEmbedded ? 2 : 4) {
                 Text(L10n.tr("common.settings"))
-                    .font(.system(size: 22, weight: .bold, design: .rounded))
-                Text(selectedTab.subtitle)
-                    .font(.system(size: 12.5, weight: .medium, design: .rounded))
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: isEmbedded ? 18 : 22, weight: .bold, design: .rounded))
+                if !isEmbedded {
+                    Text(selectedTab.subtitle)
+                        .font(.system(size: 12.5, weight: .medium, design: .rounded))
+                        .foregroundStyle(.secondary)
+                }
             }
 
             VStack(spacing: 8) {
@@ -230,9 +319,9 @@ struct SettingsView: View {
 
             Spacer()
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 18)
-        .frame(width: 208, alignment: .topLeading)
+        .padding(.horizontal, isEmbedded ? 14 : 18)
+        .padding(.vertical, isEmbedded ? 16 : 18)
+        .frame(width: isEmbedded ? 188 : 208, alignment: .topLeading)
         .background(
             LinearGradient(
                 colors: [
@@ -249,49 +338,121 @@ struct SettingsView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    headerCard
+                    if displayMode == .embedded {
+                        embeddedTopBar
+                    }
+                    if displayMode == .modal {
+                        headerCard
+                    } else {
+                        embeddedHeader
+                    }
                     tabContent
                 }
-                .padding(22)
+                .padding(displayMode == .embedded ? 20 : 22)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            Divider()
+            if displayMode == .modal {
+                Divider()
 
-            HStack {
-                if selectedTab == .models {
-                    Button(L10n.tr("settings.profile.save_as")) {
-                        showAddProfile = true
+                HStack {
+                    if selectedTab == .models {
+                        Button(L10n.tr("settings.profile.save_as")) {
+                            showAddProfile = true
+                        }
+                        .buttonStyle(.bordered)
                     }
-                    .buttonStyle(.bordered)
+
+                    Spacer()
+
+                    if selectedTab == .models || selectedTab == .general {
+                        Button(L10n.tr("common.cancel")) {
+                            viewModel.resetDraft()
+                            closeSettingsView()
+                        }
+                        .keyboardShortcut(.cancelAction)
+
+                        Button(L10n.tr("common.save")) {
+                            viewModel.save()
+                            closeSettingsView()
+                        }
+                        .keyboardShortcut(.defaultAction)
+                    } else {
+                        Button(L10n.tr("common.close")) {
+                            closeSettingsView()
+                        }
+                        .keyboardShortcut(.cancelAction)
+                    }
                 }
+                .padding(.horizontal, 22)
+                .padding(.vertical, 14)
+                .background(Color(nsColor: .windowBackgroundColor).opacity(0.985))
+            }
+        }
+        .background(Color.primary.opacity(0.01))
+    }
 
-                Spacer()
+    private var embeddedTopBar: some View {
+        HStack(spacing: 10) {
+            Button {
+                closeSettingsView()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text(L10n.tr("common.back"))
+                        .font(.system(size: 12.5, weight: .semibold, design: .rounded))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 7)
+                .background(Color.primary.opacity(0.05), in: Capsule())
+            }
+            .buttonStyle(.plain)
 
-                if selectedTab == .models || selectedTab == .general {
+            if selectedTab == .models {
+                Button(L10n.tr("settings.profile.save_as")) {
+                    showAddProfile = true
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+
+            Spacer()
+
+            if embeddedShowsDraftActions {
+                if hasDraftChanges {
                     Button(L10n.tr("common.cancel")) {
                         viewModel.resetDraft()
-                        dismiss()
                     }
-                    .keyboardShortcut(.cancelAction)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
 
                     Button(L10n.tr("common.save")) {
                         viewModel.save()
-                        dismiss()
                     }
-                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
                 } else {
-                    Button(L10n.tr("common.close")) {
-                        dismiss()
-                    }
-                    .keyboardShortcut(.cancelAction)
+                    Text(L10n.tr("common.saved"))
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(Color.primary.opacity(0.045), in: Capsule())
                 }
             }
-            .padding(.horizontal, 22)
-            .padding(.vertical, 14)
-            .background(Color(nsColor: .windowBackgroundColor).opacity(0.985))
         }
-        .background(Color.primary.opacity(0.01))
+    }
+
+    private var embeddedHeader: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(selectedTab.title)
+                .font(.system(size: 24, weight: .bold, design: .rounded))
+            Text(selectedTab.subtitle)
+                .font(.system(size: 12.5, weight: .medium, design: .rounded))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.bottom, 4)
     }
 
     private var headerCard: some View {
@@ -371,11 +532,17 @@ struct SettingsView: View {
 
     private var modelsContent: some View {
         VStack(alignment: .leading, spacing: 18) {
-            settingsCard(title: L10n.tr("settings.section.model"), subtitle: "当前启用配置与草稿切换一眼可见。") {
+            settingsCard(
+                title: L10n.tr("settings.section.model"),
+                subtitle: displayMode == .embedded ? nil : "当前启用配置与草稿切换一眼可见。"
+            ) {
                 activeModelOverview
             }
 
-            settingsCard(title: L10n.tr("settings.section.api"), subtitle: "这里保留真正需要改动的核心参数，其他信息收在摘要里。") {
+            settingsCard(
+                title: L10n.tr("settings.section.api"),
+                subtitle: displayMode == .embedded ? "保留真正需要改动的核心参数。" : "这里保留真正需要改动的核心参数，其他信息收在摘要里。"
+            ) {
                 VStack(alignment: .leading, spacing: 16) {
                     selectedProfileHeader
 
@@ -397,7 +564,10 @@ struct SettingsView: View {
                 }
             }
 
-            settingsCard(title: L10n.tr("settings.models.saved_profiles"), subtitle: "切换、删除和新增 profile 都放在这一处。") {
+            settingsCard(
+                title: L10n.tr("settings.models.saved_profiles"),
+                subtitle: displayMode == .embedded ? nil : "切换、删除和新增 profile 都放在这一处。"
+            ) {
                 VStack(alignment: .leading, spacing: 14) {
                     if viewModel.profiles.isEmpty {
                         Text(L10n.tr("settings.profile.hint"))
@@ -424,7 +594,10 @@ struct SettingsView: View {
     }
 
     private var skillsContent: some View {
-        settingsCard(title: L10n.tr("settings.section.skills"), subtitle: "先按来源切换，再对单个 skill 做导入、查看或卸载。") {
+        settingsCard(
+            title: L10n.tr("settings.section.skills"),
+            subtitle: displayMode == .embedded ? "按来源切换，再对单个 skill 做管理。" : "先按来源切换，再对单个 skill 做导入、查看或卸载。"
+        ) {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(spacing: 8) {
                     skillLibraryTabButton(.standard)
@@ -484,7 +657,10 @@ struct SettingsView: View {
 
     private var generalContent: some View {
         VStack(alignment: .leading, spacing: 18) {
-            settingsCard(title: "主要设置", subtitle: "把最常改的主题、语言和发送方式放在最上面。") {
+            settingsCard(
+                title: "主要设置",
+                subtitle: displayMode == .embedded ? nil : "把最常改的主题、语言和发送方式放在最上面。"
+            ) {
                 VStack(spacing: 14) {
                     labeledPicker(
                         "主题",
@@ -516,7 +692,10 @@ struct SettingsView: View {
                 }
             }
 
-            settingsCard(title: L10n.tr("settings.section.sandbox"), subtitle: "把日常最常改的工作目录和系统提示词放在同一页。") {
+            settingsCard(
+                title: L10n.tr("settings.section.sandbox"),
+                subtitle: displayMode == .embedded ? "默认工作区和系统提示词。" : "把日常最常改的默认工作区和系统提示词放在同一页。"
+            ) {
                 VStack(spacing: 14) {
                     HStack(alignment: .top, spacing: 12) {
                         Text(L10n.tr("settings.workdir"))
@@ -544,56 +723,244 @@ struct SettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
                     }
+
+                    if displayMode == .embedded {
+                        Divider()
+                            .overlay(Color.primary.opacity(0.05))
+
+                        DisclosureGroup(isExpanded: $showEmbeddedSystemPrompt) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("只在需要统一 agent 行为时调整；默认情况下不需要频繁修改。")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+
+                                TextEditor(text: $viewModel.draftSystemPrompt)
+                                    .font(.body)
+                                    .frame(minHeight: 180)
+                                    .padding(10)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                            .fill(Color.primary.opacity(0.03))
+                                    )
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                            .stroke(Color.primary.opacity(0.06), lineWidth: 0.8)
+                                    )
+                            }
+                            .padding(.top, 8)
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(L10n.tr("settings.section.system_prompt"))
+                                        .font(.system(size: 12.5, weight: .semibold))
+                                    Text("低频修改项，默认情况下无需频繁调整。")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                            }
+                        }
+                    }
                 }
             }
 
-            settingsCard(title: L10n.tr("settings.section.system_prompt"), subtitle: "只在需要统一 agent 行为时调整；默认情况下不需要频繁修改。") {
-                TextEditor(text: $viewModel.draftSystemPrompt)
-                    .font(.body)
-                    .frame(minHeight: 180)
-                    .padding(10)
-                    .background(
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            .fill(Color.primary.opacity(0.03))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            .stroke(Color.primary.opacity(0.06), lineWidth: 0.8)
-                    )
+            settingsCard(
+                title: L10n.tr("settings.knowledge.title"),
+                subtitle: L10n.tr("settings.knowledge.subtitle")
+            ) {
+                if let library = viewModel.currentKnowledgeLibrary {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(alignment: .top, spacing: 12) {
+                            Text(L10n.tr("settings.knowledge.current"))
+                                .font(.system(size: 12.5, weight: .semibold))
+                                .frame(width: 110, alignment: .leading)
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(library.name)
+                                    .font(.system(size: 13, weight: .semibold))
+
+                                Text(library.sourceRoot ?? viewModel.currentWorkspacePath)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                                    .textSelection(.enabled)
+                                    .lineLimit(2)
+
+                                Text("\(L10n.tr("settings.knowledge.status")): \(knowledgeStatusLabel(library.status))  •  \(L10n.tr("settings.knowledge.documents")): \(library.documentCount)  •  \(L10n.tr("settings.knowledge.chunks")): \(library.chunkCount)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+
+                        Text(L10n.tr("settings.knowledge.overview.inline_summary", "\(viewModel.knowledgeLibraryCount)"))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        HStack(spacing: 10) {
+                            Button(L10n.tr("settings.knowledge.manage")) {
+                                selectedKnowledgeLibrary = library
+                            }
+                            .buttonStyle(.bordered)
+
+                            Button(L10n.tr("settings.knowledge.overview.open")) {
+                                showKnowledgeOverview = true
+                            }
+                            .buttonStyle(.bordered)
+
+                            Button(L10n.tr("settings.knowledge.import_workspace")) {
+                                Task { await viewModel.importCurrentWorkspaceLibrary() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(viewModel.isKnowledgeImportRunning)
+
+                            Button(L10n.tr("settings.knowledge.import_file")) {
+                                let panel = NSOpenPanel()
+                                panel.title = L10n.tr("settings.knowledge.import_file.title")
+                                panel.canChooseDirectories = false
+                                panel.canChooseFiles = true
+                                panel.allowsMultipleSelection = false
+                                if panel.runModal() == .OK, let url = panel.urls.first {
+                                    Task { await viewModel.importKnowledgeFile(url) }
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(viewModel.isKnowledgeImportRunning)
+
+                            Button(L10n.tr("settings.knowledge.import_folder")) {
+                                let panel = NSOpenPanel()
+                                panel.title = L10n.tr("settings.knowledge.import_folder.title")
+                                panel.canChooseDirectories = true
+                                panel.canChooseFiles = false
+                                panel.allowsMultipleSelection = false
+                                if panel.runModal() == .OK, let url = panel.urls.first {
+                                    Task { await viewModel.importKnowledgeFolder(url) }
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(viewModel.isKnowledgeImportRunning)
+
+                            if let libraryURL = viewModel.currentKnowledgeLibraryFolderURL {
+                                Button(L10n.tr("settings.knowledge.open_library")) {
+                                    NSWorkspace.shared.open(libraryURL)
+                                }
+                                .buttonStyle(.bordered)
+                            }
+
+                            Button(L10n.tr("settings.knowledge.open_index")) {
+                                NSWorkspace.shared.open(viewModel.knowledgeLibrariesFileURL)
+                            }
+                            .buttonStyle(.bordered)
+
+                            Button(L10n.tr("settings.knowledge.open_imports")) {
+                                NSWorkspace.shared.open(viewModel.knowledgeImportsFileURL)
+                            }
+                            .buttonStyle(.bordered)
+
+                            Spacer()
+                        }
+
+                        HStack(spacing: 10) {
+                            TextField(L10n.tr("settings.knowledge.import_web.placeholder"), text: $knowledgeWebURL)
+                                .textFieldStyle(.roundedBorder)
+
+                            Button(L10n.tr("settings.knowledge.import_web")) {
+                                Task { await viewModel.importKnowledgeWeb(knowledgeWebURL) }
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(viewModel.isKnowledgeImportRunning || knowledgeWebURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        }
+
+                        if viewModel.isKnowledgeImportRunning {
+                            Text(L10n.tr("settings.knowledge.import_running"))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else if let message = viewModel.knowledgeImportStatusMessage, !message.isEmpty {
+                            Text(message)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } else {
+                    Text(L10n.tr("settings.knowledge.not_ready"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if displayMode == .modal {
+                settingsCard(title: L10n.tr("settings.section.system_prompt"), subtitle: "只在需要统一 agent 行为时调整；默认情况下不需要频繁修改。") {
+                    TextEditor(text: $viewModel.draftSystemPrompt)
+                        .font(.body)
+                        .frame(minHeight: 180)
+                        .padding(10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .fill(Color.primary.opacity(0.03))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .stroke(Color.primary.opacity(0.06), lineWidth: 0.8)
+                        )
+                }
             }
         }
     }
 
     private var aboutContent: some View {
         VStack(alignment: .leading, spacing: 18) {
-            settingsCard(title: "SkyAgent", subtitle: "当前版本和本地数据位置。") {
+            settingsCard(title: "SkyAgent", subtitle: L10n.tr("settings.about.app.subtitle")) {
                 VStack(alignment: .leading, spacing: 14) {
                     HStack(spacing: 10) {
-                        mcpMetricCard(title: "版本", value: appVersionText, tint: .accentColor)
-                        mcpMetricCard(title: "数据根目录", value: ".skyagent", tint: .green)
-                        mcpMetricCard(title: "日志目录", value: "events", tint: .orange)
+                        mcpMetricCard(title: L10n.tr("settings.about.metric.version"), value: appVersionText, tint: .accentColor)
+                        mcpMetricCard(title: L10n.tr("settings.about.metric.data_root"), value: ".skyagent", tint: .green)
+                        mcpMetricCard(title: L10n.tr("settings.about.metric.logs"), value: "events", tint: .orange)
                     }
 
-                    Text("这里主要用于快速确认版本、定位本地目录，以及打开常用数据位置。")
+                    Text(L10n.tr("settings.about.app.hint"))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
 
-            settingsCard(title: "本地路径", subtitle: "常用目录直接打开或在 Finder 中定位。") {
+            settingsCard(title: L10n.tr("settings.memory.title"), subtitle: L10n.tr("settings.memory.subtitle")) {
                 VStack(alignment: .leading, spacing: 10) {
-                    aboutPathRow(title: "用户目录", path: AppStoragePaths.userRoot.path)
-                    aboutPathRow(title: "工作目录", path: AppStoragePaths.workspaceDir.path)
+                    aboutPathRow(title: L10n.tr("settings.memory.global"), path: viewModel.globalMemoryFileURL.path, canOpenFile: true)
+                    aboutPathRow(title: L10n.tr("settings.memory.global_generated"), path: viewModel.generatedGlobalMemoryFileURL.path, canOpenFile: true)
+                    aboutPathRow(title: L10n.tr("settings.memory.global_index"), path: viewModel.globalMemoryIndexFileURL.path, canOpenFile: true)
+                    Divider()
+                        .padding(.vertical, 2)
+                    aboutPathRow(title: L10n.tr("settings.memory.workspace"), path: viewModel.currentWorkspaceMemoryFileURL.path, canOpenFile: true)
+                    aboutPathRow(title: L10n.tr("settings.memory.workspace_profile"), path: viewModel.currentWorkspaceProfileFileURL.path, canOpenFile: true)
+                    aboutPathRow(title: L10n.tr("settings.memory.workspace_index"), path: viewModel.currentWorkspaceFileIndexURL.path, canOpenFile: true)
+
+                    Text(L10n.tr("settings.memory.hint"))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .onAppear {
+                WorkspaceMemoryService.shared.ensureWorkspaceArtifacts(for: viewModel.currentWorkspacePath)
+            }
+
+            settingsCard(title: L10n.tr("settings.about.paths.title"), subtitle: L10n.tr("settings.about.paths.subtitle")) {
+                VStack(alignment: .leading, spacing: 10) {
+                    aboutPathRow(title: L10n.tr("settings.about.paths.user_root"), path: AppStoragePaths.userRoot.path)
+                    aboutPathRow(title: L10n.tr("settings.about.paths.sandbox"), path: AppStoragePaths.workspaceDir.path)
+                    aboutPathRow(title: L10n.tr("settings.about.paths.bin"), path: AppStoragePaths.binDir.path)
                     aboutPathRow(title: "Skills", path: AppStoragePaths.skillsDir.path)
-                    aboutPathRow(title: "MCP 配置", path: AppStoragePaths.mcpServersFile.path, canOpenFile: true)
-                    aboutPathRow(title: "日志目录", path: AppStoragePaths.logsDir.path)
+                    aboutPathRow(title: L10n.tr("settings.about.paths.skills_registry"), path: AppStoragePaths.skillsRegistryFile.path, canOpenFile: true)
+                    aboutPathRow(title: L10n.tr("settings.about.paths.mcp_config"), path: AppStoragePaths.mcpServersFile.path, canOpenFile: true)
+                    aboutPathRow(title: L10n.tr("settings.about.paths.mcp_log"), path: AppStoragePaths.mcpActivityLogFile.path, canOpenFile: true)
+                    aboutPathRow(title: L10n.tr("settings.about.paths.logs_dir"), path: AppStoragePaths.logsDir.path)
                 }
             }
         }
     }
 
     private var mcpContent: some View {
-        settingsCard(title: "MCP Servers", subtitle: "把高频操作放在上面，连接细节和测试工具折叠到单个 server 里。") {
+        settingsCard(
+            title: "MCP Servers",
+            subtitle: displayMode == .embedded ? "高频操作在上，细节折叠到单个 server 内。" : "把高频操作放在上面，连接细节和测试工具折叠到单个 server 里。"
+        ) {
             VStack(alignment: .leading, spacing: 14) {
                 Text("第三方 MCP server 分为 User 和 Project 两层；日常只需要看状态、刷新和编辑单个 server。")
                     .font(.caption)
@@ -633,7 +1000,10 @@ struct SettingsView: View {
 
     private var logsContent: some View {
         VStack(alignment: .leading, spacing: 18) {
-            settingsCard(title: "Logs", subtitle: "先看最近日志，再按 category 或 trace_id 缩小范围。") {
+            settingsCard(
+                title: "Logs",
+                subtitle: displayMode == .embedded ? "先看最近日志，再按分类或 trace 缩小范围。" : "先看最近日志，再按 category 或 trace_id 缩小范围。"
+            ) {
                 VStack(alignment: .leading, spacing: 14) {
                     HStack(spacing: 8) {
                         Button(viewModel.isLoadingLogs ? "Refreshing..." : "Refresh Logs") {
@@ -641,6 +1011,23 @@ struct SettingsView: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .disabled(viewModel.isLoadingLogs)
+
+                        Button("Export Logs") {
+                            let panel = NSOpenPanel()
+                            panel.title = "Export Logs"
+                            panel.canChooseDirectories = true
+                            panel.canChooseFiles = false
+                            panel.allowsMultipleSelection = false
+                            if panel.runModal() == .OK, let url = panel.urls.first {
+                                viewModel.exportLogs(to: url)
+                            }
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button("Clear Logs") {
+                            viewModel.clearLogs()
+                        }
+                        .buttonStyle(.bordered)
 
                         Button("Open Logs Folder") {
                             NSWorkspace.shared.open(AppStoragePaths.logsDir)
@@ -657,12 +1044,24 @@ struct SettingsView: View {
                         Spacer()
                     }
 
+                    let filteredEntries = logAnalysisSnapshot.filteredEntries
+                    let categoryOptions = logAnalysisSnapshot.categoryOptions
+                    let traceIDsCount = logAnalysisSnapshot.traceIDsCount
+                    let errorCount = logAnalysisSnapshot.errorCount
+                    let focusedTraceID = activeLogTraceID
+                    let focusedTraceEntries = focusedTraceID.map { traceLogEntries(traceID: $0) } ?? []
+                    let slowTraces = logAnalysisSnapshot.slowTraces
+
                     HStack(spacing: 10) {
-                        mcpMetricCard(title: "Loaded", value: "\(filteredLogEntries.count)", tint: .accentColor)
-                        mcpMetricCard(title: "Trace IDs", value: "\(Set(viewModel.logEntries.compactMap(\.traceID)).count)", tint: .green)
+                        mcpMetricCard(title: "Loaded", value: "\(filteredEntries.count)", tint: .accentColor)
+                        mcpMetricCard(title: "Trace IDs", value: "\(traceIDsCount)", tint: .green)
                         mcpMetricCard(title: "Files", value: "\(viewModel.logFiles.count)", tint: .orange)
-                        mcpMetricCard(title: "Errors", value: "\(viewModel.logEntries.filter { $0.level == "error" }.count)", tint: .red)
+                        mcpMetricCard(title: "Errors", value: "\(errorCount)", tint: .red)
                     }
+
+                    Text("日志默认保留最近 \(LogRetentionPolicy.maxAgeDays) 天，最多 \(LogRetentionPolicy.maxFiles) 个按天文件；敏感字段会自动脱敏。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
 
                     HStack(spacing: 8) {
                         ForEach(LogQuickFilter.allCases) { filter in
@@ -678,7 +1077,7 @@ struct SettingsView: View {
 
                         Picker("", selection: $selectedLogCategory) {
                             Text("All").tag("all")
-                            ForEach(logCategories, id: \.self) { category in
+                            ForEach(categoryOptions, id: \.self) { category in
                                 Text(category).tag(category)
                             }
                         }
@@ -691,12 +1090,10 @@ struct SettingsView: View {
                     labeledTextField("Search", text: $logSearchText)
                     labeledTextField("Trace ID", text: $logTraceFilter)
 
-                    if let traceID = activeLogTraceID,
-                       !traceLogEntries(traceID: traceID).isEmpty {
-                        logTracePanel(traceID: traceID)
+                    if let focusedTraceID, !focusedTraceEntries.isEmpty {
+                        logTracePanel(traceID: focusedTraceID)
                     }
 
-                    let slowTraces = slowTraceSummaries()
                     if !slowTraces.isEmpty {
                         logSlowTracesPanel(slowTraces)
                     }
@@ -707,13 +1104,19 @@ struct SettingsView: View {
                             .foregroundStyle(.red)
                     }
 
-                    if filteredLogEntries.isEmpty {
+                    if let logsStatusMessage = viewModel.logsStatusMessage, !logsStatusMessage.isEmpty {
+                        Text(logsStatusMessage)
+                            .font(.caption)
+                            .foregroundStyle(.green)
+                    }
+
+                    if filteredEntries.isEmpty {
                         Text("No logs matched the current filters.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     } else {
                         VStack(spacing: 8) {
-                            ForEach(filteredLogEntries.prefix(120)) { entry in
+                            ForEach(filteredEntries.prefix(120)) { entry in
                                 logRow(entry)
                             }
                         }
@@ -725,6 +1128,7 @@ struct SettingsView: View {
 
     private func tabButton(_ tab: SettingsTab) -> some View {
         let isSelected = selectedTab == tab
+        let isEmbedded = displayMode == .embedded
 
         return Button {
             selectedTab = tab
@@ -740,14 +1144,14 @@ struct SettingsView: View {
 
                 VStack(alignment: .leading, spacing: 1) {
                     Text(tab.title)
-                        .font(.system(size: 12.5, weight: .semibold, design: .rounded))
+                        .font(.system(size: isEmbedded ? 12 : 12.5, weight: .semibold, design: .rounded))
                         .foregroundStyle(isSelected ? Color.primary : Color.primary.opacity(0.82))
                 }
 
                 Spacer()
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 11)
+            .padding(.horizontal, isEmbedded ? 10 : 12)
+            .padding(.vertical, isEmbedded ? 10 : 11)
             .background(
                 RoundedRectangle(cornerRadius: 16, style: .continuous)
                     .fill(isSelected ? Color.accentColor.opacity(0.1) : Color.primary.opacity(0.02))
@@ -761,7 +1165,8 @@ struct SettingsView: View {
     }
 
     private func settingsCard<Content: View>(title: String, subtitle: String? = nil, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
+        let isEmbedded = displayMode == .embedded
+        return VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 4) {
                 Text(title)
                     .font(.system(size: 14, weight: .semibold, design: .rounded))
@@ -774,14 +1179,14 @@ struct SettingsView: View {
 
             content()
         }
-        .padding(18)
+        .padding(isEmbedded ? 16 : 18)
         .background(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
+            RoundedRectangle(cornerRadius: isEmbedded ? 18 : 22, style: .continuous)
                 .fill(
                     LinearGradient(
                         colors: [
                             Color(nsColor: .windowBackgroundColor).opacity(0.98),
-                            Color(nsColor: .textBackgroundColor).opacity(0.93)
+                            Color(nsColor: .textBackgroundColor).opacity(isEmbedded ? 0.9 : 0.93)
                         ],
                         startPoint: .topLeading,
                         endPoint: .bottomTrailing
@@ -789,10 +1194,35 @@ struct SettingsView: View {
                 )
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
+            RoundedRectangle(cornerRadius: isEmbedded ? 18 : 22, style: .continuous)
                 .stroke(Color.primary.opacity(0.055), lineWidth: 0.8)
         )
-        .shadow(color: Color.black.opacity(0.016), radius: 12, x: 0, y: 5)
+        .shadow(color: Color.black.opacity(isEmbedded ? 0.008 : 0.016), radius: isEmbedded ? 6 : 12, x: 0, y: isEmbedded ? 2 : 5)
+    }
+
+    private var embeddedShowsDraftActions: Bool {
+        selectedTab == .general || selectedTab == .models
+    }
+
+    private var hasDraftChanges: Bool {
+        let settings = viewModel.settings
+        let hasGeneralChanges =
+            viewModel.draftSystemPrompt != settings.systemPrompt ||
+            Int(viewModel.draftMaxTokens) != settings.maxTokens ||
+            viewModel.draftTemperature != settings.temperature ||
+            viewModel.draftSandboxDir != settings.sandboxDir ||
+            viewModel.draftThemePreference != settings.themePreference ||
+            viewModel.draftLanguagePreference != settings.languagePreference ||
+            viewModel.draftRequireCommandReturnToSend != settings.requireCommandReturnToSend
+
+        let hasModelChanges =
+            viewModel.draftURL != settings.apiURL ||
+            viewModel.draftKey != settings.apiKey ||
+            viewModel.draftModel != settings.model ||
+            viewModel.draftProfiles != settings.profiles ||
+            viewModel.selectedProfileId != (settings.activeProfileId ?? settings.profiles.first?.id)
+
+        return hasGeneralChanges || hasModelChanges
     }
 
     private func labeledTextField(_ title: String, text: Binding<String>) -> some View {
@@ -1014,6 +1444,14 @@ struct SettingsView: View {
             return build
         default:
             return "Dev Build"
+        }
+    }
+
+    private func closeSettingsView() {
+        if let onClose {
+            onClose()
+        } else {
+            dismiss()
         }
     }
 
@@ -1664,6 +2102,10 @@ struct SettingsView: View {
             switch selectedLogQuickFilter {
             case .all:
                 quickFilterMatches = true
+            case .foreground:
+                quickFilterMatches = !isBackgroundMemoryLog(entry)
+            case .background:
+                quickFilterMatches = isBackgroundMemoryLog(entry)
             case .errors:
                 quickFilterMatches = entry.level.lowercased() == "error"
             case .timeouts:
@@ -1704,6 +2146,18 @@ struct SettingsView: View {
         viewModel.logEntries
             .filter { $0.traceID == traceID }
             .sorted { $0.timestamp < $1.timestamp }
+    }
+
+    private func logRequestScope(_ entry: PersistedLogEvent) -> String? {
+        entry.metadata["request_scope"]?.lowercased()
+    }
+
+    private func logRequestPurpose(_ entry: PersistedLogEvent) -> String? {
+        entry.metadata["request_purpose"]
+    }
+
+    private func isBackgroundMemoryLog(_ entry: PersistedLogEvent) -> Bool {
+        logRequestScope(entry) == "background_memory"
     }
 
     private func traceTimingSummary(traceID: String) -> TraceTimingSummary {
@@ -1837,7 +2291,7 @@ struct SettingsView: View {
 
     private func slowTraceSummaries(limit: Int = 6) -> [SlowTraceSummary] {
         let grouped = Dictionary(grouping: viewModel.logEntries.compactMap { entry -> (String, PersistedLogEvent)? in
-            guard let traceID = entry.traceID, !traceID.isEmpty else { return nil }
+            guard let traceID = entry.traceID, !traceID.isEmpty, !isBackgroundMemoryLog(entry) else { return nil }
             return (traceID, entry)
         }, by: \.0)
 
@@ -1867,6 +2321,140 @@ struct SettingsView: View {
     }
 
     private func isTimeoutLog(_ entry: PersistedLogEvent) -> Bool {
+        if entry.status?.lowercased() == "timeout" {
+            return true
+        }
+        let haystack = [
+            entry.event,
+            entry.summary,
+            entry.metadata.map { "\($0.key)=\($0.value)" }.joined(separator: " ")
+        ].joined(separator: " ").lowercased()
+        return haystack.contains("timeout") || haystack.contains("timed out")
+    }
+
+    private func scheduleLogAnalysisRefresh() {
+        let entries = viewModel.logEntries
+        let selectedCategory = selectedLogCategory
+        let traceFilter = activeLogTraceID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let quickFilter = selectedLogQuickFilter
+        let search = logSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let token = UUID()
+        logAnalysisToken = token
+        logAnalysisTask?.cancel()
+
+        logAnalysisTask = Task.detached(priority: .utility) {
+            let snapshot = Self.buildLogAnalysisSnapshot(
+                entries: entries,
+                selectedCategory: selectedCategory,
+                traceFilter: traceFilter,
+                quickFilter: quickFilter,
+                search: search
+            )
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard logAnalysisToken == token else { return }
+                logAnalysisSnapshot = snapshot
+            }
+        }
+    }
+
+    nonisolated private static func buildLogAnalysisSnapshot(
+        entries: [PersistedLogEvent],
+        selectedCategory: String,
+        traceFilter: String,
+        quickFilter: LogQuickFilter,
+        search: String
+    ) -> LogAnalysisSnapshot {
+        let categoryOptions = Array(Set(entries.map(\.category))).sorted()
+        let traceIDsCount = Set(entries.compactMap(\.traceID)).count
+        let errorCount = entries.reduce(0) { partial, entry in
+            partial + (entry.level.lowercased() == "error" ? 1 : 0)
+        }
+
+        let filteredEntries = entries.filter { entry in
+            let categoryMatches = selectedCategory == "all" || entry.category == selectedCategory
+            let traceMatches = traceFilter.isEmpty
+                || entry.traceID?.localizedCaseInsensitiveContains(traceFilter) == true
+
+            let quickFilterMatches: Bool
+            switch quickFilter {
+            case .all:
+                quickFilterMatches = true
+            case .foreground:
+                quickFilterMatches = !isBackgroundMemoryLogStatic(entry)
+            case .background:
+                quickFilterMatches = isBackgroundMemoryLogStatic(entry)
+            case .errors:
+                quickFilterMatches = entry.level.lowercased() == "error"
+            case .timeouts:
+                quickFilterMatches = isTimeoutLogStatic(entry)
+            case .slow:
+                quickFilterMatches = (entry.durationMs ?? 0) >= 1_000
+            }
+
+            let searchMatches: Bool
+            if search.isEmpty {
+                searchMatches = true
+            } else {
+                let haystack = [
+                    entry.summary,
+                    entry.event,
+                    entry.category,
+                    entry.level,
+                    entry.status ?? "",
+                    entry.traceID ?? "",
+                    entry.operationID ?? "",
+                    entry.metadata.map { "\($0.key)=\($0.value)" }.joined(separator: " ")
+                ].joined(separator: " ")
+                searchMatches = haystack.localizedCaseInsensitiveContains(search)
+            }
+
+            return categoryMatches && traceMatches && quickFilterMatches && searchMatches
+        }
+
+        let grouped = Dictionary(grouping: entries.compactMap { entry -> (String, PersistedLogEvent)? in
+            guard let traceID = entry.traceID, !traceID.isEmpty, !isBackgroundMemoryLogStatic(entry) else { return nil }
+            return (traceID, entry)
+        }, by: \.0)
+
+        let slowTraces = grouped.compactMap { (traceID: String, pairs: [(String, PersistedLogEvent)]) -> SlowTraceSummary? in
+            let traceEntries = pairs.map(\.1).sorted { $0.timestamp < $1.timestamp }
+            guard let first = traceEntries.first, let last = traceEntries.last else { return nil }
+            let durationMs = Int(max(0, last.timestamp.timeIntervalSince(first.timestamp) * 1_000))
+            guard durationMs > 0 else { return nil }
+            return SlowTraceSummary(
+                id: traceID,
+                traceID: traceID,
+                durationMs: durationMs,
+                eventCount: traceEntries.count,
+                errorCount: traceEntries.filter { $0.level.lowercased() == "error" }.count,
+                timeoutCount: traceEntries.filter(isTimeoutLogStatic(_:)).count,
+                startedAt: first.timestamp
+            )
+        }
+        .sorted {
+            if $0.durationMs == $1.durationMs {
+                return $0.startedAt > $1.startedAt
+            }
+            return $0.durationMs > $1.durationMs
+        }
+        .prefix(6)
+        .map { $0 }
+
+        return LogAnalysisSnapshot(
+            categoryOptions: categoryOptions,
+            filteredEntries: filteredEntries,
+            traceIDsCount: traceIDsCount,
+            errorCount: errorCount,
+            slowTraces: slowTraces
+        )
+    }
+
+    nonisolated private static func isBackgroundMemoryLogStatic(_ entry: PersistedLogEvent) -> Bool {
+        entry.metadata["request_scope"]?.lowercased() == "background_memory"
+    }
+
+    nonisolated private static func isTimeoutLogStatic(_ entry: PersistedLogEvent) -> Bool {
         if entry.status?.lowercased() == "timeout" {
             return true
         }
@@ -2134,6 +2722,8 @@ struct SettingsView: View {
 
     private func logRow(_ entry: PersistedLogEvent) -> some View {
         let isExpanded = expandedLogIDs.contains(entry.id)
+        let requestScope = logRequestScope(entry)
+        let requestPurpose = logRequestPurpose(entry)
 
         return VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top, spacing: 10) {
@@ -2172,6 +2762,15 @@ struct SettingsView: View {
                         Text(entry.level.uppercased())
                             .font(.system(size: 10, weight: .bold, design: .rounded))
                             .foregroundStyle(logLevelColor(entry.level))
+                        if let requestScope {
+                            scopeBadge(
+                                title: requestScope == "background_memory" ? "Background" : "User",
+                                tint: requestScope == "background_memory" ? .orange : .accentColor
+                            )
+                        }
+                        if let requestPurpose, requestScope == "background_memory" {
+                            scopeBadge(title: humanReadableRequestPurpose(requestPurpose), tint: .secondary)
+                        }
                     if let traceID = entry.traceID, !traceID.isEmpty {
                         Button {
                             selectedLogTraceID = traceID
@@ -2249,6 +2848,26 @@ struct SettingsView: View {
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .stroke(Color.primary.opacity(0.045), lineWidth: 0.8)
         )
+    }
+
+    private func scopeBadge(title: String, tint: Color) -> some View {
+        Text(title)
+            .font(.system(size: 10, weight: .semibold, design: .rounded))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(tint.opacity(0.1), in: Capsule())
+            .foregroundStyle(tint)
+    }
+
+    private func humanReadableRequestPurpose(_ purpose: String) -> String {
+        switch purpose {
+        case "summary_generation":
+            return "Summary"
+        case "semantic_memory_extraction":
+            return "Memory Extract"
+        default:
+            return purpose.replacingOccurrences(of: "_", with: " ").capitalized
+        }
     }
 
     private func logMetaLine(_ key: String, _ value: String) -> some View {
@@ -2978,6 +3597,17 @@ struct SettingsView: View {
     private func copyToPasteboard(_ value: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(value, forType: .string)
+    }
+
+    private func knowledgeStatusLabel(_ status: KnowledgeLibraryStatus) -> String {
+        switch status {
+        case .idle:
+            return L10n.tr("settings.knowledge.status.idle")
+        case .indexing:
+            return L10n.tr("settings.knowledge.status.indexing")
+        case .failed:
+            return L10n.tr("settings.knowledge.status.failed")
+        }
     }
 
     private func revealInFinder(_ path: String) {

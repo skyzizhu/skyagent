@@ -4,7 +4,8 @@ import Network
 // MARK: - LLM Service (OpenAI compatible)
 
 actor LLMService {
-    private static let initialResponseTimeout: TimeInterval = 300
+    private static let firstTokenTimeout: TimeInterval = 90
+    private static let streamIdleTimeout: TimeInterval = 45
     private static let overallResponseTimeout: TimeInterval = 1800
 
     private var settings: AppSettings
@@ -25,7 +26,7 @@ actor LLMService {
         self.settings = settings
         let config = URLSessionConfiguration.default
         config.waitsForConnectivity = false
-        config.timeoutIntervalForRequest = Self.initialResponseTimeout
+        config.timeoutIntervalForRequest = Self.overallResponseTimeout
         config.timeoutIntervalForResource = Self.overallResponseTimeout
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         self.session = URLSession(configuration: config)
@@ -94,6 +95,7 @@ actor LLMService {
     }
 
     typealias StreamCallback = @Sendable (String) async -> Void
+    typealias ToolCallHintCallback = @Sendable (ToolCallRecord) async -> Void
 
     struct CompletionResponse {
         let content: String
@@ -103,7 +105,10 @@ actor LLMService {
     func complete(
         messages: [ChatMessage],
         toolDefinitions: [[String: Any]]? = nil,
+        trackAsCurrentTask: Bool = true,
         traceContext: TraceContext? = nil,
+        extraLogMetadata: [String: LogValue] = [:],
+        onToolCallHint: ToolCallHintCallback? = nil,
         onDelta: @escaping StreamCallback
     ) async throws -> CompletionResponse {
         guard !settings.apiKey.isEmpty else {
@@ -140,7 +145,7 @@ actor LLMService {
         request.setValue("Bearer \(settings.apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
-        request.timeoutInterval = Self.initialResponseTimeout
+        request.timeoutInterval = Self.overallResponseTimeout
         let requestStartedAt = Date()
         await LoggerService.shared.log(
             category: .llm,
@@ -154,10 +159,16 @@ actor LLMService {
                 "payload_message_count": .int(messagesPayload.count),
                 "tool_definition_count": .int(toolDefinitions?.count ?? 0),
                 "system_prompt_length": .int(settings.systemPrompt.count)
-            ]
+            ].merging(extraLogMetadata) { _, new in new }
         )
 
         let requestTask = Task<CompletionResponse, Error> {
+            let timeoutState = StreamTimeoutState(
+                requestStartedAt: requestStartedAt,
+                firstTokenTimeout: Self.firstTokenTimeout,
+                streamIdleTimeout: Self.streamIdleTimeout
+            )
+            let processingTask = Task<CompletionResponse, Error> {
             do {
                 let (bytes, response): (URLSession.AsyncBytes, URLResponse)
                 do {
@@ -189,11 +200,13 @@ actor LLMService {
                 }
 
                 var toolCallsBuffer: [Int: PartialToolCall] = [:]
+                var emittedToolCallHintIndexes: Set<Int> = []
                 var collectedContent = ""
                 var firstResponseLogged = false
 
                 for try await line in bytes.lines {
                     try Task.checkCancellation()
+                    await timeoutState.markActivity()
 
                     guard line.hasPrefix("data: ") else { continue }
                     let payload = String(line.dropFirst(6))
@@ -209,13 +222,15 @@ actor LLMService {
                     if !firstResponseLogged,
                        (delta["content"] as? String)?.isEmpty == false || delta["tool_calls"] != nil {
                         firstResponseLogged = true
+                        await timeoutState.markFirstTokenReceived()
                         await LoggerService.shared.log(
                             category: .llm,
                             event: "llm_first_token_received",
                             traceContext: traceContext,
                             status: .progress,
                             durationMs: Date().timeIntervalSince(requestStartedAt) * 1000,
-                            summary: "收到模型首个增量"
+                            summary: "收到模型首个增量",
+                            metadata: extraLogMetadata
                         )
                     }
 
@@ -241,6 +256,14 @@ actor LLMService {
                                     toolCallsBuffer[index]?.arguments += args
                                 }
                             }
+
+                            if !emittedToolCallHintIndexes.contains(index),
+                               let partial = toolCallsBuffer[index],
+                               let id = partial.id,
+                               let name = partial.name {
+                                emittedToolCallHintIndexes.insert(index)
+                                await onToolCallHint?(ToolCallRecord(id: id, name: name, arguments: partial.arguments))
+                            }
                         }
                     }
                 }
@@ -262,7 +285,7 @@ actor LLMService {
                         summary: "模型已返回工具调用",
                         metadata: [
                             "tool_call_count": .int(toolCalls.count)
-                        ]
+                        ].merging(extraLogMetadata) { _, new in new }
                     )
                 }
 
@@ -276,7 +299,7 @@ actor LLMService {
                     metadata: [
                         "content_length": .int(collectedContent.count),
                         "tool_call_count": .int(toolCalls.count)
-                    ]
+                    ].merging(extraLogMetadata) { _, new in new }
                 )
 
                 return CompletionResponse(content: collectedContent, toolCalls: toolCalls)
@@ -296,19 +319,58 @@ actor LLMService {
                         extra: [
                             "error_message": .string(error.localizedDescription)
                         ]
-                    )
+                    ).merging(extraLogMetadata) { _, new in new }
                 )
+                throw error
+            }
+            }
+
+            let timeoutWatcher = Task<Void, Never> {
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    if let timeoutError = await timeoutState.triggeredTimeoutIfNeeded() {
+                        processingTask.cancel()
+                        await LoggerService.shared.log(
+                            level: .warn,
+                            category: .llm,
+                            event: "llm_timeout_triggered",
+                            traceContext: traceContext,
+                            status: .timeout,
+                            durationMs: Date().timeIntervalSince(requestStartedAt) * 1000,
+                            summary: timeoutError.timeoutSummary,
+                            metadata: [
+                                "timeout_stage": .string(timeoutError.timeoutStage),
+                                "timeout_seconds": .int(Int(timeoutError.timeoutThreshold))
+                            ].merging(extraLogMetadata) { _, new in new }
+                        )
+                        return
+                    }
+                }
+            }
+
+            defer {
+                timeoutWatcher.cancel()
+            }
+
+            do {
+                return try await processingTask.value
+            } catch {
+                if let timeoutError = await timeoutState.consumeTriggeredTimeout() {
+                    throw timeoutError
+                }
                 throw error
             }
         }
 
         let taskID = UUID()
-        currentTask?.cancel()
-        currentTask = requestTask
-        currentTaskID = taskID
+        if trackAsCurrentTask {
+            currentTask?.cancel()
+            currentTask = requestTask
+            currentTaskID = taskID
+        }
 
         defer {
-            if currentTaskID == taskID {
+            if trackAsCurrentTask, currentTaskID == taskID {
                 currentTask = nil
                 currentTaskID = nil
             }
@@ -323,6 +385,12 @@ actor LLMService {
 
     private func logErrorKind(for error: Error) -> LogErrorKind {
         if case LLMError.requestTimedOut = error {
+            return .timeout
+        }
+        if case LLMError.firstTokenTimedOut = error {
+            return .timeout
+        }
+        if case LLMError.streamIdleTimedOut = error {
             return .timeout
         }
         if case LLMError.networkUnavailable = error {
@@ -345,8 +413,22 @@ actor LLMService {
         return .unknown
     }
 
-    func chat(messages: [ChatMessage], toolDefinitions: [[String: Any]]? = nil, onDelta: @escaping StreamCallback) async throws {
-        _ = try await complete(messages: messages, toolDefinitions: toolDefinitions, onDelta: onDelta)
+    func chat(
+        messages: [ChatMessage],
+        toolDefinitions: [[String: Any]]? = nil,
+        trackAsCurrentTask: Bool = true,
+        traceContext: TraceContext? = nil,
+        extraLogMetadata: [String: LogValue] = [:],
+        onDelta: @escaping StreamCallback
+    ) async throws {
+        _ = try await complete(
+            messages: messages,
+            toolDefinitions: toolDefinitions,
+            trackAsCurrentTask: trackAsCurrentTask,
+            traceContext: traceContext,
+            extraLogMetadata: extraLogMetadata,
+            onDelta: onDelta
+        )
     }
 
     private func messagePayload(for message: ChatMessage) -> [String: Any] {
@@ -451,7 +533,47 @@ enum LLMError: Error, LocalizedError {
     case networkUnavailable
     case connectionLost
     case requestTimedOut
+    case firstTokenTimedOut(timeout: TimeInterval)
+    case streamIdleTimedOut(timeout: TimeInterval)
     case maxRetriesExceeded(underlying: Error)
+
+    var timeoutStage: String {
+        switch self {
+        case .firstTokenTimedOut:
+            return "first_token"
+        case .streamIdleTimedOut:
+            return "stream_idle"
+        case .requestTimedOut:
+            return "request"
+        default:
+            return "unknown"
+        }
+    }
+
+    var timeoutThreshold: TimeInterval {
+        switch self {
+        case .firstTokenTimedOut(let timeout),
+             .streamIdleTimedOut(let timeout):
+            return timeout
+        case .requestTimedOut:
+            return 0
+        default:
+            return 0
+        }
+    }
+
+    var timeoutSummary: String {
+        switch self {
+        case .firstTokenTimedOut:
+            return "等待模型首个响应超时"
+        case .streamIdleTimedOut:
+            return "模型流式输出长时间无新数据"
+        case .requestTimedOut:
+            return "模型请求超时"
+        default:
+            return "模型请求异常"
+        }
+    }
 
     var errorDescription: String? {
         switch self {
@@ -461,7 +583,68 @@ enum LLMError: Error, LocalizedError {
         case .networkUnavailable: return "网络连接不可用，请检查网络设置"
         case .connectionLost: return "网络连接已断开，正在尝试重连..."
         case .requestTimedOut: return "请求超时。通常是模型生成内容过大、工具参数过长，或服务响应过慢导致的，并不一定是本地断网。"
+        case .firstTokenTimedOut: return "等待模型首个响应超时。服务端长时间没有返回首个 token。"
+        case .streamIdleTimedOut: return "模型开始响应后长时间没有新的流式数据，已按超时处理。"
         case .maxRetriesExceeded(let underlying): return "多次重试失败：\(underlying.localizedDescription)"
         }
+    }
+}
+
+private actor StreamTimeoutState {
+    private let requestStartedAt: Date
+    private let firstTokenTimeout: TimeInterval
+    private let streamIdleTimeout: TimeInterval
+
+    private var firstTokenReceived = false
+    private var lastActivityAt: Date
+    private var triggeredTimeout: LLMError?
+
+    init(
+        requestStartedAt: Date,
+        firstTokenTimeout: TimeInterval,
+        streamIdleTimeout: TimeInterval
+    ) {
+        self.requestStartedAt = requestStartedAt
+        self.firstTokenTimeout = firstTokenTimeout
+        self.streamIdleTimeout = streamIdleTimeout
+        self.lastActivityAt = requestStartedAt
+    }
+
+    func markActivity(at date: Date = Date()) {
+        lastActivityAt = date
+    }
+
+    func markFirstTokenReceived(at date: Date = Date()) {
+        firstTokenReceived = true
+        lastActivityAt = date
+    }
+
+    func triggeredTimeoutIfNeeded(now: Date = Date()) -> LLMError? {
+        if let triggeredTimeout {
+            return triggeredTimeout
+        }
+
+        if !firstTokenReceived {
+            if now.timeIntervalSince(requestStartedAt) >= firstTokenTimeout {
+                let error = LLMError.firstTokenTimedOut(timeout: firstTokenTimeout)
+                triggeredTimeout = error
+                return error
+            }
+            return nil
+        }
+
+        if now.timeIntervalSince(lastActivityAt) >= streamIdleTimeout {
+            let error = LLMError.streamIdleTimedOut(timeout: streamIdleTimeout)
+            triggeredTimeout = error
+            return error
+        }
+
+        return nil
+    }
+
+    func consumeTriggeredTimeout() -> LLMError? {
+        let timeout = triggeredTimeout
+        triggeredTimeout = nil
+        return timeout
     }
 }

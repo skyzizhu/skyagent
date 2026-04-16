@@ -9,14 +9,13 @@ struct SidebarView: View {
 
     @ObservedObject var viewModel: SidebarViewModel
     @ObservedObject var store: ConversationStore
+    @EnvironmentObject private var appState: AppState
     @State private var renamingId: UUID? = nil
     @State private var renameText = ""
     @State private var showSearch = false
     @State private var permissionChangeTarget: UUID?
     @State private var showOpenModeConfirmation = false
     @State private var pendingDangerousAction: PendingDangerousAction?
-    @Environment(\.openSettings) private var openSettings
-
     init(viewModel: SidebarViewModel) {
         self.viewModel = viewModel
         self.store = viewModel.store
@@ -127,7 +126,7 @@ struct SidebarView: View {
             .buttonStyle(.plain)
             .help(L10n.tr("sidebar.search.help"))
 
-            Button { openSettings() } label: {
+            Button { appState.showSettings() } label: {
                 toolbarIcon("gearshape")
             }
             .buttonStyle(.plain)
@@ -227,6 +226,7 @@ struct SidebarView: View {
                 LazyVStack(spacing: 6) {
                     ForEach(viewModel.filteredConversations) { conv in
                         Button {
+                            appState.closeSettings()
                             viewModel.selectConversation(conv.id)
                         } label: {
                             ConversationRowView(

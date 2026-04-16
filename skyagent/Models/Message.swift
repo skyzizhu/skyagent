@@ -1,5 +1,39 @@
 import Foundation
 
+struct KnowledgeReferenceRecord: Identifiable, Codable, Equatable, Sendable {
+    let id: UUID
+    let libraryID: UUID?
+    let libraryName: String?
+    let documentID: UUID?
+    let title: String
+    let source: String?
+    let citation: String?
+    let snippet: String
+    let score: Double?
+
+    init(
+        id: UUID = UUID(),
+        libraryID: UUID? = nil,
+        libraryName: String? = nil,
+        documentID: UUID? = nil,
+        title: String,
+        source: String? = nil,
+        citation: String? = nil,
+        snippet: String,
+        score: Double? = nil
+    ) {
+        self.id = id
+        self.libraryID = libraryID
+        self.libraryName = libraryName
+        self.documentID = documentID
+        self.title = title
+        self.source = source
+        self.citation = citation
+        self.snippet = snippet
+        self.score = score
+    }
+}
+
 struct ToolCallRecord: Identifiable, Codable, Equatable, Sendable {
     let id: String
     let name: String
@@ -18,7 +52,7 @@ struct ToolExecutionRecord: Identifiable, Codable, Equatable, Sendable {
     let arguments: String
 }
 
-struct Message: Identifiable, Codable, Equatable {
+struct Message: Identifiable, Codable, Equatable, Sendable {
     let id: UUID
     let role: Role
     var content: String
@@ -30,8 +64,9 @@ struct Message: Identifiable, Codable, Equatable {
     var imageDataURL: String?
     var previewImagePath: String?
     var previewImagePaths: [String]?
+    var knowledgeReferences: [KnowledgeReferenceRecord]?
 
-    enum Role: String, Codable {
+    enum Role: String, Codable, Sendable {
         case user, assistant, system, tool
     }
 
@@ -44,7 +79,8 @@ struct Message: Identifiable, Codable, Equatable {
         attachmentID: String? = nil,
         imageDataURL: String? = nil,
         previewImagePath: String? = nil,
-        previewImagePaths: [String]? = nil
+        previewImagePaths: [String]? = nil,
+        knowledgeReferences: [KnowledgeReferenceRecord]? = nil
     ) {
         self.id = UUID()
         self.role = role
@@ -57,6 +93,7 @@ struct Message: Identifiable, Codable, Equatable {
         self.imageDataURL = imageDataURL
         self.previewImagePath = previewImagePath
         self.previewImagePaths = previewImagePaths
+        self.knowledgeReferences = knowledgeReferences
     }
 
     var hidesAssistantToolCallMarker: Bool {
@@ -80,5 +117,32 @@ struct Message: Identifiable, Codable, Equatable {
 
     var isVisibleInTranscript: Bool {
         hiddenFromTranscript != true && !hidesAssistantToolCallMarker && !hidesAssistantToolPreamble
+    }
+
+    nonisolated var renderFingerprint: String {
+        let prefix = String(content.prefix(160))
+        let suffix = String(content.suffix(64))
+        let toolCallSummary = toolCalls?.map(\.name).joined(separator: "|") ?? ""
+        let toolExecutionName = toolExecution?.name ?? ""
+        let attachmentSummary = attachmentID ?? ""
+        let previewSummary = previewImagePaths?.joined(separator: "|") ?? previewImagePath ?? ""
+        let knowledgeSummary = knowledgeReferences?
+            .prefix(3)
+            .map { "\($0.libraryName ?? "")::\($0.title)::\($0.citation ?? "")" }
+            .joined(separator: "|") ?? ""
+
+        return [
+            role.rawValue,
+            id.uuidString,
+            "\(content.count)",
+            prefix,
+            suffix,
+            hiddenFromTranscript == true ? "hidden" : "visible",
+            toolCallSummary,
+            toolExecutionName,
+            attachmentSummary,
+            previewSummary,
+            knowledgeSummary
+        ].joined(separator: "§")
     }
 }

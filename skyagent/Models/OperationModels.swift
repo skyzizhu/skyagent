@@ -1,6 +1,6 @@
 import Foundation
 
-struct OperationPreview: Identifiable, Equatable {
+struct OperationPreview: Identifiable, Equatable, Sendable {
     let id: String
     let toolName: String
     let title: String
@@ -10,18 +10,18 @@ struct OperationPreview: Identifiable, Equatable {
     let canUndo: Bool
 }
 
-enum UndoActionKind: String, Codable {
+enum UndoActionKind: String, Codable, Sendable {
     case deleteCreatedItem
     case restoreBackup
 }
 
-struct UndoAction: Codable {
+struct UndoAction: Codable, Sendable {
     let kind: UndoActionKind
     let targetPath: String
     let backupPath: String?
 }
 
-struct FileOperationRecord: Identifiable, Codable {
+struct FileOperationRecord: Identifiable, Codable, Sendable {
     let id: String
     let toolName: String
     let title: String

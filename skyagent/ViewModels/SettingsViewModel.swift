@@ -24,6 +24,14 @@ class SettingsViewModel: ObservableObject {
     @Published private(set) var logFiles: [URL] = []
     @Published private(set) var isLoadingLogs = false
     @Published private(set) var logsErrorMessage: String?
+    @Published private(set) var logsStatusMessage: String?
+    @Published private(set) var currentKnowledgeLibrary: KnowledgeLibrary?
+    @Published private(set) var knowledgeLibraryCount = 0
+    @Published private(set) var knowledgeImportStatusMessage: String?
+    @Published private(set) var isKnowledgeImportRunning = false
+
+    private var cancellables = Set<AnyCancellable>()
+    private var knowledgeLibraryRefreshToken = UUID()
 
     init(store: ConversationStore, llm: LLMService, skillManager: SkillManager, mcpManager: MCPServerManager) {
         self.store = store
@@ -44,6 +52,8 @@ class SettingsViewModel: ObservableObject {
         self.draftProfiles = s.profiles
         self.selectedProfileId = s.activeProfileId ?? s.profiles.first?.id
         refreshLogs()
+        refreshKnowledgeLibrary()
+        observeStoreChanges()
     }
 
     var settings: AppSettings { store.settings }
@@ -195,6 +205,180 @@ class SettingsViewModel: ObservableObject {
     }
 
     var mcpServers: [MCPServerConfig] { mcpManager.servers }
+
+    var globalMemoryFileURL: URL { AppStoragePaths.globalMemoryFile }
+
+    var generatedGlobalMemoryFileURL: URL { AppStoragePaths.generatedMemoryFile }
+
+    var globalMemoryIndexFileURL: URL { AppStoragePaths.memoryIndexFile }
+
+    var currentWorkspacePath: String {
+        let conversationWorkspace = store.currentConversation?.sandboxDir.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let draftWorkspace = draftSandboxDir.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !conversationWorkspace.isEmpty {
+            return conversationWorkspace
+        }
+        if !draftWorkspace.isEmpty {
+            return draftWorkspace
+        }
+        return store.settings.ensureSandboxDir()
+    }
+
+    var knowledgeLibrariesFileURL: URL { AppStoragePaths.knowledgeLibrariesFile }
+
+    var knowledgeImportsFileURL: URL { AppStoragePaths.knowledgeImportsFile }
+
+    var currentKnowledgeLibraryFolderURL: URL? {
+        guard let library = currentKnowledgeLibrary else { return nil }
+        return AppStoragePaths.knowledgeLibrariesRootDir.appendingPathComponent(library.id.uuidString, isDirectory: true)
+    }
+
+    var allKnowledgeLibraries: [KnowledgeLibrary] {
+        KnowledgeBaseService.shared.listLibraries()
+            .sorted { lhs, rhs in
+                if lhs.sourceRoot != nil && rhs.sourceRoot == nil { return true }
+                if lhs.sourceRoot == nil && rhs.sourceRoot != nil { return false }
+                if lhs.updatedAt != rhs.updatedAt { return lhs.updatedAt > rhs.updatedAt }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
+    }
+
+    var currentWorkspaceMemoryFileURL: URL {
+        URL(fileURLWithPath: WorkspaceMemoryService.shared.workspaceMemoryFilePath(for: currentWorkspacePath))
+    }
+
+    func importCurrentWorkspaceLibrary() async {
+        guard let library = currentKnowledgeLibrary else { return }
+        let sourceRoot = library.sourceRoot ?? currentWorkspacePath
+        guard !sourceRoot.isEmpty else { return }
+        isKnowledgeImportRunning = true
+        knowledgeImportStatusMessage = nil
+        let job = await KnowledgeBaseService.shared.enqueueAndRunImport(
+            libraryId: library.id,
+            sourceType: .folder,
+            source: sourceRoot,
+            title: URL(fileURLWithPath: sourceRoot, isDirectory: true).lastPathComponent
+        )
+        isKnowledgeImportRunning = false
+        applyKnowledgeImportStatus(job)
+    }
+
+    func importKnowledgeFile(_ url: URL) async {
+        guard let library = currentKnowledgeLibrary else { return }
+        isKnowledgeImportRunning = true
+        knowledgeImportStatusMessage = nil
+        let job = await KnowledgeBaseService.shared.enqueueAndRunImport(
+            libraryId: library.id,
+            sourceType: .file,
+            source: url.path,
+            title: url.lastPathComponent
+        )
+        isKnowledgeImportRunning = false
+        applyKnowledgeImportStatus(job)
+    }
+
+    func importKnowledgeFolder(_ url: URL) async {
+        guard let library = currentKnowledgeLibrary else { return }
+        isKnowledgeImportRunning = true
+        knowledgeImportStatusMessage = nil
+        let job = await KnowledgeBaseService.shared.enqueueAndRunImport(
+            libraryId: library.id,
+            sourceType: .folder,
+            source: url.path,
+            title: url.lastPathComponent
+        )
+        isKnowledgeImportRunning = false
+        applyKnowledgeImportStatus(job)
+    }
+
+    func importKnowledgeWeb(_ urlString: String) async {
+        guard let library = currentKnowledgeLibrary else { return }
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        isKnowledgeImportRunning = true
+        knowledgeImportStatusMessage = nil
+        let job = await KnowledgeBaseService.shared.enqueueAndRunImport(
+            libraryId: library.id,
+            sourceType: .web,
+            source: trimmed,
+            title: trimmed
+        )
+        isKnowledgeImportRunning = false
+        applyKnowledgeImportStatus(job)
+    }
+
+    private func applyKnowledgeImportStatus(_ job: KnowledgeImportJob) {
+        switch job.status {
+        case .succeeded:
+            knowledgeImportStatusMessage = L10n.tr("settings.knowledge.import_done")
+        case .failed:
+            knowledgeImportStatusMessage = L10n.tr("settings.knowledge.import_failed", job.errorMessage ?? "")
+        default:
+            knowledgeImportStatusMessage = L10n.tr("settings.knowledge.import_pending")
+        }
+    }
+
+    private func observeStoreChanges() {
+        store.$currentConversationId
+            .sink { [weak self] _ in
+                self?.refreshKnowledgeLibrary()
+            }
+            .store(in: &cancellables)
+
+        store.$conversations
+            .debounce(for: .milliseconds(200), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.refreshKnowledgeLibrary()
+            }
+            .store(in: &cancellables)
+
+        store.$settings
+            .sink { [weak self] _ in
+                self?.refreshKnowledgeLibrary()
+            }
+            .store(in: &cancellables)
+    }
+
+    private func refreshKnowledgeLibrary() {
+        let workspacePath = AppStoragePaths.normalizeSandboxPath(currentWorkspacePath)
+        guard !workspacePath.isEmpty else {
+            currentKnowledgeLibrary = nil
+            knowledgeLibraryCount = 0
+            return
+        }
+
+        let refreshToken = UUID()
+        knowledgeLibraryRefreshToken = refreshToken
+
+        DispatchQueue.global(qos: .utility).async {
+            let service = KnowledgeBaseService.shared
+            var libraries = service.listLibraries()
+            let library = libraries.first {
+                guard let sourceRoot = $0.sourceRoot else { return false }
+                return AppStoragePaths.normalizeSandboxPath(sourceRoot) == workspacePath
+            } ?? service.ensureLibraryForWorkspace(rootPath: workspacePath)
+
+            if !libraries.contains(where: { $0.id == library.id }) {
+                libraries = service.listLibraries()
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                guard self.knowledgeLibraryRefreshToken == refreshToken else { return }
+                guard AppStoragePaths.normalizeSandboxPath(self.currentWorkspacePath) == workspacePath else { return }
+                self.currentKnowledgeLibrary = library
+                self.knowledgeLibraryCount = libraries.count
+            }
+        }
+    }
+
+    var currentWorkspaceProfileFileURL: URL {
+        URL(fileURLWithPath: WorkspaceMemoryService.shared.workspaceProfileFilePath(for: currentWorkspacePath))
+    }
+
+    var currentWorkspaceFileIndexURL: URL {
+        URL(fileURLWithPath: WorkspaceMemoryService.shared.workspaceFileIndexPath(for: currentWorkspacePath))
+    }
 
     var mcpUserConfigURL: URL { mcpManager.userConfigURL }
 
@@ -412,6 +596,37 @@ class SettingsViewModel: ObservableObject {
             self.logEntries = entries
             self.logFiles = files
             self.isLoadingLogs = false
+        }
+    }
+
+    func clearLogs() {
+        logsErrorMessage = nil
+        logsStatusMessage = nil
+        Task {
+            do {
+                try await Task.detached(priority: .utility) {
+                    try LogFileReader.clearAllLogs()
+                }.value
+                self.logsStatusMessage = "日志已清空。"
+                self.refreshLogs()
+            } catch {
+                self.logsErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func exportLogs(to url: URL) {
+        logsErrorMessage = nil
+        logsStatusMessage = nil
+        Task {
+            do {
+                let exportURL = try await Task.detached(priority: .utility) {
+                    try LogFileReader.exportLogs(to: url)
+                }.value
+                self.logsStatusMessage = "日志已导出到 \(exportURL.lastPathComponent)。"
+            } catch {
+                self.logsErrorMessage = error.localizedDescription
+            }
         }
     }
 }

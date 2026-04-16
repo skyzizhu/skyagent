@@ -38,6 +38,7 @@ enum ToolDefinition {
         case appendXLSXRows = "append_xlsx_rows"
         case updateXLSXCell = "update_xlsx_cell"
         case webFetch = "web_fetch"
+        case webSearch = "web_search"
         case listFiles = "list_files"
         case importFile = "import_file"
         case importDirectory = "import_directory"
@@ -496,7 +497,7 @@ enum ToolDefinition {
         tools.append(
             function(
                 name: ToolName.webFetch.rawValue,
-                description: "抓取网页内容（去除 HTML 标签）",
+                description: "抓取并结构化提取网页正文内容。支持 HTTP 和 HTTPS；会尽量提取标题、摘要、结构标题和正文片段；如果目标站点的 HTTP / HTTPS 配置异常，会返回更明确的诊断信息。",
                 properties: [
                     "url": [
                         "type": "string",
@@ -509,10 +510,32 @@ enum ToolDefinition {
 
         tools.append(
             function(
+                name: ToolName.webSearch.rawValue,
+                description: "使用公开搜索引擎进行网页搜索，返回标题、链接与摘要。支持 bing / google / baidu，默认自动选择可用结果最多的引擎。",
+                properties: [
+                    "query": [
+                        "type": "string",
+                        "description": "搜索关键词"
+                    ],
+                    "limit": [
+                        "type": "integer",
+                        "description": "返回结果数量（1-10）"
+                    ],
+                    "engine": [
+                        "type": "string",
+                        "description": "搜索引擎：auto / bing / google / baidu"
+                    ]
+                ],
+                required: ["query"]
+            )
+        )
+
+        tools.append(
+            function(
                 name: ToolName.listFiles.rawValue,
                 description: mode == .sandbox
-                    ? "列出目录文件（支持递归）。沙盒模式下可查看当前会话工作目录和其他系统路径，但只有当前会话工作目录可写。"
-                    : "列出目录文件（支持递归）。默认相对当前会话工作目录解析，也可查看其他绝对路径。",
+                    ? "列出目录文件（支持递归）。沙盒模式下可查看当前会话工作目录和其他系统路径，但只有当前会话工作目录可写。适合目录浏览、确认目标文件或浅层查看；不适合代替递归扩展名统计或大目录树数量统计。"
+                    : "列出目录文件（支持递归）。默认相对当前会话工作目录解析，也可查看其他绝对路径。适合目录浏览、确认目标文件或浅层查看；不适合代替递归扩展名统计或大目录树数量统计。",
                 properties: [
                     "path": [
                         "type": "string",
@@ -888,9 +911,7 @@ enum ToolDefinition {
         tools.append(
             function(
                 name: ToolName.runSkillScript.rawValue,
-                description: mode == .open
-                    ? "运行一个已激活 Agent Skill 中的脚本。开放模式下可直接执行。脚本路径必须使用 skill 中 scripts/ 下的相对路径。"
-                    : "运行一个已激活 Agent Skill 中的脚本。沙盒模式下允许执行本地脚本，但会通过系统沙盒禁止网络请求，并限制只有当前会话工作目录可写；脚本路径必须使用 skill 中 scripts/ 下的相对路径。",
+                description: "运行一个已激活 Agent Skill 中的脚本。该工具使用独立的 Skill Runtime，默认允许联网，不受普通 shell 开关影响。脚本路径必须使用 skill 中 scripts/ 下的相对路径。",
                 properties: [
                     "skill_name": [
                         "type": "string",

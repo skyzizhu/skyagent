@@ -21,6 +21,8 @@ enum LogCategory: String, Sendable {
     case ui
     case render
     case file
+    case rag
+    case automation
 }
 
 enum LogStatus: String, Sendable {
@@ -278,8 +280,10 @@ enum LogMetadataBuilder {
 
 actor LogStore {
     private let fileManager = FileManager.default
+    private var hasPreparedRetention = false
 
     func append(_ event: LogEvent) {
+        prepareRetentionIfNeeded()
         let url = fileURL(for: event.timestamp)
         if !fileManager.fileExists(atPath: url.path) {
             fileManager.createFile(atPath: url.path, contents: nil)
@@ -296,6 +300,12 @@ actor LogStore {
         } catch {
             return
         }
+    }
+
+    private func prepareRetentionIfNeeded() {
+        guard !hasPreparedRetention else { return }
+        hasPreparedRetention = true
+        LogFileReader.pruneExpiredAndExcessFiles()
     }
 
     private func fileURL(for date: Date) -> URL {
@@ -339,6 +349,11 @@ actor LoggerService {
     }
 }
 
+enum LogRetentionPolicy {
+    nonisolated static let maxAgeDays = 14
+    nonisolated static let maxFiles = 30
+}
+
 struct PersistedLogEvent: Identifiable, Sendable {
     let id: String
     let timestamp: Date
@@ -367,7 +382,57 @@ struct PersistedLogEvent: Identifiable, Sendable {
 }
 
 enum LogFileReader {
+    nonisolated static func pruneExpiredAndExcessFiles() {
+        AppStoragePaths.prepareDataDirectories()
+        let directory = AppStoragePaths.eventLogsDir
+        let fileManager = FileManager.default
+        let urls = ((try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )) ?? [])
+            .filter { $0.pathExtension.lowercased() == "ndjson" }
+            .sorted { lhs, rhs in
+                let leftDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let rightDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                if leftDate != rightDate {
+                    return leftDate > rightDate
+                }
+                return lhs.lastPathComponent > rhs.lastPathComponent
+            }
+
+        let cutoffDate = Calendar.current.date(byAdding: .day, value: -LogRetentionPolicy.maxAgeDays, to: Date()) ?? .distantPast
+        for url in urls {
+            let modifiedAt = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            if modifiedAt < cutoffDate {
+                try? fileManager.removeItem(at: url)
+            }
+        }
+
+        let refreshed = ((try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )) ?? [])
+            .filter { $0.pathExtension.lowercased() == "ndjson" }
+            .sorted { lhs, rhs in
+                let leftDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let rightDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                if leftDate != rightDate {
+                    return leftDate > rightDate
+                }
+                return lhs.lastPathComponent > rhs.lastPathComponent
+            }
+
+        if refreshed.count > LogRetentionPolicy.maxFiles {
+            for url in refreshed.dropFirst(LogRetentionPolicy.maxFiles) {
+                try? fileManager.removeItem(at: url)
+            }
+        }
+    }
+
     nonisolated static func loadRecentEvents(limit: Int = 250, maxFiles: Int = 5) -> [PersistedLogEvent] {
+        pruneExpiredAndExcessFiles()
         AppStoragePaths.prepareDataDirectories()
         let directory = AppStoragePaths.eventLogsDir
         let fileManager = FileManager.default
@@ -408,12 +473,44 @@ enum LogFileReader {
     }
 
     nonisolated static func availableLogFiles() -> [URL] {
+        pruneExpiredAndExcessFiles()
         AppStoragePaths.prepareDataDirectories()
         let directory = AppStoragePaths.eventLogsDir
         let fileManager = FileManager.default
         return ((try? fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? [])
             .filter { $0.pathExtension.lowercased() == "ndjson" }
             .sorted { $0.lastPathComponent > $1.lastPathComponent }
+    }
+
+    nonisolated static func clearAllLogs() throws {
+        AppStoragePaths.prepareDataDirectories()
+        let fileManager = FileManager.default
+        let directory = AppStoragePaths.eventLogsDir
+        let urls = try fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+            .filter { $0.pathExtension.lowercased() == "ndjson" }
+        for url in urls {
+            try fileManager.removeItem(at: url)
+        }
+    }
+
+    nonisolated static func exportLogs(to destinationDirectory: URL) throws -> URL {
+        pruneExpiredAndExcessFiles()
+        AppStoragePaths.prepareDataDirectories()
+        let fileManager = FileManager.default
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let exportRoot = destinationDirectory.appendingPathComponent("skyagent-logs-\(formatter.string(from: Date()))", isDirectory: true)
+        try fileManager.createDirectory(at: exportRoot, withIntermediateDirectories: true)
+
+        let sourceFiles = availableLogFiles()
+        for file in sourceFiles {
+            let destination = exportRoot.appendingPathComponent(file.lastPathComponent, isDirectory: false)
+            try fileManager.copyItem(at: file, to: destination)
+        }
+        return exportRoot
     }
 
     nonisolated private static func parse(line: String) -> PersistedLogEvent? {

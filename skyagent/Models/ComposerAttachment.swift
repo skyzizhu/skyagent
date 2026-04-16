@@ -37,18 +37,46 @@ struct ComposerAttachment: Identifiable {
     ]
     nonisolated private static let officeExtensions: Set<String> = ["docx", "xlsx", "pptx"]
 
+    typealias ProgressHandler = @Sendable (ComposerAttachmentParsingProgress) -> Void
+
     nonisolated static var supportedFileExtensions: [String] {
         Array(imageExtensions.union(supportedTextExtensions).union(officeExtensions).union(["pdf"])).sorted()
     }
 
-    nonisolated static func fromImage(_ image: NSImage, fileName: String = "image.png") throws -> ComposerAttachment {
+    nonisolated static func parsingKind(forExtension ext: String) -> ComposerAttachmentStatus.Kind {
+        let normalized = ext.lowercased()
+        if imageExtensions.contains(normalized) {
+            return .image
+        }
+        if normalized == "pdf" {
+            return .pdf
+        }
+        if officeExtensions.contains(normalized) {
+            return .office
+        }
+        if supportedTextExtensions.contains(normalized) {
+            return .text
+        }
+        return .file
+    }
+
+    nonisolated static func fromImage(
+        _ image: NSImage,
+        fileName: String = "image.png",
+        progress: ProgressHandler? = nil
+    ) throws -> ComposerAttachment {
         guard let imageData = image.tiffRepresentation else {
             throw AttachmentError.failedToReadImage
         }
-        return try fromImageData(imageData, fileName: fileName)
+        return try fromImageData(imageData, fileName: fileName, progress: progress)
     }
 
-    nonisolated static func fromImageData(_ imageData: Data, fileName: String = "image.png") throws -> ComposerAttachment {
+    nonisolated static func fromImageData(
+        _ imageData: Data,
+        fileName: String = "image.png",
+        progress: ProgressHandler? = nil
+    ) throws -> ComposerAttachment {
+        reportProgress(progress, kind: .image, key: "attachment.progress.image.reading")
         guard let image = NSImage(data: imageData),
               let tiffData = image.tiffRepresentation,
               let bitmap = NSBitmapImageRep(data: tiffData),
@@ -56,8 +84,10 @@ struct ComposerAttachment: Identifiable {
             throw AttachmentError.failedToReadImage
         }
 
+        reportProgress(progress, kind: .image, key: "attachment.progress.image.normalizing")
         let base64 = pngData.base64EncodedString()
         let dataURL = "data:image/png;base64,\(base64)"
+        reportProgress(progress, kind: .image, key: "attachment.progress.image.preparing")
         let context = """
         [上传图片]
         文件名: \(fileName)
@@ -80,12 +110,16 @@ struct ComposerAttachment: Identifiable {
         )
     }
 
-    nonisolated static func fromFile(url: URL) throws -> ComposerAttachment {
+    nonisolated static func fromFile(
+        url: URL,
+        progress: ProgressHandler? = nil
+    ) throws -> ComposerAttachment {
         let fileName = url.lastPathComponent
         let ext = url.pathExtension.lowercased()
 
         if imageExtensions.contains(ext) {
-            return try fromImageData(Data(contentsOf: url), fileName: fileName)
+            reportProgress(progress, kind: .image, key: "attachment.progress.file.loading")
+            return try fromImageData(Data(contentsOf: url), fileName: fileName, progress: progress)
         }
 
         let values = try url.resourceValues(forKeys: [.fileSizeKey])
@@ -101,6 +135,7 @@ struct ComposerAttachment: Identifiable {
         }
 
         if ext == "pdf" {
+            reportProgress(progress, kind: .pdf, key: "attachment.progress.pdf.opening")
             guard let pdf = PDFDocument(url: url) else {
                 throw AttachmentError.failedToReadPDF
             }
@@ -111,6 +146,14 @@ struct ComposerAttachment: Identifiable {
             var usedOCR = false
             var attemptedOCR = false
             for pageIndex in 0..<pdf.pageCount {
+                if shouldReportStepProgress(current: pageIndex + 1, total: pdf.pageCount) {
+                    reportProgress(
+                        progress,
+                        kind: .pdf,
+                        key: "attachment.progress.pdf.page",
+                        arguments: ["\(pageIndex + 1)", "\(pdf.pageCount)"]
+                    )
+                }
                 if let text = pdf.page(at: pageIndex)?.string?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !text.isEmpty {
                     pages.append(text)
@@ -118,6 +161,12 @@ struct ComposerAttachment: Identifiable {
                           let page = pdf.page(at: pageIndex),
                           !page.bounds(for: .mediaBox).isEmpty {
                     attemptedOCR = true
+                    reportProgress(
+                        progress,
+                        kind: .pdf,
+                        key: "attachment.progress.pdf.ocr",
+                        arguments: ["\(pageIndex + 1)", "\(min(pdf.pageCount, maxPDFOCRPages))"]
+                    )
                     if let ocrText = recognizeText(in: page),
                        !ocrText.isEmpty {
                         pages.append("第\(pageIndex + 1)页（OCR）\n\(ocrText)")
@@ -130,6 +179,7 @@ struct ComposerAttachment: Identifiable {
                 throw AttachmentError.pdfHasNoReadableContent(ocrAttempted: attemptedOCR)
             }
             let detail = usedOCR ? "PDF(OCR) · \(sizeString)" : "PDF · \(sizeString)"
+            reportProgress(progress, kind: .pdf, key: "attachment.progress.pdf.organizing")
             let document = try storeChunkedDocument(
                 fileName: fileName,
                 typeName: usedOCR ? "PDF(OCR)" : "PDF",
@@ -144,6 +194,7 @@ struct ComposerAttachment: Identifiable {
                     )
                 }
             )
+            reportProgress(progress, kind: .pdf, key: "attachment.progress.common.storing")
             let context = """
             [上传文件]
             文件名: \(fileName)
@@ -176,7 +227,7 @@ struct ComposerAttachment: Identifiable {
         if officeExtensions.contains(ext) {
             let extracted: (typeName: String, content: String, segments: [UploadedAttachmentSegment])
             do {
-                extracted = try extractOfficeDocument(at: url, ext: ext)
+                extracted = try extractOfficeDocument(at: url, ext: ext, progress: progress)
             } catch AttachmentError.failedToReadArchiveEntry {
                 throw AttachmentError.failedToReadOfficeDocument(
                     typeDisplayName(for: ext),
@@ -191,6 +242,7 @@ struct ComposerAttachment: Identifiable {
                 throw error
             }
             let detail = "\(extracted.typeName) · \(sizeString)"
+            reportProgress(progress, kind: .office, key: "attachment.progress.office.organizing")
             let document = try storeChunkedDocument(
                 fileName: fileName,
                 typeName: extracted.typeName,
@@ -198,6 +250,7 @@ struct ComposerAttachment: Identifiable {
                 content: extracted.content,
                 segments: extracted.segments
             )
+            reportProgress(progress, kind: .office, key: "attachment.progress.common.storing")
             let selectorHint: String
             switch ext {
             case "xlsx":
@@ -240,11 +293,14 @@ struct ComposerAttachment: Identifiable {
             throw AttachmentError.unsupportedFileType(ext.isEmpty ? fileName : ext)
         }
 
+        reportProgress(progress, kind: .text, key: "attachment.progress.file.loading")
         let data = try Data(contentsOf: url)
+        reportProgress(progress, kind: .text, key: "attachment.progress.text.decoding")
         let rawText = decodeText(data)
         let language = codeFenceLanguage(for: ext)
         let typeName = typeDisplayName(for: ext)
         let detail = "\(typeName) · \(sizeString)"
+        reportProgress(progress, kind: .text, key: "attachment.progress.text.segmenting")
         let document = try storeChunkedDocument(
             fileName: fileName,
             typeName: typeName,
@@ -252,6 +308,7 @@ struct ComposerAttachment: Identifiable {
             content: rawText,
             segments: makeSemanticSegments(from: rawText)
         )
+        reportProgress(progress, kind: .text, key: "attachment.progress.common.storing")
         let context = """
         [上传文件]
         文件名: \(fileName)
@@ -508,9 +565,15 @@ struct ComposerAttachment: Identifiable {
         }
     }
 
-    nonisolated private static func extractOfficeDocument(at url: URL, ext: String) throws -> (typeName: String, content: String, segments: [UploadedAttachmentSegment]) {
+    nonisolated private static func extractOfficeDocument(
+        at url: URL,
+        ext: String,
+        progress: ProgressHandler? = nil
+    ) throws -> (typeName: String, content: String, segments: [UploadedAttachmentSegment]) {
+        reportProgress(progress, kind: .office, key: "attachment.progress.office.opening")
         switch ext {
         case "docx":
+            reportProgress(progress, kind: .office, key: "attachment.progress.office.word")
             let xml = try unzipEntry("word/document.xml", from: url)
             let text = XMLTextExtractor.extractPlainText(from: xml)
             guard !text.isEmpty else { throw AttachmentError.failedToReadOfficeDocument(typeDisplayName(for: ext), reason: nil) }
@@ -522,6 +585,14 @@ struct ComposerAttachment: Identifiable {
                 .filter { $0.hasPrefix("ppt/slides/slide") && $0.hasSuffix(".xml") }
                 .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
             let slides = try entries.enumerated().compactMap { index, entry -> UploadedAttachmentSegment? in
+                if shouldReportStepProgress(current: index + 1, total: entries.count) {
+                    reportProgress(
+                        progress,
+                        kind: .office,
+                        key: "attachment.progress.office.pptx.slide",
+                        arguments: ["\(index + 1)", "\(entries.count)"]
+                    )
+                }
                 let xml = try unzipEntry(entry, from: url)
                 let text = XMLTextExtractor.extractPlainText(from: xml)
                 guard !text.isEmpty else { return nil }
@@ -558,6 +629,14 @@ struct ComposerAttachment: Identifiable {
                     : mapped
             }()
             let sheets = try orderedSheetEntries.enumerated().compactMap { index, item -> UploadedAttachmentSegment? in
+                if shouldReportStepProgress(current: index + 1, total: orderedSheetEntries.count) {
+                    reportProgress(
+                        progress,
+                        kind: .office,
+                        key: "attachment.progress.office.xlsx.sheet",
+                        arguments: ["\(index + 1)", "\(orderedSheetEntries.count)"]
+                    )
+                }
                 let xml = try unzipEntry(item.entry, from: url)
                 let rows = WorksheetExtractor.extractRows(from: xml, sharedStrings: sharedStrings)
                 guard !rows.isEmpty else { return nil }
@@ -688,6 +767,39 @@ struct ComposerAttachment: Identifiable {
         }
         return rep.cgImage
     }
+
+    nonisolated private static func reportProgress(
+        _ progress: ProgressHandler?,
+        kind: ComposerAttachmentStatus.Kind,
+        key: String,
+        arguments: [String] = []
+    ) {
+        progress?(ComposerAttachmentParsingProgress(kind: kind, messageKey: key, arguments: arguments))
+    }
+
+    nonisolated private static func shouldReportStepProgress(current: Int, total: Int) -> Bool {
+        guard total > 0 else { return false }
+        if total <= 8 {
+            return true
+        }
+        if current == 1 || current == total {
+            return true
+        }
+        let step = max(2, total / 5)
+        return current % step == 0
+    }
+}
+
+struct ComposerAttachmentParsingProgress: Sendable, Equatable {
+    let kind: ComposerAttachmentStatus.Kind
+    let messageKey: String
+    let arguments: [String]
+
+    nonisolated init(kind: ComposerAttachmentStatus.Kind, messageKey: String, arguments: [String] = []) {
+        self.kind = kind
+        self.messageKey = messageKey
+        self.arguments = arguments
+    }
 }
 
 struct ComposerAttachmentStatus: Identifiable, Equatable {
@@ -697,10 +809,34 @@ struct ComposerAttachmentStatus: Identifiable, Equatable {
         case failed
     }
 
+    enum Kind: Equatable {
+        case image
+        case pdf
+        case office
+        case text
+        case file
+    }
+
     let id = UUID()
     let phase: Phase
+    let kind: Kind
     let fileName: String
     let message: String
+    let startedAt: Date
+
+    init(
+        phase: Phase,
+        kind: Kind,
+        fileName: String,
+        message: String,
+        startedAt: Date = Date()
+    ) {
+        self.phase = phase
+        self.kind = kind
+        self.fileName = fileName
+        self.message = message
+        self.startedAt = startedAt
+    }
 }
 
 enum AttachmentError: LocalizedError {

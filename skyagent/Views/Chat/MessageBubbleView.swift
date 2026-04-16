@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct MessageBubbleView: View, Equatable {
     let message: Message
@@ -7,7 +8,6 @@ struct MessageBubbleView: View, Equatable {
     var onEditUserMessage: ((UUID, String) -> Void)?
     var isLastAssistant: Bool
     var isStreamingAssistant: Bool
-    var activityStatus: ConversationActivityStatus?
 
     private static let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -21,8 +21,7 @@ struct MessageBubbleView: View, Equatable {
         onRegenerate: (() -> Void)? = nil,
         onEditUserMessage: ((UUID, String) -> Void)? = nil,
         isLastAssistant: Bool = false,
-        isStreamingAssistant: Bool = false,
-        activityStatus: ConversationActivityStatus? = nil
+        isStreamingAssistant: Bool = false
     ) {
         self.message = message
         self.onDelete = onDelete
@@ -30,14 +29,12 @@ struct MessageBubbleView: View, Equatable {
         self.onEditUserMessage = onEditUserMessage
         self.isLastAssistant = isLastAssistant
         self.isStreamingAssistant = isStreamingAssistant
-        self.activityStatus = activityStatus
     }
 
     static func == (lhs: MessageBubbleView, rhs: MessageBubbleView) -> Bool {
-        lhs.message == rhs.message &&
+        lhs.message.renderFingerprint == rhs.message.renderFingerprint &&
         lhs.isLastAssistant == rhs.isLastAssistant &&
-        lhs.isStreamingAssistant == rhs.isStreamingAssistant &&
-        lhs.activityStatus == rhs.activityStatus
+        lhs.isStreamingAssistant == rhs.isStreamingAssistant
     }
 
     private var timeString: String {
@@ -148,12 +145,19 @@ struct MessageBubbleView: View, Equatable {
             }
 
         case .system:
-            systemSurface {
-                Text(message.content)
-                    .font(.system(size: 13, design: .rounded))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
+            if let knowledgeReferences = message.knowledgeReferences, !knowledgeReferences.isEmpty {
+                KnowledgeReferenceMessageView(
+                    title: message.content,
+                    references: knowledgeReferences
+                )
+            } else {
+                systemSurface {
+                    Text(message.content)
+                        .font(.system(size: 13, design: .rounded))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
     }
@@ -209,6 +213,298 @@ struct MessageBubbleView: View, Equatable {
                 onEditUserMessage?(message.id, newText)
             }
         }
+    }
+}
+
+private struct KnowledgeReferenceMessageView: View {
+    let title: String
+    let references: [KnowledgeReferenceRecord]
+    @State private var isExpanded = true
+
+    private var groups: [KnowledgeReferenceGroup] {
+        var orderedKeys: [String] = []
+        var grouped: [String: [KnowledgeReferenceRecord]] = [:]
+
+        for reference in references {
+            let key = groupingKey(for: reference)
+            if grouped[key] == nil {
+                orderedKeys.append(key)
+                grouped[key] = []
+            }
+            grouped[key, default: []].append(reference)
+        }
+
+        return orderedKeys.compactMap { key in
+            guard let items = grouped[key], !items.isEmpty else { return nil }
+            return KnowledgeReferenceGroup(key: key, references: items)
+        }
+    }
+
+    private var libraryNames: [String] {
+        var seen = Set<String>()
+        var ordered: [String] = []
+
+        for reference in references {
+            let libraryName = reference.libraryName?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let libraryName, !libraryName.isEmpty else {
+                continue
+            }
+            guard seen.insert(libraryName).inserted else { continue }
+            ordered.append(libraryName)
+        }
+
+        return ordered
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "books.vertical")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.accent)
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title)
+                            .font(.system(size: 13.5, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.primary)
+
+                        Text(summaryText)
+                            .font(.system(size: 11, weight: .medium, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Spacer(minLength: 0)
+
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(groups) { group in
+                        KnowledgeReferenceGroupView(group: group)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.accentColor.opacity(0.035))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.accentColor.opacity(0.08), lineWidth: 0.8)
+        )
+    }
+
+    private var summaryText: String {
+        if libraryNames.isEmpty {
+            return L10n.tr(
+                "chat.knowledge.reference_summary",
+                "\(references.count)",
+                "\(groups.count)"
+            )
+        }
+
+        return L10n.tr(
+            "chat.knowledge.reference_summary_with_libraries",
+            "\(references.count)",
+            "\(groups.count)",
+            "\(libraryNames.count)"
+        )
+    }
+
+    private func groupingKey(for reference: KnowledgeReferenceRecord) -> String {
+        let source = reference.source?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !source.isEmpty {
+            return source
+        }
+        return reference.title
+    }
+}
+
+private struct KnowledgeReferenceGroup: Identifiable {
+    let key: String
+    let references: [KnowledgeReferenceRecord]
+
+    var id: String { key }
+}
+
+private struct KnowledgeReferenceGroupView: View {
+    let group: KnowledgeReferenceGroup
+    @State private var isExpanded = true
+
+    private var groupLibraryName: String? {
+        let names = Array(
+            NSOrderedSet(
+                array: group.references.compactMap {
+                    let libraryName = $0.libraryName?.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return libraryName?.isEmpty == false ? libraryName : nil
+                }
+            )
+        ) as? [String] ?? []
+        return names.count == 1 ? names[0] : nil
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Text(displaySource(group.key))
+                        .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+
+                    if let groupLibraryName {
+                        Text(groupLibraryName)
+                            .font(.system(size: 10, weight: .semibold, design: .rounded))
+                            .foregroundStyle(Color.accentColor)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(Color.accentColor.opacity(0.08))
+                            )
+                    }
+
+                    Text(L10n.tr("chat.knowledge.reference_group_count", "\(group.references.count)"))
+                        .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                        .foregroundStyle(.secondary)
+
+                    Spacer(minLength: 0)
+
+                    if let action = referenceAction(for: group.key) {
+                        Button(action.label) {
+                            action.perform()
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                    }
+
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(group.references) { reference in
+                        KnowledgeReferenceRow(reference: reference)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.primary.opacity(0.03))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.primary.opacity(0.05), lineWidth: 0.8)
+        )
+    }
+
+    private func displaySource(_ source: String) -> String {
+        if source.hasPrefix("http://") || source.hasPrefix("https://"),
+           let url = URL(string: source),
+           let host = url.host {
+            return host + url.path
+        }
+        return (source as NSString).lastPathComponent.isEmpty ? source : (source as NSString).lastPathComponent
+    }
+
+    private func referenceAction(for source: String) -> (label: String, perform: () -> Void)? {
+        if source.hasPrefix("http://") || source.hasPrefix("https://"), let url = URL(string: source) {
+            return (L10n.tr("chat.preview.view"), { NSWorkspace.shared.open(url) })
+        }
+
+        guard FileManager.default.fileExists(atPath: source) else { return nil }
+        return (L10n.tr("common.open_file"), { NSWorkspace.shared.open(URL(fileURLWithPath: source)) })
+    }
+}
+
+private struct KnowledgeReferenceRow: View {
+    let reference: KnowledgeReferenceRecord
+    @State private var selectedLibrary: KnowledgeLibrary?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(reference.title)
+                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+
+                Spacer(minLength: 0)
+
+                if reference.libraryID != nil {
+                    Button(reference.documentID != nil ? L10n.tr("chat.knowledge.reference_open_document") : L10n.tr("chat.knowledge.reference_open_library")) {
+                        openLibrary()
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                }
+            }
+
+            let libraryName = reference.libraryName?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let libraryName, !libraryName.isEmpty {
+                Text("\(L10n.tr("chat.knowledge.reference_library")): \(libraryName)")
+                    .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+            }
+
+            if let citation = reference.citation, !citation.isEmpty {
+                Text("\(L10n.tr("chat.knowledge.reference_citation")): \(citation)")
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .lineLimit(2)
+            }
+
+            Text(reference.snippet)
+                .font(.system(size: 11.5, design: .rounded))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+        .sheet(item: $selectedLibrary) { library in
+            KnowledgeBaseLibraryView(
+                viewModel: KnowledgeBaseLibraryViewModel(
+                    library: library,
+                    focusDocumentID: reference.documentID,
+                    focusCitation: reference.citation,
+                    focusSnippet: reference.snippet
+                )
+            )
+        }
+    }
+
+    private func openLibrary() {
+        guard let libraryID = reference.libraryID,
+              let library = KnowledgeBaseService.shared.library(by: libraryID) else {
+            return
+        }
+        selectedLibrary = library
     }
 }
 

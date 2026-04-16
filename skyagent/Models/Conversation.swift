@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - 文件权限模式
 
-enum FilePermissionMode: String, Codable, CaseIterable {
+enum FilePermissionMode: String, Codable, CaseIterable, Sendable {
     case sandbox = "sandbox"
     case open = "open"
 
@@ -28,7 +28,7 @@ enum FilePermissionMode: String, Codable, CaseIterable {
     }
 }
 
-struct Conversation: Identifiable, Codable {
+struct Conversation: Identifiable, Codable, Sendable {
     let id: UUID
     var title: String
     var isFavorite: Bool
@@ -42,6 +42,7 @@ struct Conversation: Identifiable, Codable {
     var activatedSkillIDs: [String]
     var recentOperations: [FileOperationRecord]
     var contextState: ConversationContextState
+    var knowledgeLibraryIDs: [String]
 
     init(title: String = L10n.tr("conversation.new")) {
         self.id = UUID()
@@ -55,6 +56,7 @@ struct Conversation: Identifiable, Codable {
         self.activatedSkillIDs = []
         self.recentOperations = []
         self.contextState = .empty
+        self.knowledgeLibraryIDs = []
     }
 
     init(from decoder: Decoder) throws {
@@ -70,10 +72,11 @@ struct Conversation: Identifiable, Codable {
         activatedSkillIDs = (try? c.decode([String].self, forKey: .activatedSkillIDs)) ?? []
         recentOperations = (try? c.decode([FileOperationRecord].self, forKey: .recentOperations)) ?? []
         contextState = (try? c.decode(ConversationContextState.self, forKey: .contextState)) ?? .empty
+        knowledgeLibraryIDs = (try? c.decode([String].self, forKey: .knowledgeLibraryIDs)) ?? []
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, isFavorite, messages, createdAt, lastActiveAt, filePermissionMode, sandboxDir, activatedSkillIDs, recentOperations, contextState
+        case id, title, isFavorite, messages, createdAt, lastActiveAt, filePermissionMode, sandboxDir, activatedSkillIDs, recentOperations, contextState, knowledgeLibraryIDs
     }
 
     var memoryRetrievalQuery: String {
@@ -94,11 +97,29 @@ struct Conversation: Identifiable, Codable {
         }
 
         if !contextState.activeTargets.isEmpty {
-            parts.append(contextState.activeTargets.prefix(3).joined(separator: "；"))
+            let filteredTargets = contextState.activeTargets.filter { target in
+                let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return false }
+                return !trimmed.hasPrefix("当前工作目录：")
+                    && !trimmed.hasPrefix("工作目录：")
+                    && !trimmed.hasPrefix("目标目录：")
+                    && !trimmed.hasPrefix("目标路径：")
+            }
+            if !filteredTargets.isEmpty {
+                parts.append(filteredTargets.prefix(3).joined(separator: "；"))
+            }
         }
 
         if !contextState.activeConstraints.isEmpty {
-            parts.append(contextState.activeConstraints.prefix(3).joined(separator: "；"))
+            let filteredConstraints = contextState.activeConstraints.filter { constraint in
+                let trimmed = constraint.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { return false }
+                return !trimmed.hasPrefix("工作目录：")
+                    && !trimmed.hasPrefix("目标目录：")
+            }
+            if !filteredConstraints.isEmpty {
+                parts.append(filteredConstraints.prefix(3).joined(separator: "；"))
+            }
         }
 
         if !contextState.recentTimeline.isEmpty {

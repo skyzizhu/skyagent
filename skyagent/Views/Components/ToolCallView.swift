@@ -8,6 +8,10 @@ struct ToolCallView: View {
     @State private var isExpanded = false
     private let expandedPreviewLimit = 24_000
 
+    private var displayToolName: String {
+        ChatStatusComposer.friendlyToolTitle(for: toolExecution.name)
+    }
+
     private var isFailure: Bool {
         let trimmed = result.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.hasPrefix("[错误]") || trimmed.hasPrefix("⚠️")
@@ -22,10 +26,22 @@ struct ToolCallView: View {
     }
 
     private var resultPreview: String? {
+        let ignoredPrefixes = [
+            "工具:",
+            "总长度:",
+            "总行数:",
+            "样例：",
+            "摘要预览：",
+            "前若干项样例："
+        ]
+
         let normalized = result
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+            .filter { line in
+                guard !line.isEmpty else { return false }
+                return !ignoredPrefixes.contains { line.hasPrefix($0) }
+            }
             .prefix(2)
             .joined(separator: "  ")
         guard !normalized.isEmpty else { return nil }
@@ -52,17 +68,13 @@ struct ToolCallView: View {
                 }
             } label: {
                 HStack(alignment: .top, spacing: 8) {
-                    RoundedRectangle(cornerRadius: 999, style: .continuous)
-                        .fill(accentColor.opacity(isFailure ? 0.7 : 0.45))
-                        .frame(width: 2, height: isExpanded ? 34 : 18)
-
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 6) {
                             Image(systemName: titleIcon)
                                 .font(.system(size: 9, weight: .semibold))
                                 .foregroundStyle(accentColor)
 
-                            Text(verbatim: toolExecution.name)
+                            Text(verbatim: displayToolName)
                                 .font(.system(size: 10.5, weight: .semibold, design: .rounded))
                                 .foregroundStyle(.primary.opacity(0.88))
 
@@ -168,8 +180,12 @@ struct ToolBatchSummaryView: View {
         let path: String?
     }
 
-    private var toolName: String {
+    private var rawToolName: String {
         messages.first?.toolExecution?.name ?? "tool"
+    }
+
+    private var toolName: String {
+        ChatStatusComposer.friendlyToolTitle(for: rawToolName)
     }
 
     private var count: Int {
@@ -218,7 +234,7 @@ struct ToolBatchSummaryView: View {
     }
 
     private var summaryLine: String {
-        switch toolName {
+        switch rawToolName {
         case "write_file":
             return L10n.tr("chat.tool.batch.write_file", String(affectedItemCount))
         case "write_assistant_content_to_file":
@@ -362,10 +378,6 @@ struct ToolBatchSummaryView: View {
                 }
             } label: {
                 HStack(alignment: .top, spacing: 8) {
-                    RoundedRectangle(cornerRadius: 999, style: .continuous)
-                        .fill(accentColor.opacity(hasFailure ? 0.7 : 0.45))
-                        .frame(width: 2, height: isExpanded ? 34 : 18)
-
                     VStack(alignment: .leading, spacing: 3) {
                         HStack(spacing: 6) {
                             Image(systemName: hasFailure ? "exclamationmark.triangle" : "square.stack.3d.up")

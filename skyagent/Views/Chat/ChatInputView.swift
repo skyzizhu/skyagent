@@ -98,54 +98,56 @@ struct ChatInputView: View {
             }
             .padding(.horizontal, 16)
         } else if let attachmentStatus {
-            HStack(spacing: 10) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(iconBackground(for: attachmentStatus.phase))
-                        .frame(width: 72, height: 60)
+            TimelineView(.periodic(from: attachmentStatus.startedAt, by: 1)) { context in
+                HStack(spacing: 10) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(iconBackground(for: attachmentStatus.phase))
+                            .frame(width: 72, height: 60)
 
-                    Group {
-                        switch attachmentStatus.phase {
-                        case .parsing:
-                            ProgressView()
-                                .controlSize(.small)
-                        case .ready:
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.system(size: 20, weight: .semibold))
-                        case .failed:
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.system(size: 20, weight: .semibold))
+                        Group {
+                            switch attachmentStatus.phase {
+                            case .parsing:
+                                ProgressView()
+                                    .controlSize(.small)
+                            case .ready:
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.system(size: 20, weight: .semibold))
+                            case .failed:
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 20, weight: .semibold))
+                            }
+                        }
+                        .foregroundStyle(iconColor(for: attachmentStatus.phase))
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(attachmentStatus.fileName)
+                            .font(.system(size: 12.5, weight: .semibold, design: .rounded))
+                            .lineLimit(1)
+                        HStack(spacing: 6) {
+                            statusBadge(attachmentStatus.phase, text: statusText(for: attachmentStatus.phase))
+                            Text(attachmentMessage(for: attachmentStatus, now: context.date))
+                                .font(.system(size: 11, weight: .medium, design: .rounded))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
                         }
                     }
-                    .foregroundStyle(iconColor(for: attachmentStatus.phase))
-                }
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(attachmentStatus.fileName)
-                        .font(.system(size: 12.5, weight: .semibold, design: .rounded))
-                        .lineLimit(1)
-                    HStack(spacing: 6) {
-                        statusBadge(attachmentStatus.phase, text: statusText(for: attachmentStatus.phase))
-                        Text(attachmentStatus.message)
-                            .font(.system(size: 11, weight: .medium, design: .rounded))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
+                    if attachmentStatus.phase == .failed {
+                        Button {
+                            self.attachmentStatus = nil
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
                     }
-                }
 
-                if attachmentStatus.phase == .failed {
-                    Button {
-                        self.attachmentStatus = nil
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
+                    Spacer()
                 }
-
-                Spacer()
+                .padding(.horizontal, 16)
             }
-            .padding(.horizontal, 16)
         }
     }
 
@@ -490,21 +492,38 @@ struct ChatInputView: View {
 
     private func loadImageAttachment(from imageData: Data, fileName: String) {
         pendingAttachment = nil
+        let startedAt = Date()
         attachmentStatus = ComposerAttachmentStatus(
             phase: .parsing,
+            kind: .image,
             fileName: fileName,
-            message: L10n.tr("attachment.processing_image")
+            message: L10n.tr("attachment.processing_image"),
+            startedAt: startedAt
         )
 
         Task.detached(priority: .userInitiated) { [imageData, fileName] in
             do {
-                let attachment = try ComposerAttachment.fromImageData(imageData, fileName: fileName)
+                let attachment = try ComposerAttachment.fromImageData(
+                    imageData,
+                    fileName: fileName,
+                    progress: { progress in
+                        Task { @MainActor in
+                            self.updateAttachmentParsingStatus(
+                                fileName: fileName,
+                                progress: progress,
+                                startedAt: startedAt
+                            )
+                        }
+                    }
+                )
                 await MainActor.run {
                     self.pendingAttachment = attachment
                     self.attachmentStatus = ComposerAttachmentStatus(
                         phase: .ready,
+                        kind: .image,
                         fileName: attachment.fileName,
-                        message: L10n.tr("attachment.ready_message")
+                        message: L10n.tr("attachment.ready_message"),
+                        startedAt: startedAt
                     )
                 }
             } catch {
@@ -512,8 +531,10 @@ struct ChatInputView: View {
                     self.pendingAttachment = nil
                     self.attachmentStatus = ComposerAttachmentStatus(
                         phase: .failed,
+                        kind: .image,
                         fileName: fileName,
-                        message: error.localizedDescription
+                        message: error.localizedDescription,
+                        startedAt: startedAt
                     )
                 }
             }
@@ -522,22 +543,39 @@ struct ChatInputView: View {
 
     private func loadFileAttachment(from url: URL) {
         let fileName = url.lastPathComponent
+        let kind = ComposerAttachment.parsingKind(forExtension: url.pathExtension)
         pendingAttachment = nil
+        let startedAt = Date()
         attachmentStatus = ComposerAttachmentStatus(
             phase: .parsing,
+            kind: kind,
             fileName: fileName,
-            message: L10n.tr("attachment.processing_file")
+            message: initialAttachmentMessage(for: kind),
+            startedAt: startedAt
         )
 
         Task.detached(priority: .userInitiated) { [url, fileName] in
             do {
-                let attachment = try ComposerAttachment.fromFile(url: url)
+                let attachment = try ComposerAttachment.fromFile(
+                    url: url,
+                    progress: { progress in
+                        Task { @MainActor in
+                            self.updateAttachmentParsingStatus(
+                                fileName: fileName,
+                                progress: progress,
+                                startedAt: startedAt
+                            )
+                        }
+                    }
+                )
                 await MainActor.run {
                     self.pendingAttachment = attachment
                     self.attachmentStatus = ComposerAttachmentStatus(
                         phase: .ready,
+                        kind: kind,
                         fileName: attachment.fileName,
-                        message: L10n.tr("attachment.ready_message")
+                        message: L10n.tr("attachment.ready_message"),
+                        startedAt: startedAt
                     )
                 }
             } catch {
@@ -545,8 +583,10 @@ struct ChatInputView: View {
                     self.pendingAttachment = nil
                     self.attachmentStatus = ComposerAttachmentStatus(
                         phase: .failed,
+                        kind: kind,
                         fileName: fileName,
-                        message: error.localizedDescription
+                        message: error.localizedDescription,
+                        startedAt: startedAt
                     )
                 }
             }
@@ -599,6 +639,84 @@ struct ChatInputView: View {
         case .parsing: return .orange
         case .ready: return .green
         case .failed: return .red
+        }
+    }
+
+    private func attachmentMessage(for status: ComposerAttachmentStatus, now: Date) -> String {
+        guard status.phase == .parsing else { return status.message }
+
+        let elapsedSeconds = max(1, Int(now.timeIntervalSince(status.startedAt)))
+        let elapsedLabel = L10n.tr("chat.waiting.elapsed.seconds", String(elapsedSeconds))
+        let initialMessage = initialAttachmentMessage(for: status.kind)
+        if !status.message.isEmpty, status.message != initialMessage {
+            return L10n.tr("attachment.parsing.step_elapsed", status.message, elapsedLabel)
+        }
+        let stage = max(0, (elapsedSeconds - 1) / 4) % 3
+
+        switch (status.kind, stage) {
+        case (.image, 0):
+            return L10n.tr("attachment.parsing.image.elapsed", elapsedLabel)
+        case (.image, 1):
+            return L10n.tr("attachment.parsing.image.running", elapsedLabel)
+        case (.image, _):
+            return L10n.tr("attachment.parsing.image.long", elapsedLabel)
+        case (.pdf, 0):
+            return L10n.tr("attachment.parsing.pdf.elapsed", elapsedLabel)
+        case (.pdf, 1):
+            return L10n.tr("attachment.parsing.pdf.running", elapsedLabel)
+        case (.pdf, _):
+            return L10n.tr("attachment.parsing.pdf.long", elapsedLabel)
+        case (.office, 0):
+            return L10n.tr("attachment.parsing.office.elapsed", elapsedLabel)
+        case (.office, 1):
+            return L10n.tr("attachment.parsing.office.running", elapsedLabel)
+        case (.office, _):
+            return L10n.tr("attachment.parsing.office.long", elapsedLabel)
+        case (.text, 0):
+            return L10n.tr("attachment.parsing.text.elapsed", elapsedLabel)
+        case (.text, 1):
+            return L10n.tr("attachment.parsing.text.running", elapsedLabel)
+        case (.text, _):
+            return L10n.tr("attachment.parsing.text.long", elapsedLabel)
+        case (.file, 0):
+            return L10n.tr("attachment.parsing.file.elapsed", elapsedLabel)
+        case (.file, 1):
+            return L10n.tr("attachment.parsing.file.running", elapsedLabel)
+        case (.file, _):
+            return L10n.tr("attachment.parsing.file.long", elapsedLabel)
+        }
+    }
+
+    private func updateAttachmentParsingStatus(
+        fileName: String,
+        progress: ComposerAttachmentParsingProgress,
+        startedAt: Date
+    ) {
+        guard attachmentStatus?.phase == .parsing, attachmentStatus?.fileName == fileName else {
+            return
+        }
+
+        attachmentStatus = ComposerAttachmentStatus(
+            phase: .parsing,
+            kind: progress.kind,
+            fileName: fileName,
+            message: L10n.tr(progress.messageKey, arguments: progress.arguments),
+            startedAt: startedAt
+        )
+    }
+
+    private func initialAttachmentMessage(for kind: ComposerAttachmentStatus.Kind) -> String {
+        switch kind {
+        case .image:
+            return L10n.tr("attachment.processing_image")
+        case .pdf:
+            return L10n.tr("attachment.processing_pdf")
+        case .office:
+            return L10n.tr("attachment.processing_office")
+        case .text:
+            return L10n.tr("attachment.processing_text")
+        case .file:
+            return L10n.tr("attachment.processing_file")
         }
     }
 }

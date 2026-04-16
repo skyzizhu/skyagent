@@ -1,9 +1,11 @@
 import Foundation
 
 enum AgentEvent {
+    case knowledgeRetrieved([RetrievalHit])
     case assistantTurnStarted
     case assistantDelta(String)
     case assistantToolCalls([ToolCallRecord])
+    case toolMatched(ToolExecutionRecord)
     case toolStarted(ToolExecutionRecord, String)
     case toolProgress(ToolExecutionRecord, String)
     case toolCompleted(ToolExecutionRecord, String, FileOperationRecord?, String?, String?, [String]?)
@@ -24,6 +26,19 @@ enum AgentError: Error, LocalizedError {
 }
 
 final class AgentOrchestrator {
+    private struct KnowledgeContextPayload {
+        let context: String
+        let hits: [RetrievalHit]
+    }
+
+    private struct KnowledgeRouteCandidate: Sendable {
+        let libraryID: UUID
+        let libraryName: String
+        let routeScore: Double
+        let documentCount: Int
+        let isWorkspaceLibrary: Bool
+    }
+
     private let llm: LLMService
     private let maxToolRounds = 8
     private let toolExecutionQueue = DispatchQueue(label: "SkyAgent.ToolExecution", qos: .userInitiated)
@@ -83,21 +98,60 @@ final class AgentOrchestrator {
 
         var preparedMessages: [Message] = []
         let memoryBuildStartedAt = Date()
-        let globalMemoryContext = MemoryService.shared.buildMemoryContext(query: effectiveConversation.memoryRetrievalQuery)
+        let workspacePath = effectiveConversation.sandboxDir.isEmpty ? settings.ensureSandboxDir() : effectiveConversation.sandboxDir
+        WorkspaceMemoryService.shared.ensureWorkspaceArtifacts(for: workspacePath)
+        let workspaceMemoryContext = WorkspaceMemoryService.shared.loadWorkspaceMemoryContext(for: workspacePath, maxCharacters: 900)
+        let workspaceProfileContext = WorkspaceMemoryService.shared.loadWorkspaceProfileContext(for: workspacePath, maxCharacters: 700)
+        let globalMemoryContext = MemoryService.shared.buildMemoryContext(
+            query: effectiveConversation.memoryRetrievalQuery,
+            maxResults: 4,
+            maxTokens: 80
+        )
+        let sessionMemoryContext = effectiveConversation.contextState.systemContext()
+        let workspaceMemoryTokens = ChatContextUsageEstimator.estimateTokenCount(for: workspaceMemoryContext)
+        let workspaceProfileTokens = ChatContextUsageEstimator.estimateTokenCount(for: workspaceProfileContext)
+        let globalMemoryTokens = ChatContextUsageEstimator.estimateTokenCount(for: globalMemoryContext)
+        let sessionMemoryTokens = ChatContextUsageEstimator.estimateTokenCount(for: sessionMemoryContext)
+        let totalMemoryTokens = workspaceMemoryTokens + workspaceProfileTokens + globalMemoryTokens + sessionMemoryTokens
+        let knowledgeContextStartedAt = Date()
+        let knowledgePayload = await buildKnowledgeContext(for: effectiveConversation, traceContext: effectiveTraceContext)
+        let knowledgeContext = knowledgePayload.context
+        let knowledgeTokens = ChatContextUsageEstimator.estimateTokenCount(for: knowledgeContext)
         await LoggerService.shared.log(
             category: .memory,
             event: "memory_context_built",
             traceContext: effectiveTraceContext,
             status: .succeeded,
             durationMs: Date().timeIntervalSince(memoryBuildStartedAt) * 1000,
-            summary: globalMemoryContext.isEmpty ? "未命中长期记忆上下文" : "已构建长期记忆上下文",
+            summary: (workspaceMemoryContext.isEmpty && workspaceProfileContext.isEmpty && globalMemoryContext.isEmpty && sessionMemoryContext.isEmpty) ? "未命中会话、工作区与长期记忆上下文" : "已构建会话、工作区与长期记忆上下文",
             metadata: [
+                "workspace_path": .string(LogRedactor.preview(workspacePath, maxLength: 120)),
+                "workspace_memory_length": .int(workspaceMemoryContext.count),
+                "workspace_memory_tokens": .int(workspaceMemoryTokens),
+                "workspace_profile_length": .int(workspaceProfileContext.count),
+                "workspace_profile_tokens": .int(workspaceProfileTokens),
                 "query_preview": .string(LogRedactor.preview(effectiveConversation.memoryRetrievalQuery, maxLength: 100)),
-                "memory_context_length": .int(globalMemoryContext.count)
+                "global_memory_length": .int(globalMemoryContext.count),
+                "global_memory_tokens": .int(globalMemoryTokens),
+                "session_memory_length": .int(sessionMemoryContext.count),
+                "session_memory_tokens": .int(sessionMemoryTokens),
+                "memory_total_tokens": .int(totalMemoryTokens),
+                "knowledge_context_length": .int(knowledgeContext.count),
+                "knowledge_context_tokens": .int(knowledgeTokens),
+                "knowledge_context_ms": .double(Date().timeIntervalSince(knowledgeContextStartedAt) * 1000)
             ]
         )
+        if !workspaceMemoryContext.isEmpty {
+            preparedMessages.append(Message(role: .system, content: workspaceMemoryContext))
+        }
+        if !workspaceProfileContext.isEmpty {
+            preparedMessages.append(Message(role: .system, content: workspaceProfileContext))
+        }
         if !globalMemoryContext.isEmpty {
             preparedMessages.append(Message(role: .system, content: globalMemoryContext))
+        }
+        if !knowledgeContext.isEmpty {
+            preparedMessages.append(Message(role: .system, content: knowledgeContext))
         }
         preparedMessages.append(
             Message(
@@ -122,9 +176,10 @@ final class AgentOrchestrator {
                 [列表与计数规则]
                 1. 当用户要求“总共有多少个”“统计数量”“看一下有多少张图片/多少个文件”时，优先返回数量结论，不要输出完整列表。
                 2. 当结果集很大时，只返回总数、必要分类和少量样例（例如前 10-20 条），不要把成百上千条路径、文件名或全文直接输出给用户。
-                3. 能用 list_files、read_file 等结构化工具完成时，不要为了计数和列举去调用 shell。
-                4. 如果必须使用 shell 来统计，请优先使用能直接返回数量和少量样例的命令组合，不要生成会输出完整大列表的命令。
-                5. 如果工具结果已经被系统标记为“大输出摘要”，请直接基于摘要回答，不要再次尝试打印完整结果。
+                3. 简单浅层浏览可以优先使用 list_files；但只要问题涉及递归统计、按扩展名/类型过滤、跨多层目录树计数，就不要依赖顶层 list_files 结果直接下结论。
+                4. 对“统计图片数量”“统计某类文件数量”这类问题，必须先完成真实计数，再回答结论；如果顶层只看到文件夹，不能直接推断目标数量为 0。
+                5. 当需要递归统计、按扩展名过滤或快速返回总数时，优先使用能直接返回数量和少量样例的 shell，不要生成会输出完整大列表的命令。
+                6. 如果工具结果已经被系统标记为“大输出摘要”，请直接基于摘要回答，不要再次尝试打印完整结果。
                 [/列表与计数规则]
                 """
             )
@@ -147,9 +202,8 @@ final class AgentOrchestrator {
         if let catalogPrompt = SkillManager.shared.buildCatalogPrompt(for: availableSkills) {
             preparedMessages.append(Message(role: .system, content: catalogPrompt))
         }
-        let contextPrompt = effectiveConversation.contextState.systemContext()
-        if !contextPrompt.isEmpty {
-            preparedMessages.append(Message(role: .system, content: contextPrompt))
+        if !sessionMemoryContext.isEmpty {
+            preparedMessages.append(Message(role: .system, content: sessionMemoryContext))
         }
         preparedMessages.append(contentsOf: activatedSkillMessages.map { Message(role: .system, content: $0) })
         preparedMessages.append(contentsOf: rawMessages)
@@ -181,6 +235,10 @@ final class AgentOrchestrator {
         var executedToolSignatures: [String: ToolExecutionOutcome] = [:]
         var successfulSkillScriptRuns: Set<String> = []
 
+        if !knowledgePayload.hits.isEmpty {
+            await onEvent(.knowledgeRetrieved(knowledgePayload.hits))
+        }
+
         while true {
             try Task.checkCancellation()
             await onEvent(.assistantTurnStarted)
@@ -188,7 +246,15 @@ final class AgentOrchestrator {
             let response = try await llm.complete(
                 messages: workingMessages,
                 toolDefinitions: toolDefinitions,
-                traceContext: effectiveTraceContext
+                traceContext: effectiveTraceContext,
+                onToolCallHint: { partialToolCall in
+                    let execution = ToolExecutionRecord(
+                        id: partialToolCall.id,
+                        name: partialToolCall.name,
+                        arguments: partialToolCall.arguments
+                    )
+                    await onEvent(.toolMatched(execution))
+                }
             ) { delta in
                 await onEvent(.assistantDelta(delta))
             }
@@ -230,6 +296,7 @@ final class AgentOrchestrator {
                     ]
                 )
                 await onEvent(.toolStarted(execution, Self.toolStartSummary(for: call)))
+                await Task.yield()
                 let signature = Self.toolSignature(for: call)
                 let skillScriptRunKey = Self.skillScriptRunKey(for: call)
                 let outcome: ToolExecutionOutcome
@@ -508,6 +575,8 @@ final class AgentOrchestrator {
             case .rejected(let outcome):
                 return outcome
             }
+            await onEvent(.toolProgress(execution, Self.toolRunningSummary(for: call)))
+            await Task.yield()
             return await MCPServerManager.shared.executeTool(
                 named: call.name,
                 arguments: call.arguments,
@@ -517,7 +586,10 @@ final class AgentOrchestrator {
             )
         }
 
-        if call.name == ToolDefinition.ToolName.webFetch.rawValue {
+        if call.name == ToolDefinition.ToolName.webFetch.rawValue
+            || call.name == ToolDefinition.ToolName.webSearch.rawValue {
+            await onEvent(.toolProgress(execution, Self.toolRunningSummary(for: call)))
+            await Task.yield()
             return await ToolRunner.shared.execute(
                 name: call.name,
                 arguments: call.arguments,
@@ -527,6 +599,8 @@ final class AgentOrchestrator {
             )
         }
 
+        await onEvent(.toolProgress(execution, Self.toolRunningSummary(for: call)))
+        await Task.yield()
         return await withCheckedContinuation { continuation in
             toolExecutionQueue.async {
                 let outcome = ToolRunner.shared.executeBlocking(
@@ -563,66 +637,11 @@ final class AgentOrchestrator {
     }
 
     private static func toolStartSummary(for call: ToolCallRecord) -> String {
-        switch ToolDefinition.ToolName(rawValue: call.name) {
-        case .activateSkill:
-            return "正在激活 skill"
-        case .installSkill:
-            return "正在下载并安装 skill"
-        case .readSkillResource:
-            return "正在读取 skill 资源"
-        case .runSkillScript:
-            return "正在执行 skill 脚本"
-        case .readUploadedAttachment:
-            return "正在读取上传文件内容"
-        case .previewImage:
-            return "正在预览图片"
-        case .readFile:
-            return "正在读取文件"
-        case .writeFile:
-            return "正在写入文件"
-        case .writeAssistantContentToFile:
-            return "正在写入正文文件"
-        case .writeMultipleFiles:
-            return "正在批量写入文件"
-        case .movePaths:
-            return L10n.tr("chat.tool.move_paths")
-        case .deletePaths:
-            return L10n.tr("chat.tool.delete_paths")
-        case .writeDOCX:
-            return "正在写入 Word"
-        case .writeXLSX:
-            return "正在写入 Excel"
-        case .replaceDOCXSection:
-            return "正在更新 Word 章节"
-        case .insertDOCXSection:
-            return "正在插入 Word 章节"
-        case .appendXLSXRows:
-            return "正在更新 Excel 工作表"
-        case .updateXLSXCell:
-            return "正在更新 Excel 单元格"
-        case .listFiles:
-            return "正在查看目录"
-        case .webFetch:
-            return "正在抓取网页"
-        case .importFile, .importDirectory:
-            return "正在导入文件"
-        case .exportFile, .exportDirectory:
-            return "正在导出文件"
-        case .exportPDF:
-            return "正在导出 PDF"
-        case .exportDOCX:
-            return "正在导出 Word"
-        case .exportXLSX:
-            return "正在导出 Excel"
-        case .importFileContent:
-            return "正在读取外部文件内容"
-        case .listExternalFiles:
-            return "正在查看外部目录"
-        case .shell:
-            return "正在执行 shell 命令"
-        case .none:
-            return "正在执行工具 \(call.name)"
-        }
+        "准备调用 \(ChatStatusComposer.friendlyToolTitle(for: call.name))"
+    }
+
+    private static func toolRunningSummary(for call: ToolCallRecord) -> String {
+        "正在调用 \(ChatStatusComposer.friendlyToolTitle(for: call.name))"
     }
 
     private static func logCategory(for toolName: String) -> LogCategory {
@@ -745,4 +764,304 @@ final class AgentOrchestrator {
         }
         return .unknown
     }
+
+    private func buildKnowledgeContext(for conversation: Conversation, traceContext: TraceContext) async -> KnowledgeContextPayload {
+        let libraryIDs = conversation.knowledgeLibraryIDs
+        guard !libraryIDs.isEmpty else { return KnowledgeContextPayload(context: "", hits: []) }
+
+        let queryText = conversation.messages.reversed().first(where: { $0.role == .user })?.content
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallbackQuery = conversation.memoryRetrievalQuery
+        let query = (queryText?.isEmpty == false) ? queryText! : fallbackQuery
+        guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return KnowledgeContextPayload(context: "", hits: [])
+        }
+
+        let startedAt = Date()
+        await LoggerService.shared.log(
+            category: .rag,
+            event: "kb_query_started",
+            traceContext: traceContext,
+            status: .started,
+            summary: "知识库检索开始",
+            metadata: [
+                "library_count": .int(libraryIDs.count),
+                "query": .string(query)
+            ]
+        )
+
+        let routedLibraries = routedKnowledgeLibraries(
+            from: libraryIDs,
+            query: query,
+            workspacePath: conversation.sandboxDir
+        )
+        let librariesToQuery = Array(routedLibraries.prefix(routedLibraries.count <= 3 ? routedLibraries.count : 4))
+        guard !librariesToQuery.isEmpty else {
+            return KnowledgeContextPayload(context: "", hits: [])
+        }
+
+        await LoggerService.shared.log(
+            category: .rag,
+            event: "kb_route_selected",
+            traceContext: traceContext,
+            status: .succeeded,
+            summary: "已完成知识库路由",
+            metadata: [
+                "candidate_count": .int(routedLibraries.count),
+                "queried_count": .int(librariesToQuery.count),
+                "libraries": .string(librariesToQuery.map(\.libraryName).joined(separator: " | "))
+            ]
+        )
+
+        var hits: [RetrievalHit] = []
+        let maxHitsTotal = 4
+        let topKPerLibrary = librariesToQuery.count == 1 ? 4 : 3
+        var hitsByLibraryID: [UUID: [RetrievalHit]] = [:]
+
+        await withTaskGroup(of: (KnowledgeRouteCandidate, Result<[RetrievalHit], KnowledgeBaseSidecarError>).self) { group in
+            for candidate in librariesToQuery {
+                group.addTask {
+                    let result = await self.queryKnowledgeWithTimeout(
+                        libraryId: candidate.libraryID,
+                        query: query,
+                        topK: topKPerLibrary
+                    )
+                    return (candidate, result)
+                }
+            }
+
+            for await (candidate, result) in group {
+                switch result {
+                case .success(let libraryHits):
+                    hitsByLibraryID[candidate.libraryID] = libraryHits
+                case .failure(let error):
+                    await LoggerService.shared.log(
+                        level: .warn,
+                        category: .rag,
+                        event: "kb_query_failed",
+                        traceContext: traceContext,
+                        status: .failed,
+                        summary: "知识库检索失败",
+                        metadata: [
+                            "library_id": .string(candidate.libraryID.uuidString),
+                            "library_name": .string(candidate.libraryName),
+                            "error": .string(error.description)
+                        ]
+                    )
+                }
+            }
+        }
+
+        var mergedHits: [(hit: RetrievalHit, combinedScore: Double, routeOrder: Int)] = []
+        var seenHitKeys = Set<String>()
+        for (routeOrder, candidate) in librariesToQuery.enumerated() {
+            let libraryHits = hitsByLibraryID[candidate.libraryID] ?? []
+            for hit in libraryHits {
+                let hitKey = [
+                    hit.documentID?.uuidString ?? "",
+                    hit.citation ?? "",
+                    hit.source ?? "",
+                    String(hit.snippet.prefix(120))
+                ].joined(separator: "|")
+
+                guard seenHitKeys.insert(hitKey).inserted else { continue }
+
+                let combinedScore = hit.score + candidate.routeScore * 0.08 - Double(routeOrder) * 0.01
+                mergedHits.append((hit: hit, combinedScore: combinedScore, routeOrder: routeOrder))
+            }
+        }
+
+        mergedHits.sort {
+            if $0.combinedScore == $1.combinedScore {
+                return $0.routeOrder < $1.routeOrder
+            }
+            return $0.combinedScore > $1.combinedScore
+        }
+        hits = mergedHits.prefix(maxHitsTotal).map(\.hit)
+
+        let durationMs = Date().timeIntervalSince(startedAt) * 1000
+        await LoggerService.shared.log(
+            category: .rag,
+            event: "kb_query_finished",
+            traceContext: traceContext,
+            status: .succeeded,
+            durationMs: durationMs,
+            summary: hits.isEmpty ? "知识库检索无命中" : "知识库检索完成",
+            metadata: [
+                "library_count": .int(libraryIDs.count),
+                "queried_library_count": .int(librariesToQuery.count),
+                "hit_count": .int(hits.count),
+                "queried_libraries": .strings(librariesToQuery.map(\.libraryName)),
+                "hit_libraries": .strings(orderedHitLibraryNames(from: hits)),
+                "top_titles": .strings(
+                    hits.prefix(3).compactMap {
+                        let title = $0.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+                        return title?.isEmpty == false ? title : nil
+                    }
+                )
+            ]
+        )
+
+        guard !hits.isEmpty else { return KnowledgeContextPayload(context: "", hits: []) }
+
+        var lines: [String] = []
+        lines.append("[知识库检索结果]")
+        lines.append("以下内容来自用户启用的个人知识库，仅供当前回答参考，请在回答中明确引用来源。")
+        for (index, hit) in hits.enumerated() {
+            let title = hit.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let libraryName = hit.libraryName?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let citation = hit.citation?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let snippet = hit.snippet.trimmingCharacters(in: .whitespacesAndNewlines)
+            lines.append("\(index + 1). \(title?.isEmpty == false ? title! : "参考资料")")
+            if let libraryName, !libraryName.isEmpty {
+                lines.append("知识库：\(libraryName)")
+            }
+            if !snippet.isEmpty {
+                lines.append("片段：\(snippet)")
+            }
+            if let citation, !citation.isEmpty {
+                lines.append("引用：\(citation)")
+            }
+        }
+        return KnowledgeContextPayload(context: lines.joined(separator: "\n"), hits: hits)
+    }
+
+    private func queryKnowledgeWithTimeout(
+        libraryId: UUID,
+        query: String,
+        topK: Int,
+        timeout: TimeInterval = 4.0
+    ) async -> Result<[RetrievalHit], KnowledgeBaseSidecarError> {
+        await withCheckedContinuation { continuation in
+            let lock = NSLock()
+            var hasResumed = false
+
+            func finish(_ result: Result<[RetrievalHit], KnowledgeBaseSidecarError>) {
+                lock.lock()
+                defer { lock.unlock() }
+                guard !hasResumed else { return }
+                hasResumed = true
+                continuation.resume(returning: result)
+            }
+
+            Task.detached(priority: .utility) {
+                let result = await KnowledgeBaseService.shared.queryKnowledge(
+                    libraryId: libraryId,
+                    query: query,
+                    topK: topK
+                )
+                finish(result)
+            }
+
+            Task.detached(priority: .utility) {
+                let timeoutNs = UInt64(max(1, timeout) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: timeoutNs)
+                finish(.failure(.message("知识库检索超时，已跳过本次检索。")))
+            }
+        }
+    }
+
+    private func routedKnowledgeLibraries(
+        from libraryIDs: [String],
+        query: String,
+        workspacePath: String
+    ) -> [KnowledgeRouteCandidate] {
+        let normalizedWorkspacePath = AppStoragePaths.normalizeSandboxPath(workspacePath)
+        let queryText = query.lowercased()
+        let queryTokens = Self.routeTokens(from: query)
+
+        return libraryIDs.compactMap { rawID in
+            guard let id = UUID(uuidString: rawID),
+                  let library = KnowledgeBaseService.shared.library(by: id) else {
+                return nil
+            }
+
+            let libraryName = library.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let sourceRoot = library.sourceRoot ?? ""
+            let sourceTail = sourceRoot.isEmpty ? "" : URL(fileURLWithPath: sourceRoot, isDirectory: true).lastPathComponent
+            let metadataTokens = Self.routeTokens(from: "\(libraryName) \(sourceTail)")
+            let tokenMatches = queryTokens.intersection(metadataTokens).count
+            let normalizedName = libraryName.lowercased()
+            let normalizedSourceTail = sourceTail.lowercased()
+            let isWorkspaceLibrary = !normalizedWorkspacePath.isEmpty && sourceRoot == normalizedWorkspacePath
+
+            var routeScore = 0.0
+            if isWorkspaceLibrary {
+                routeScore += 1.35
+            }
+            if !normalizedName.isEmpty && queryText.contains(normalizedName) {
+                routeScore += 0.85
+            }
+            if !normalizedSourceTail.isEmpty && queryText.contains(normalizedSourceTail) {
+                routeScore += 0.6
+            }
+            routeScore += Double(tokenMatches) * 0.12
+            routeScore += min(Double(max(library.documentCount, 1)).squareRoot() * 0.03, 0.18)
+
+            if library.status == .failed {
+                routeScore -= 0.8
+            }
+            if library.documentCount == 0 || library.chunkCount == 0 {
+                routeScore -= 0.55
+            }
+
+            return KnowledgeRouteCandidate(
+                libraryID: id,
+                libraryName: libraryName.isEmpty ? "Knowledge Library" : libraryName,
+                routeScore: routeScore,
+                documentCount: library.documentCount,
+                isWorkspaceLibrary: isWorkspaceLibrary
+            )
+        }
+        .sorted {
+            if $0.routeScore == $1.routeScore {
+                if $0.isWorkspaceLibrary != $1.isWorkspaceLibrary {
+                    return $0.isWorkspaceLibrary && !$1.isWorkspaceLibrary
+                }
+                if $0.documentCount == $1.documentCount {
+                    return $0.libraryName.localizedCaseInsensitiveCompare($1.libraryName) == .orderedAscending
+                }
+                return $0.documentCount > $1.documentCount
+            }
+            return $0.routeScore > $1.routeScore
+        }
+    }
+
+    private static func routeTokens(from text: String) -> Set<String> {
+        let lowered = text.lowercased()
+        var tokens = Set(
+            lowered
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { $0.count >= 2 }
+        )
+
+        if let regex = try? NSRegularExpression(pattern: "[\\u4e00-\\u9fff]{2,}", options: []) {
+            let range = NSRange(lowered.startIndex..<lowered.endIndex, in: lowered)
+            for match in regex.matches(in: lowered, options: [], range: range) {
+                guard let tokenRange = Range(match.range, in: lowered) else { continue }
+                tokens.insert(String(lowered[tokenRange]))
+            }
+        }
+
+        return tokens
+    }
+
+    private func orderedHitLibraryNames(from hits: [RetrievalHit]) -> [String] {
+        var seen = Set<String>()
+        var ordered: [String] = []
+
+        for hit in hits {
+            let libraryName = hit.libraryName?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let libraryName, !libraryName.isEmpty else {
+                continue
+            }
+            guard seen.insert(libraryName).inserted else { continue }
+            ordered.append(libraryName)
+        }
+
+        return ordered
+    }
 }
+
+extension AgentOrchestrator: @unchecked Sendable {}

@@ -8,6 +8,10 @@ struct ChatContextUsageSnapshot: Sendable {
 }
 
 enum ChatContextUsageEstimator {
+    nonisolated static func estimateTokenCount(for text: String) -> Int {
+        estimatedTokenCount(for: text)
+    }
+
     static func makeSnapshot(
         for conversation: Conversation,
         modelName: String,
@@ -24,7 +28,17 @@ enum ChatContextUsageEstimator {
 
         var preparedMessages: [Message] = []
         let mcpTooling = MCPServerManager.shared.tooling(for: conversation)
-        let globalMemoryContext = MemoryService.shared.buildMemoryContext(query: conversation.memoryRetrievalQuery)
+        let workspacePath = conversation.sandboxDir.isEmpty ? AppSettings.defaultSandboxDir : conversation.sandboxDir
+        WorkspaceMemoryService.shared.ensureWorkspaceArtifacts(for: workspacePath)
+        let workspaceMemoryContext = WorkspaceMemoryService.shared.loadWorkspaceMemoryContext(for: workspacePath, maxCharacters: 900)
+        let workspaceProfileContext = WorkspaceMemoryService.shared.loadWorkspaceProfileContext(for: workspacePath, maxCharacters: 700)
+        let globalMemoryContext = MemoryService.shared.buildMemoryContext(query: conversation.memoryRetrievalQuery, maxResults: 4, maxTokens: 80)
+        if !workspaceMemoryContext.isEmpty {
+            preparedMessages.append(Message(role: .system, content: workspaceMemoryContext, hiddenFromTranscript: true))
+        }
+        if !workspaceProfileContext.isEmpty {
+            preparedMessages.append(Message(role: .system, content: workspaceProfileContext, hiddenFromTranscript: true))
+        }
         if !globalMemoryContext.isEmpty {
             preparedMessages.append(Message(role: .system, content: globalMemoryContext, hiddenFromTranscript: true))
         }

@@ -180,7 +180,7 @@ struct AppSettings: Codable {
         activeProfileId: nil
     )
 
-    /// 默认工作目录：~/.skyagent/workspace
+    /// 默认工作目录：~/.skyagent/default_workspace
     static var defaultSandboxDir: String {
         AppStoragePaths.prepareDataDirectories()
         return AppStoragePaths.workspaceDir.path
@@ -195,7 +195,8 @@ struct AppSettings: Codable {
 
     /// 确保当前沙盒目录存在并返回路径
     func ensureSandboxDir() -> String {
-        let dir = sandboxDir.isEmpty ? Self.defaultSandboxDir : sandboxDir
+        let rawDir = sandboxDir.isEmpty ? Self.defaultSandboxDir : sandboxDir
+        let dir = AppStoragePaths.normalizeSandboxPath(rawDir)
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         return dir
     }
@@ -214,10 +215,16 @@ struct AppSettings: Codable {
         if settings.profiles.isEmpty {
             settings.profiles = APIProfile.defaultProfiles
         }
+        let didNormalizeSandboxDir = AppStoragePaths.normalizeSandboxPath(settings.sandboxDir) != settings.sandboxDir
+        if didNormalizeSandboxDir {
+            settings.sandboxDir = AppStoragePaths.normalizeSandboxPath(settings.sandboxDir)
+        }
         UserDefaults.standard.set(settings.languagePreference.rawValue, forKey: "appLanguagePreference")
         // 更新默认 system prompt（仅覆盖旧版默认提示词，不覆盖用户手动自定义）
         if Self.shouldUpgradeSystemPrompt(settings.systemPrompt) {
             settings.systemPrompt = Self.recommendedSystemPrompt
+            settings.save()
+        } else if didNormalizeSandboxDir {
             settings.save()
         }
         return settings

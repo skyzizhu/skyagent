@@ -21,6 +21,9 @@ final class ConversationContextService {
             recentResults: normalize(buildRecentResults(conversation: conversation, scopeStartDate: scopeStartDate), limit: 4),
             recentTimeline: normalize(buildRecentTimeline(conversation: conversation, scopeStartDate: scopeStartDate), limit: 6),
             openQuestions: normalize(buildOpenQuestions(intent: latestIntent), limit: 2),
+            nextLikelyStep: buildNextLikelyStep(conversation: conversation, intent: latestIntent, scopeStartDate: scopeStartDate),
+            blockedBy: buildBlockedBy(conversation: conversation, intent: latestIntent, scopeStartDate: scopeStartDate),
+            userDecision: buildUserDecision(conversation: conversation, scopeStartDate: scopeStartDate),
             segmentStartedAt: segment.startDate,
             segmentReason: segment.reason,
             updatedAt: Date()
@@ -166,6 +169,99 @@ final class ConversationContextService {
             questions.append(confirmation)
         }
         return questions
+    }
+
+    private nonisolated func buildNextLikelyStep(
+        conversation: Conversation,
+        intent: ParsedIntentContext?,
+        scopeStartDate: Date?
+    ) -> String? {
+        if let clarification = intent?.clarificationQuestion, !clarification.isEmpty {
+            return "等待用户确认后继续：\(clarification)"
+        }
+        if let confirmation = intent?.writeConfirmationQuestion, !confirmation.isEmpty {
+            return "等待写入确认后继续：\(confirmation)"
+        }
+        if let pending = buildBlockedBy(conversation: conversation, intent: intent, scopeStartDate: scopeStartDate) {
+            return "先解除阻塞：\(pending)"
+        }
+
+        if let recentOperation = conversation.recentOperations.first(where: { scopeStartDate == nil || $0.createdAt >= scopeStartDate! }) {
+            if recentOperation.isUndone {
+                return "根据撤销后的状态继续后续处理"
+            }
+            let summary = recentOperation.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !summary.isEmpty {
+                return "基于最近结果继续：\(timelineSummary(from: summary, limit: 80))"
+            }
+            return "继续处理与 \(recentOperation.title) 相关的后续步骤"
+        }
+
+        let recentUserMessages = scopedUserMessages(in: conversation, scopeStartDate: scopeStartDate)
+        if let lastUserMessage = recentUserMessages.last, !lastUserMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "继续完成用户刚才提出的请求：\(timelineSummary(from: lastUserMessage, limit: 80))"
+        }
+
+        return nil
+    }
+
+    private nonisolated func buildBlockedBy(
+        conversation: Conversation,
+        intent: ParsedIntentContext?,
+        scopeStartDate: Date?
+    ) -> String? {
+        if let clarification = intent?.clarificationQuestion, !clarification.isEmpty {
+            return clarification
+        }
+        if let confirmation = intent?.writeConfirmationQuestion, !confirmation.isEmpty {
+            return confirmation
+        }
+
+        let recentMessages = conversation.messages
+            .filter { scopeStartDate == nil || $0.timestamp >= scopeStartDate! }
+            .suffix(6)
+
+        if let lastAssistant = recentMessages.reversed().first(where: { $0.role == .assistant }) {
+            let content = lastAssistant.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            if content.localizedCaseInsensitiveContains("需要确认")
+                || content.localizedCaseInsensitiveContains("请确认")
+                || content.localizedCaseInsensitiveContains("等待确认")
+                || content.localizedCaseInsensitiveContains("需要你确认") {
+                return timelineSummary(from: content, limit: 90)
+            }
+        }
+
+        return nil
+    }
+
+    private nonisolated func buildUserDecision(
+        conversation: Conversation,
+        scopeStartDate: Date?
+    ) -> String? {
+        let scopedMessages = conversation.messages
+            .filter { $0.role == .user && (scopeStartDate == nil || $0.timestamp >= scopeStartDate!) }
+            .suffix(6)
+            .map(\.content)
+
+        for message in scopedMessages.reversed() {
+            let normalized = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty else { continue }
+
+            if normalized.contains("按这个来") || normalized.contains("就这么做") || normalized.contains("可以，继续") || normalized.contains("继续吧") {
+                return "用户已确认继续当前方案"
+            }
+            if normalized.contains("不要覆盖") || normalized.contains("保留原文件") || normalized.contains("另存为") {
+                return "用户要求保留原文件，不直接覆盖"
+            }
+            if normalized.contains("覆盖原文件") || normalized.contains("直接覆盖") {
+                return "用户允许直接覆盖原文件"
+            }
+            if normalized.contains("先不要") || normalized.contains("先不做") || normalized.contains("暂停") {
+                return "用户要求暂停或暂不执行当前动作"
+            }
+        }
+
+        return nil
     }
 
     private nonisolated func latestAttachmentID(in conversation: Conversation, scopeStartDate: Date?) -> String? {

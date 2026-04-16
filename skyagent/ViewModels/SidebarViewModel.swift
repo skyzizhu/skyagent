@@ -14,28 +14,18 @@ class SidebarViewModel: ObservableObject {
     @Published var searchText = ""
     @Published var showNewConversationSheet = false
     @Published var selectedFilter: ConversationFilter = .all
+    @Published private(set) var filteredConversations: [Conversation] = []
 
-    var filteredConversations: [Conversation] {
-        let baseConversations: [Conversation]
-        switch selectedFilter {
-        case .all:
-            baseConversations = store.conversations
-        case .favorites:
-            baseConversations = store.conversations.filter(\.isFavorite)
-        }
-
-        if searchText.isEmpty { return baseConversations }
-        let q = searchText.lowercased()
-        return baseConversations.filter {
-            $0.title.localizedCaseInsensitiveContains(searchText) ||
-            $0.messages.contains { $0.content.localizedCaseInsensitiveContains(q) }
-        }
-    }
+    private var cancellables = Set<AnyCancellable>()
+    private var conversationSearchIndex: [UUID: String] = [:]
 
     init(store: ConversationStore, skillManager: SkillManager) {
         self.store = store
         self.skillManager = skillManager
         skillManager.reloadSkills()
+        bindFiltering()
+        rebuildConversationSearchIndex(for: store.conversations)
+        recomputeFilteredConversations()
     }
 
     func newConversation() {
@@ -65,10 +55,68 @@ class SidebarViewModel: ObservableObject {
     func renameConversation(_ id: UUID, newTitle: String) {
         guard !newTitle.isEmpty else { return }
         store.updateConversationTitle(id, title: newTitle)
-        store.saveConversations()
     }
 
     func clearMessages(_ id: UUID) {
         store.clearMessages(id)
+    }
+
+    private func bindFiltering() {
+        store.$conversations
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] conversations in
+                guard let self else { return }
+                self.rebuildConversationSearchIndex(for: conversations)
+                self.recomputeFilteredConversations()
+            }
+            .store(in: &cancellables)
+
+        Publishers.CombineLatest(
+            $searchText
+                .removeDuplicates()
+                .debounce(for: .milliseconds(120), scheduler: DispatchQueue.main),
+            $selectedFilter.removeDuplicates()
+        )
+        .sink { [weak self] _, _ in
+            self?.recomputeFilteredConversations()
+        }
+        .store(in: &cancellables)
+    }
+
+    private func recomputeFilteredConversations() {
+        let baseConversations: [Conversation]
+        switch selectedFilter {
+        case .all:
+            baseConversations = store.conversations
+        case .favorites:
+            baseConversations = store.conversations.filter(\.isFavorite)
+        }
+
+        let needle = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else {
+            filteredConversations = baseConversations
+            return
+        }
+
+        filteredConversations = baseConversations.filter { conversation in
+            if conversation.title.lowercased().contains(needle) {
+                return true
+            }
+            return conversationSearchIndex[conversation.id]?.contains(needle) == true
+        }
+    }
+
+    private func rebuildConversationSearchIndex(for conversations: [Conversation]) {
+        conversationSearchIndex = Dictionary(
+            uniqueKeysWithValues: conversations.map { conversation in
+                let searchableContent = conversation.messages
+                    .lazy
+                    .filter { !($0.hiddenFromTranscript ?? false) }
+                    .map(\.content)
+                    .joined(separator: "\n")
+                    .lowercased()
+                return (conversation.id, searchableContent)
+            }
+        )
     }
 }

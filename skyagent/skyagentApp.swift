@@ -13,11 +13,18 @@ struct skyagentApp: App {
                 .preferredColorScheme(appState.preferredColorScheme)
                 .environment(\.locale, appState.locale)
         }
+        .windowStyle(.hiddenTitleBar)
         .defaultSize(width: 1100, height: 750)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button(L10n.tr("app.command.new_conversation")) { appState.sidebarVM.newConversation() }
                     .keyboardShortcut("n")
+            }
+            CommandGroup(replacing: .appSettings) {
+                Button(L10n.tr("common.settings")) {
+                    appState.showSettings()
+                }
+                .keyboardShortcut(",", modifiers: .command)
             }
             CommandMenu(L10n.tr("app.command.menu.conversation")) {
                 Button(L10n.tr("app.command.clear_current")) {
@@ -37,12 +44,6 @@ struct skyagentApp: App {
                 .keyboardShortcut("l", modifiers: .command)
             }
         }
-        Settings {
-            SettingsView(viewModel: appState.settingsVM)
-                .environmentObject(appState)
-                .preferredColorScheme(appState.preferredColorScheme)
-                .environment(\.locale, appState.locale)
-        }
     }
 
     private func exportCurrentConversation() {
@@ -61,11 +62,17 @@ struct skyagentApp: App {
 
 @MainActor
 final class AppState: ObservableObject {
+    enum DetailRoute: Equatable {
+        case chat
+        case settings(SettingsView.SettingsTab)
+    }
+
     let store = ConversationStore()
     let skillManager = SkillManager.shared
     let mcpManager = MCPServerManager.shared
     @Published private(set) var preferredColorScheme: ColorScheme?
     @Published private(set) var locale: Locale
+    @Published var detailRoute: DetailRoute = .chat
     private(set) var sidebarVM: SidebarViewModel!
     private(set) var settingsVM: SettingsViewModel!
     private(set) var chatVM: ChatViewModel!
@@ -88,5 +95,18 @@ final class AppState: ObservableObject {
                 self?.locale = settings.languagePreference.localeIdentifier.map(Locale.init(identifier:)) ?? .current
             }
             .store(in: &cancellables)
+
+        KnowledgeBaseMaintenanceScheduler.shared.start()
+        Task(priority: .utility) {
+            _ = await KnowledgeBaseService.shared.runAutomaticMaintenanceIfNeeded()
+        }
+    }
+
+    func showSettings(tab: SettingsView.SettingsTab = .general) {
+        detailRoute = .settings(tab)
+    }
+
+    func closeSettings() {
+        detailRoute = .chat
     }
 }

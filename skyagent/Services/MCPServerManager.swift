@@ -293,6 +293,10 @@ struct MCPImportSummary: Sendable {
     }
 }
 
+private struct MCPServerConfigFile: Codable {
+    let mcpServers: [MCPServerConfig]
+}
+
 @MainActor
 final class MCPServerManager: ObservableObject {
     static let shared = MCPServerManager()
@@ -367,37 +371,12 @@ final class MCPServerManager: ObservableObject {
             )
         }
 
-        let lines = output.components(separatedBy: .newlines)
-        let nonEmptyLineCount = lines.reduce(into: 0) { partialResult, line in
-            if !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                partialResult += 1
-            }
-        }
-        let visiblePreview = String(output.prefix(largeVisibleOutputLimit))
-        let modelPreview = String(output.prefix(largeModelOutputLimit))
-        let countHint = nonEmptyLineCount > 1
-            ? "若每行代表一个结果项，则总数约为 \(nonEmptyLineCount) 项。"
-            : "结果为长文本输出，请直接基于摘要继续。"
-
-        let visibleOutput = """
-        [结果过长，已截断显示]
-        工具: \(toolLabel)
-        总长度: \(output.count.formatted()) 个字符
-        总行数: \(nonEmptyLineCount.formatted()) 行
-        说明: 以下仅展示前 \(largeVisibleOutputLimit.formatted()) 个字符，完整原始结果不会继续无上限展开。
-
-        \(visiblePreview)
-        """
-
-        let modelOutput = """
-        [工具结果过长，系统已做摘要]
-        工具: \(toolLabel)
-        总长度: \(output.count) 个字符
-        总行数: \(nonEmptyLineCount) 行
-        \(countHint)
-        以下为前 \(largeModelOutputLimit) 个字符预览：
-        \(modelPreview)
-        """
+        let summary = summarizedLargeText(
+            output,
+            label: toolLabel,
+            visibleCharacterLimit: largeVisibleOutputLimit,
+            modelCharacterLimit: largeModelOutputLimit
+        )
 
         let followupHint = """
         上一个 MCP 结果过长，系统已自动摘要。
@@ -414,11 +393,71 @@ final class MCPServerManager: ObservableObject {
             .joined(separator: "\n\n")
 
         return ToolExecutionOutcome(
-            output: visibleOutput,
-            modelOutput: modelOutput,
+            output: summary.visibleOutput,
+            modelOutput: summary.modelOutput,
             operation: operation,
             followupContextMessage: mergedFollowupContext.isEmpty ? nil : mergedFollowupContext
         )
+    }
+
+    private func summarizedLargeText(
+        _ text: String,
+        label: String,
+        visibleCharacterLimit: Int,
+        modelCharacterLimit: Int
+    ) -> (visibleOutput: String, modelOutput: String) {
+        let allLines = text.components(separatedBy: .newlines)
+        let nonEmptyLines = allLines
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let nonEmptyLineCount = nonEmptyLines.count
+        let lineBased = shouldPreferLineSummary(for: nonEmptyLines)
+        let sampleLineLimit = lineBased ? min(20, nonEmptyLineCount) : min(8, nonEmptyLineCount)
+        let sampleLines = Array(nonEmptyLines.prefix(sampleLineLimit))
+        let visiblePreview = lineBased
+            ? sampleLines.joined(separator: "\n")
+            : String(text.prefix(visibleCharacterLimit))
+        let modelPreview = lineBased
+            ? Array(nonEmptyLines.prefix(min(12, nonEmptyLineCount))).joined(separator: "\n")
+            : String(text.prefix(modelCharacterLimit))
+
+        let visibleSummaryLine: String
+        let modelSummaryLine: String
+        if lineBased {
+            visibleSummaryLine = "结果较长：共约 \(nonEmptyLineCount.formatted()) 项，下面仅展示前 \(sampleLineLimit.formatted()) 项样例。"
+            modelSummaryLine = "MCP 结果较长：共约 \(nonEmptyLineCount) 项。请优先基于计数和样例继续回答，不要复述完整列表。"
+        } else {
+            visibleSummaryLine = "结果较长：共 \(text.count.formatted()) 个字符，下面仅展示开头摘要。"
+            modelSummaryLine = "MCP 结果较长：共 \(text.count) 个字符。请基于摘要继续回答，不要复述完整长文本。"
+        }
+
+        let visibleOutput = """
+        \(visibleSummaryLine)
+        工具: \(label)
+        总长度: \(text.count.formatted()) 个字符
+        总行数: \(nonEmptyLineCount.formatted()) 行
+
+        \(lineBased ? "样例：" : "摘要预览：")
+        \(visiblePreview)
+        """
+
+        let modelOutput = """
+        \(modelSummaryLine)
+        工具: \(label)
+        总长度: \(text.count) 个字符
+        总行数: \(nonEmptyLineCount) 行
+
+        \(lineBased ? "前若干项样例：" : "摘要预览：")
+        \(modelPreview)
+        """
+
+        return (visibleOutput, modelOutput)
+    }
+
+    private func shouldPreferLineSummary(for lines: [String]) -> Bool {
+        guard lines.count >= 8 else { return false }
+        let averageLength = lines.reduce(0) { $0 + $1.count } / max(lines.count, 1)
+        return averageLength <= 180
     }
 
     func addServer(
@@ -1151,8 +1190,10 @@ final class MCPServerManager: ObservableObject {
         do {
             let startedAt = Date()
             onProgress?("正在通过 MCP 调用 \(descriptor.serverName) / \(descriptor.toolName)")
+            await Task.yield()
             let parsedArguments = try decodeArguments(arguments)
             onProgress?("参数已准备完成，正在等待 \(descriptor.serverName) 响应")
+            await Task.yield()
             let result = try await connectionManager.callTool(
                 descriptor.toolName,
                 arguments: parsedArguments,
@@ -1160,6 +1201,7 @@ final class MCPServerManager: ObservableObject {
                 onProgress: onProgress
             )
             onProgress?("MCP 已返回结果，正在整理输出")
+            await Task.yield()
             let rendered = """
             [MCP Tool Result]
             Server: \(descriptor.serverName)
@@ -1170,7 +1212,7 @@ final class MCPServerManager: ObservableObject {
             let operation = FileOperationRecord(
                 id: operationId,
                 toolName: toolCallName,
-                title: "MCP · \(descriptor.toolName)",
+                title: ChatStatusComposer.formattedMCPTitle(serverName: descriptor.serverName, actionName: descriptor.toolName),
                 summary: "通过 \(descriptor.serverName) 执行 MCP 工具",
                 detailLines: [
                     "Server: \(descriptor.serverName)",
@@ -1411,11 +1453,20 @@ final class MCPServerManager: ObservableObject {
     }
 
     private func loadServers() {
-        guard let data = try? Data(contentsOf: persistenceURL),
-              let decoded = try? JSONDecoder().decode([MCPServerConfig].self, from: data) else {
+        guard let data = try? Data(contentsOf: persistenceURL) else {
             userServers = []
             return
         }
+        let decoded: [MCPServerConfig]
+        if let wrapped = try? JSONDecoder().decode(MCPServerConfigFile.self, from: data) {
+            decoded = wrapped.mcpServers
+        } else if let legacyArray = try? JSONDecoder().decode([MCPServerConfig].self, from: data) {
+            decoded = legacyArray
+        } else {
+            userServers = []
+            return
+        }
+
         userServers = decoded.map { server in
             var mutable = server
             mutable.scope = .user
@@ -1527,7 +1578,7 @@ final class MCPServerManager: ObservableObject {
     private func persistServers() {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        guard let data = try? encoder.encode(userServers) else { return }
+        guard let data = try? encoder.encode(MCPServerConfigFile(mcpServers: userServers)) else { return }
         try? data.write(to: persistenceURL, options: [.atomic])
     }
 
@@ -1555,6 +1606,14 @@ final class MCPServerManager: ObservableObject {
             )
         }
 
+        if let wrapped = try? JSONDecoder().decode(MCPServerConfigFile.self, from: data) {
+            return MCPImportParseResult(
+                servers: wrapped.mcpServers,
+                sourceDescription: "SkyAgent mcpServers config",
+                sourceCount: wrapped.mcpServers.count
+            )
+        }
+
         let object = try JSONSerialization.jsonObject(with: data)
 
         if let root = object as? [String: Any] {
@@ -1566,6 +1625,18 @@ final class MCPServerManager: ObservableObject {
                     servers: servers,
                     sourceDescription: "mcpServers config",
                     sourceCount: mcpServers.count
+                )
+            }
+
+            if let mcpServersArray = root["mcpServers"] as? [[String: Any]] {
+                let servers = mcpServersArray.compactMap { entry in
+                    let name = stringValue(entry["name"]) ?? stringValue(entry["id"]) ?? "Imported MCP Server"
+                    return parseExternalServer(named: name, rawValue: entry)
+                }
+                return MCPImportParseResult(
+                    servers: servers,
+                    sourceDescription: "mcpServers array config",
+                    sourceCount: mcpServersArray.count
                 )
             }
 

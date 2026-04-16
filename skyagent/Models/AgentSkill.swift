@@ -1,6 +1,6 @@
 import Foundation
 
-enum AgentSkillSourceType: String, Codable, CaseIterable {
+enum AgentSkillSourceType: String, Codable, CaseIterable, Sendable {
     case appData
     case userStandard
 
@@ -33,7 +33,7 @@ enum AgentSkillSourceType: String, Codable, CaseIterable {
     }
 }
 
-enum AgentSkillResourceKind: String, Codable, Hashable {
+enum AgentSkillResourceKind: String, Codable, Hashable, Sendable {
     case script
     case reference
     case asset
@@ -41,7 +41,7 @@ enum AgentSkillResourceKind: String, Codable, Hashable {
     case other
 }
 
-struct AgentSkillResource: Identifiable, Codable, Hashable {
+struct AgentSkillResource: Identifiable, Codable, Hashable, Sendable {
     let id: String
     let relativePath: String
     let kind: AgentSkillResourceKind
@@ -53,7 +53,7 @@ struct AgentSkillResource: Identifiable, Codable, Hashable {
     }
 }
 
-struct AgentSkill: Identifiable, Codable, Hashable {
+struct AgentSkill: Identifiable, Codable, Hashable, Sendable {
     let id: String
     let name: String
     let description: String
@@ -81,13 +81,13 @@ struct AgentSkill: Identifiable, Codable, Hashable {
     var templateResources: [AgentSkillResource] { resources.filter { $0.kind == .template } }
 }
 
-struct SkillActivationResult {
+struct SkillActivationResult: Sendable {
     let output: String
     let skillID: String
     let contextMessage: String
 }
 
-enum SkillMatchSource: String, Equatable {
+enum SkillMatchSource: String, Equatable, Sendable {
     case name
     case alias
     case displayName
@@ -98,12 +98,12 @@ enum SkillMatchSource: String, Equatable {
     case antiTriggerHint
 }
 
-struct SkillMatchSignal: Equatable {
+struct SkillMatchSignal: Equatable, Sendable {
     let source: SkillMatchSource
     let phrase: String
 }
 
-struct SkillMatchCandidate: Equatable {
+struct SkillMatchCandidate: Equatable, Sendable {
     let skill: AgentSkill
     let score: Int
     let matchedSignals: [SkillMatchSignal]

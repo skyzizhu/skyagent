@@ -4,11 +4,6 @@ import AppKit
 struct ChatView: View {
     private let initialTranscriptWindowSize = 40
     private let transcriptWindowIncrement = 30
-    private static let statusTimeFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm"
-        return formatter
-    }()
     private static let transcriptComputationQueue = DispatchQueue(
         label: "SkyAgent.TranscriptCache",
         qos: .userInitiated
@@ -16,6 +11,7 @@ struct ChatView: View {
 
     @ObservedObject var viewModel: ChatViewModel
     @ObservedObject var store: ConversationStore
+    @ObservedObject private var activityViewModel: ConversationActivityViewModel
     @State private var inputText = ""
     @State private var pendingAttachment: ComposerAttachment?
     @State private var attachmentStatus: ComposerAttachmentStatus?
@@ -35,6 +31,13 @@ struct ChatView: View {
     @State private var cachedTranscriptItems: [TranscriptItem] = []
     @State private var transcriptPresentationStore = TranscriptPresentationStore()
     @State private var conversationSwitchStartedAt: Date?
+    @State private var transcriptRefreshStartedAt: Date?
+    @State private var isTranscriptRefreshing = false
+    @State private var knowledgeSelectionTarget: KnowledgeSelectionTarget?
+
+    private struct KnowledgeSelectionTarget: Identifiable {
+        let id: UUID
+    }
 
     private enum TranscriptItem: Identifiable {
         case message(Message)
@@ -53,6 +56,7 @@ struct ChatView: View {
     init(viewModel: ChatViewModel) {
         self.viewModel = viewModel
         self.store = viewModel.store
+        self._activityViewModel = ObservedObject(initialValue: viewModel.activityViewModel)
     }
 
     var body: some View {
@@ -65,10 +69,6 @@ struct ChatView: View {
                     transcriptItems: transcriptItems,
                     hiddenMessageCount: transcriptSnapshot.hiddenMessageCount
                 )
-
-                if let error = viewModel.errorMessage {
-                    errorBar(error)
-                }
 
                 ChatInputView(
                     inputText: $inputText,
@@ -108,6 +108,7 @@ struct ChatView: View {
                     "conversation_id": .string(store.currentConversationId?.uuidString ?? "")
                 ]
             )
+            viewModel.resetPresentationForConversationSwitch()
             restoreTranscriptPresentationStateForCurrentConversation()
             viewModel.refreshConversationRecoveryStatus()
             requestInputFocus()
@@ -145,6 +146,14 @@ struct ChatView: View {
         .sheet(item: $viewModel.pendingApproval) { preview in
             approvalSheet(preview)
         }
+        .sheet(item: $knowledgeSelectionTarget) { target in
+            KnowledgeLibrarySelectionView(
+                viewModel: KnowledgeLibrarySelectionViewModel(
+                    conversationID: target.id,
+                    store: store
+                )
+            )
+        }
     }
 
     @ViewBuilder
@@ -152,7 +161,13 @@ struct ChatView: View {
         VStack(spacing: 0) {
             topDirectoryBar(for: conv)
 
-            transcriptScrollView(conv: conv, transcriptItems: transcriptItems, hiddenMessageCount: hiddenMessageCount)
+            ZStack {
+                transcriptScrollView(conv: conv, transcriptItems: transcriptItems, hiddenMessageCount: hiddenMessageCount)
+
+                if shouldShowTranscriptLoading(for: conv, transcriptItems: transcriptItems) {
+                    transcriptLoadingOverlay
+                }
+            }
         }
     }
 
@@ -205,10 +220,13 @@ struct ChatView: View {
             .onChange(of: conv.messages.last?.content) {
                 scheduleScrollToBottom(with: proxy, animated: false, debounce: 0.06)
             }
-            .onChange(of: viewModel.currentActivityStatus?.title) {
+            .onChange(of: activityViewModel.currentState?.id) {
                 scheduleScrollToBottom(with: proxy, animated: false, debounce: 0.02)
             }
-            .onChange(of: viewModel.currentActivityStatus?.detail) {
+            .onChange(of: activityViewModel.currentState?.detail) {
+                scheduleScrollToBottom(with: proxy, animated: false, debounce: 0.02)
+            }
+            .onChange(of: activityViewModel.displayedStates.count) {
                 scheduleScrollToBottom(with: proxy, animated: false, debounce: 0.02)
             }
             .overlay(alignment: .bottomTrailing) {
@@ -260,9 +278,9 @@ struct ChatView: View {
                 .padding(.bottom, rowSpacing(after: item, next: transcriptItems.indices.contains(index + 1) ? transcriptItems[index + 1] : nil))
             }
 
-            if let activityStatus = viewModel.currentActivityStatus {
-                assistantStatusRow(activityStatus)
-                    .id("assistant-activity-status")
+            if !activityViewModel.displayedStates.isEmpty {
+                activityTrailPanel
+                    .padding(.top, 4)
                     .padding(.bottom, 10)
             }
 
@@ -321,8 +339,7 @@ struct ChatView: View {
                         Task { await viewModel.regenerateLastReply() }
                     },
                     isLastAssistant: isLastAssistant,
-                    isStreamingAssistant: isLastAssistant && viewModel.isLoading,
-                    activityStatus: isLastAssistant ? viewModel.currentActivityStatus : nil
+                    isStreamingAssistant: isLastAssistant && viewModel.isLoading
                 )
             )
             .id(msg.id)
@@ -351,23 +368,23 @@ struct ChatView: View {
         return 16
     }
 
-    private func assistantStatusRow(_ status: ConversationActivityStatus) -> some View {
+    private func assistantStatusRow(_ status: ConversationActivityState) -> some View {
         HStack(alignment: .top, spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                TypingIndicatorView(status: status)
-
-                HStack(spacing: 6) {
-                    Text(Date(), formatter: Self.statusTimeFormatter)
-                        .font(.system(size: 10, weight: .medium, design: .rounded))
-                        .foregroundStyle(.quaternary)
-                        .tracking(0.2)
-                }
-                .padding(.horizontal, 2)
-                .opacity(0.46)
-            }
-            .frame(maxWidth: 840, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            ConversationActivityBarView(state: status)
+                .frame(maxWidth: 840, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    private var activityTrailPanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(Array(activityViewModel.displayedStates.enumerated()), id: \.element.id) { index, state in
+                assistantStatusRow(state)
+                    .id("assistant-activity-status-\(index)")
+            }
+        }
+        .frame(maxWidth: 980, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private static func transcriptItems(from messages: [Message]) -> [TranscriptItem] {
@@ -525,9 +542,7 @@ struct ChatView: View {
         var hasher = Hasher()
         hasher.combine(message.role.rawValue)
         hasher.combine(message.id)
-        hasher.combine(message.content)
-        hasher.combine(message.hiddenFromTranscript ?? false)
-        hasher.combine(message.toolExecution?.name ?? "")
+        hasher.combine(message.renderFingerprint)
         return hasher.finalize()
     }
 
@@ -547,7 +562,7 @@ struct ChatView: View {
         if cachedTranscriptConversationID == conversation.id {
             return cachedTranscriptSnapshot
         }
-        return Self.transcriptSnapshot(from: conversation.messages, limit: visibleMessageLimit)
+        return TranscriptSnapshot(messages: [], hiddenMessageCount: 0)
     }
 
     private func resolvedTranscriptItems(for conversation: Conversation, snapshot: TranscriptSnapshot) -> [TranscriptItem] {
@@ -558,12 +573,14 @@ struct ChatView: View {
         if cachedTranscriptConversationID == conversation.id {
             return cachedTranscriptItems
         }
-        return Self.transcriptItems(from: snapshot.messages)
+        return []
     }
 
     private func refreshTranscriptCache() {
         pendingTranscriptRefreshTask?.cancel()
         guard let conversation = store.currentConversation else {
+            isTranscriptRefreshing = false
+            transcriptRefreshStartedAt = nil
             cachedTranscriptConversationID = nil
             cachedTranscriptMessageCount = 0
             cachedTranscriptLimit = 0
@@ -576,6 +593,8 @@ struct ChatView: View {
 
         let key = transcriptCacheKey(for: conversation)
         guard !cachedTranscriptMatches(key) else { return }
+        isTranscriptRefreshing = true
+        transcriptRefreshStartedAt = Date()
         let messages = conversation.messages
         let refreshStartedAt = Date()
         logUIEvent(
@@ -607,6 +626,8 @@ struct ChatView: View {
                 cachedTranscriptLastMessageSignature = key.lastMessageSignature
                 cachedTranscriptSnapshot = snapshot
                 cachedTranscriptItems = items
+                isTranscriptRefreshing = false
+                transcriptRefreshStartedAt = nil
                 let durationMs = Date().timeIntervalSince(refreshStartedAt) * 1000
                 logUIEvent(
                     category: .ui,
@@ -766,6 +787,51 @@ struct ChatView: View {
         }
     }
 
+    private func shouldShowTranscriptLoading(for conversation: Conversation, transcriptItems: [TranscriptItem]) -> Bool {
+        let hasMessages = !conversation.messages.isEmpty
+        if !hasMessages {
+            return false
+        }
+        if transcriptItems.isEmpty {
+            return true
+        }
+        return isTranscriptRefreshing && conversationSwitchStartedAt != nil && transcriptItems.count <= 2
+    }
+
+    private var transcriptLoadingOverlay: some View {
+        TimelineView(.periodic(from: transcriptRefreshStartedAt ?? Date(), by: 1)) { context in
+            VStack(spacing: 10) {
+                ProgressView()
+                    .controlSize(.small)
+
+                Text(L10n.tr("chat.transcript.loading.title"))
+                    .font(.system(size: 12.5, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.primary)
+
+                Text(
+                    L10n.tr(
+                        "chat.transcript.loading.detail",
+                        L10n.tr("chat.waiting.elapsed.seconds", String(transcriptLoadingElapsedSeconds(now: context.date)))
+                    )
+                )
+                .font(.system(size: 11, weight: .medium, design: .rounded))
+                .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 16)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(Color.primary.opacity(0.06), lineWidth: 0.8)
+            )
+            .shadow(color: Color.black.opacity(0.04), radius: 12, x: 0, y: 6)
+        }
+    }
+
+    private func transcriptLoadingElapsedSeconds(now: Date) -> Int {
+        max(1, Int(now.timeIntervalSince(transcriptRefreshStartedAt ?? now)))
+    }
+
     private func scheduleScrollToBottom(
         with proxy: ScrollViewProxy,
         animated: Bool,
@@ -802,76 +868,20 @@ struct ChatView: View {
     }
 
     private func topDirectoryBar(for conv: Conversation) -> some View {
-        VStack(spacing: 0) {
+        let chromeHeight: CGFloat = 52
+
+        return VStack(spacing: 0) {
             ZStack {
                 Color(nsColor: .windowBackgroundColor).opacity(0.985)
+                WindowChromeInteractionBackground(onDoubleClick: toggleWindowZoom)
 
-                HStack {
-                    HStack(spacing: 8) {
-                        Image(systemName: "folder")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(.secondary)
-
-                        Text(currentDirName(conv))
-                            .font(.system(size: 11, weight: .semibold, design: .rounded))
-                            .foregroundStyle(.primary)
-                            .lineLimit(1)
-
-                        Button {
-                            chooseSandboxDir(for: conv.id)
-                        } label: {
-                            Text(L10n.tr("chat_input.switch_directory"))
-                                .font(.system(size: 10.5, weight: .medium, design: .rounded))
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
-                    .background(
-                        Capsule()
-                            .fill(Color.primary.opacity(0.018))
-                    )
-                    .overlay(
-                        Capsule()
-                            .stroke(Color.primary.opacity(0.04), lineWidth: 0.7)
-                    )
-                    .help(currentDirPath(conv))
-
-                    if let skillRouting = viewModel.activeSkillRoutingStatus {
-                        HStack(spacing: 6) {
-                            Image(systemName: "wand.and.stars")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(.secondary)
-
-                            Text(skillRouting.title)
-                                .font(.system(size: 10.5, weight: .medium, design: .rounded))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(
-                            Capsule()
-                                .fill(Color.primary.opacity(0.018))
-                        )
-                        .overlay(
-                            Capsule()
-                                .stroke(Color.primary.opacity(0.035), lineWidth: 0.7)
-                        )
-                        .help([skillRouting.detail, skillRouting.reason].compactMap { $0 }.joined(separator: "\n"))
-                    }
-
-                    Spacer()
-                }
-                .padding(.horizontal, 24)
+                topBarContent(for: conv)
+                .padding(.leading, 24)
+                .padding(.trailing, 24)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             }
-            .frame(height: 28)
-            .padding(.top, -28)
-            .contentShape(Rectangle())
-            .onTapGesture(count: 2) {
-                toggleWindowZoom()
-            }
+            .frame(height: chromeHeight)
+            .padding(.top, -chromeHeight)
 
             Rectangle()
                 .fill(Color.primary.opacity(0.03))
@@ -880,32 +890,153 @@ struct ChatView: View {
         }
     }
 
-    private func toggleWindowZoom() {
-        let targetWindow = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first
-        targetWindow?.performZoom(nil)
+    private func topBarContent(for conv: Conversation) -> some View {
+        HStack {
+            Text("SkyAgent")
+                .font(.system(size: 15, weight: .bold, design: .rounded))
+                .foregroundStyle(.primary)
+                .padding(.trailing, 12)
+
+            workspaceCapsule(for: conv)
+
+            if let knowledgeStatus = viewModel.activeKnowledgeStatus {
+                knowledgeCapsule(for: conv, status: knowledgeStatus)
+            }
+
+            if let skillRouting = viewModel.activeSkillRoutingStatus {
+                skillRoutingCapsule(skillRouting)
+            }
+
+            Spacer()
+        }
     }
 
-    // MARK: - Error Bar
-    private func errorBar(_ message: String) -> some View {
+    private func workspaceCapsule(for conv: Conversation) -> some View {
         HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
-            Text(message)
-                .font(.caption)
+            Image(systemName: "folder")
+                .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.secondary)
-                .lineLimit(2)
-            Spacer()
+
+            Text(currentDirName(conv))
+                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+
             Button {
-                viewModel.errorMessage = nil
+                chooseSandboxDir(for: conv.id)
             } label: {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(.tertiary)
+                Text(L10n.tr("chat_input.switch_directory"))
+                    .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                    .foregroundStyle(.secondary)
             }
             .buttonStyle(.plain)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 10)
-        .background(.ultraThinMaterial)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(capsuleFill)
+        .overlay(capsuleStroke(lineWidth: 0.7))
+        .help(currentDirPath(conv))
+    }
+
+    private func knowledgeCapsule(for conv: Conversation, status: ChatViewModel.KnowledgeStatus) -> some View {
+        let iconColor = knowledgeStatusColor(status)
+        let subtitleColor = knowledgeStatusTextColor(status)
+
+        return Button {
+            knowledgeSelectionTarget = KnowledgeSelectionTarget(id: conv.id)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "books.vertical")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(iconColor)
+
+                Text(status.title)
+                    .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                    .foregroundStyle(.secondary)
+
+                Text(status.subtitle)
+                    .font(.system(size: 10.5, weight: .semibold, design: .rounded))
+                    .foregroundStyle(subtitleColor)
+                    .lineLimit(1)
+
+                if status.hasIssues {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.orange)
+                } else if status.isSuggested {
+                    capsuleBadge(
+                        text: L10n.tr("chat.knowledge.selector.suggested_badge"),
+                        foreground: .accentColor,
+                        background: Color.accentColor.opacity(0.12)
+                    )
+                } else if status.hasRecentUsage {
+                    capsuleBadge(
+                        text: L10n.tr("chat.knowledge.recent_usage_badge"),
+                        foreground: .blue,
+                        background: Color.blue.opacity(0.12)
+                    )
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(capsuleFill)
+            .overlay(capsuleStroke(lineWidth: 0.7))
+        }
+        .buttonStyle(.plain)
+        .help(status.detail ?? L10n.tr("chat.knowledge.selector.subtitle"))
+    }
+
+    private func skillRoutingCapsule(_ skillRouting: SkillRoutingStatus) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "wand.and.stars")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            Text(skillRouting.title)
+                .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(capsuleFill)
+        .overlay(capsuleStroke(lineWidth: 0.7))
+        .help([skillRouting.detail, skillRouting.reason].compactMap { $0 }.joined(separator: "\n"))
+    }
+
+    private var capsuleFill: some ShapeStyle {
+        Color.primary.opacity(0.018)
+    }
+
+    private func capsuleStroke(lineWidth: CGFloat) -> some View {
+        Capsule()
+            .stroke(Color.primary.opacity(0.04), lineWidth: lineWidth)
+    }
+
+    private func knowledgeStatusColor(_ status: ChatViewModel.KnowledgeStatus) -> Color {
+        if status.hasIssues { return .orange }
+        if status.isSuggested { return .accentColor }
+        return status.isEnabled ? .secondary : Color.secondary.opacity(0.55)
+    }
+
+    private func knowledgeStatusTextColor(_ status: ChatViewModel.KnowledgeStatus) -> Color {
+        if status.hasIssues { return .orange }
+        if status.isSuggested { return .accentColor }
+        return status.isEnabled ? .primary : .secondary
+    }
+
+    private func capsuleBadge(text: String, foreground: Color, background: Color) -> some View {
+        Text(text)
+            .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+            .foregroundStyle(foreground)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Capsule().fill(background))
+    }
+
+    private func toggleWindowZoom() {
+        let targetWindow = NSApp.keyWindow ?? NSApp.mainWindow ?? NSApp.windows.first
+        targetWindow?.performZoom(nil)
     }
 
     // MARK: - Send
@@ -1053,6 +1184,34 @@ struct ChatView: View {
             return L10n.tr("chat.approval.risk.skill_script")
         }
         return preview.isDestructive ? L10n.tr("chat.approval.risk.high") : L10n.tr("chat.approval.risk.normal")
+    }
+}
+
+private struct WindowChromeInteractionBackground: NSViewRepresentable {
+    let onDoubleClick: () -> Void
+
+    func makeNSView(context: Context) -> WindowChromeInteractionNSView {
+        let view = WindowChromeInteractionNSView()
+        view.onDoubleClick = onDoubleClick
+        return view
+    }
+
+    func updateNSView(_ nsView: WindowChromeInteractionNSView, context: Context) {
+        nsView.onDoubleClick = onDoubleClick
+    }
+}
+
+private final class WindowChromeInteractionNSView: NSView {
+    var onDoubleClick: (() -> Void)?
+
+    override var mouseDownCanMoveWindow: Bool { true }
+
+    override func mouseUp(with event: NSEvent) {
+        if event.clickCount == 2 {
+            onDoubleClick?()
+            return
+        }
+        super.mouseUp(with: event)
     }
 }
 

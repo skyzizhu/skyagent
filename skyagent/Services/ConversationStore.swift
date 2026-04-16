@@ -34,6 +34,11 @@ class ConversationStore: ObservableObject {
         self.saveDirURL = saveDir ?? AppStoragePaths.dataDir
         try? FileManager.default.createDirectory(at: self.saveDirURL, withIntermediateDirectories: true)
         loadConversations()
+        WorkspaceMemoryService.shared.ensureWorkspaceArtifacts(for: self.settings.ensureSandboxDir())
+        conversations.forEach { conversation in
+            let workspacePath = conversation.sandboxDir.isEmpty ? self.settings.ensureSandboxDir() : conversation.sandboxDir
+            WorkspaceMemoryService.shared.ensureWorkspaceArtifacts(for: workspacePath)
+        }
         cleanupStaleAttachments()
         if conversations.isEmpty { newConversation() }
         currentConversationId = conversations.first?.id
@@ -43,11 +48,20 @@ class ConversationStore: ObservableObject {
 
     @discardableResult
     func newConversation() -> Conversation {
-        let conv = Conversation(title: L10n.tr("conversation.new"))
+        let defaultSandboxDir = settings.ensureSandboxDir()
+        var conv = Conversation(title: L10n.tr("conversation.new"))
+        conv.sandboxDir = defaultSandboxDir
+        conv.knowledgeLibraryIDs = []
         conversations.insert(conv, at: 0)
+        WorkspaceMemoryService.shared.ensureWorkspaceArtifacts(for: defaultSandboxDir)
         refreshConversationContext(conv.id, immediately: true)
         currentConversationId = conv.id
-        saveConversations()
+        resolveWorkspaceLibraryReference(
+            for: conv.id,
+            workspacePath: defaultSandboxDir,
+            strategy: .replaceAll
+        )
+        requestSave(delay: 0.1)
         return conv
     }
 
@@ -55,6 +69,8 @@ class ConversationStore: ObservableObject {
         guard let conversation = conversations.first(where: { $0.id == id }) else { return }
         currentConversationId = id
         let fallbackSandboxDir = settings.ensureSandboxDir()
+        let workspacePath = conversation.sandboxDir.isEmpty ? fallbackSandboxDir : conversation.sandboxDir
+        WorkspaceMemoryService.shared.ensureWorkspaceArtifacts(for: workspacePath)
         let snapshot = conversation
         let workItem = DispatchWorkItem { [weak self] in
             let state = ConversationContextService.shared.buildState(
@@ -79,7 +95,7 @@ class ConversationStore: ObservableObject {
             currentConversationId = conversations.first?.id
         }
         if conversations.isEmpty { newConversation() }
-        saveConversations()
+        requestSave(delay: 0.1)
         cleanupUnusedAttachments(removeAllOrphans: true)
     }
 
@@ -106,7 +122,7 @@ class ConversationStore: ObservableObject {
         }
         conversations[convIdx].lastActiveAt = Date()
         refreshConversationContext(conversations[convIdx].id)
-        saveConversations()
+        requestSave(delay: 0.1)
         cleanupUnusedAttachments(removeAllOrphans: true)
     }
 
@@ -115,7 +131,7 @@ class ConversationStore: ObservableObject {
         conversations[idx].messages.removeAll()
         conversations[idx].lastActiveAt = Date()
         refreshConversationContext(convId)
-        saveConversations()
+        requestSave(delay: 0.1)
         cleanupUnusedAttachments(removeAllOrphans: true)
     }
 
@@ -123,14 +139,14 @@ class ConversationStore: ObservableObject {
         guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
         conversations[idx].title = title
         refreshConversationContext(id)
-        saveConversations()
+        requestSave(delay: 0.2)
     }
 
     func toggleFavoriteConversation(_ id: UUID) {
         guard let idx = conversations.firstIndex(where: { $0.id == id }) else { return }
         conversations[idx].isFavorite.toggle()
         conversations[idx].lastActiveAt = Date()
-        saveConversations()
+        requestSave(delay: 0.2)
     }
 
     // MARK: - 权限模式
@@ -140,22 +156,108 @@ class ConversationStore: ObservableObject {
         let current = conversations[idx].filePermissionMode
         conversations[idx].filePermissionMode = current == .sandbox ? .open : .sandbox
         refreshConversationContext(convId)
-        saveConversations()
+        requestSave(delay: 0.1)
     }
 
     func updateConversationSandboxDir(_ convId: UUID, dir: String) {
         guard let idx = conversations.firstIndex(where: { $0.id == convId }) else { return }
-        conversations[idx].sandboxDir = dir
+        let normalizedDir = AppStoragePaths.normalizeSandboxPath(dir)
+        conversations[idx].sandboxDir = normalizedDir
+        conversations[idx].knowledgeLibraryIDs = []
+        WorkspaceMemoryService.shared.ensureWorkspaceArtifacts(for: normalizedDir, forceRefresh: true)
         refreshConversationContext(convId)
-        saveConversations()
+        resolveWorkspaceLibraryReference(
+            for: convId,
+            workspacePath: normalizedDir,
+            strategy: .replaceAll
+        )
+        requestSave(delay: 0.1)
     }
 
     func setConversationPermission(_ convId: UUID, mode: FilePermissionMode, sandboxDir: String) {
         guard let idx = conversations.firstIndex(where: { $0.id == convId }) else { return }
         conversations[idx].filePermissionMode = mode
-        conversations[idx].sandboxDir = sandboxDir
+        let normalizedDir = AppStoragePaths.normalizeSandboxPath(sandboxDir)
+        conversations[idx].sandboxDir = normalizedDir
+        conversations[idx].knowledgeLibraryIDs = []
+        WorkspaceMemoryService.shared.ensureWorkspaceArtifacts(for: normalizedDir, forceRefresh: true)
         refreshConversationContext(convId)
-        saveConversations()
+        resolveWorkspaceLibraryReference(
+            for: convId,
+            workspacePath: normalizedDir,
+            strategy: .replaceAll
+        )
+        requestSave(delay: 0.1)
+    }
+
+    func setConversationKnowledgeLibraries(_ convId: UUID, libraryIDs: [String]) {
+        guard let idx = conversations.firstIndex(where: { $0.id == convId }) else { return }
+        conversations[idx].knowledgeLibraryIDs = orderedLibraryIDs(from: libraryIDs)
+        conversations[idx].lastActiveAt = Date()
+        refreshConversationContext(convId)
+        requestSave(delay: 0.1)
+    }
+
+    func removeKnowledgeLibraryReference(_ libraryID: String) {
+        var hasChanges = false
+
+        for index in conversations.indices {
+            guard conversations[index].knowledgeLibraryIDs.contains(libraryID) else { continue }
+
+            var updatedIDs = conversations[index].knowledgeLibraryIDs.filter { $0 != libraryID }
+            if updatedIDs.isEmpty {
+                updatedIDs = []
+            }
+
+            conversations[index].knowledgeLibraryIDs = orderedLibraryIDs(from: updatedIDs)
+            conversations[index].lastActiveAt = Date()
+            refreshConversationContext(conversations[index].id)
+            if updatedIDs.isEmpty {
+                let workspacePath = conversations[index].sandboxDir.isEmpty ? settings.ensureSandboxDir() : conversations[index].sandboxDir
+                resolveWorkspaceLibraryReference(
+                    for: conversations[index].id,
+                    workspacePath: workspacePath,
+                    strategy: .onlyWhenEmpty
+                )
+            }
+            hasChanges = true
+        }
+
+        if hasChanges {
+            requestSave(delay: 0.1)
+        }
+    }
+
+    func reconcileKnowledgeLibraryReferences(validLibraryIDs: Set<String>) {
+        var hasChanges = false
+
+        for index in conversations.indices {
+            let existing = conversations[index].knowledgeLibraryIDs
+            let filtered = existing.filter { validLibraryIDs.contains($0) }
+            guard filtered.count != existing.count else { continue }
+
+            var updatedIDs = orderedLibraryIDs(from: filtered)
+            if updatedIDs.isEmpty {
+                updatedIDs = []
+            }
+
+            conversations[index].knowledgeLibraryIDs = updatedIDs
+            conversations[index].lastActiveAt = Date()
+            refreshConversationContext(conversations[index].id)
+            if updatedIDs.isEmpty {
+                let workspacePath = conversations[index].sandboxDir.isEmpty ? settings.ensureSandboxDir() : conversations[index].sandboxDir
+                resolveWorkspaceLibraryReference(
+                    for: conversations[index].id,
+                    workspacePath: workspacePath,
+                    strategy: .onlyWhenEmpty
+                )
+            }
+            hasChanges = true
+        }
+
+        if hasChanges {
+            requestSave(delay: 0.1)
+        }
     }
 
     func markSkillActivated(_ skillID: String, in convId: UUID) {
@@ -164,7 +266,7 @@ class ConversationStore: ObservableObject {
         conversations[idx].activatedSkillIDs.append(skillID)
         conversations[idx].lastActiveAt = Date()
         refreshConversationContext(convId)
-        saveConversations()
+        requestSave(delay: 0.15)
     }
 
     func updateLastMessageContent(_ convId: UUID, appending delta: String, refreshContext: Bool = false) {
@@ -194,8 +296,10 @@ class ConversationStore: ObservableObject {
             conversations[idx].recentOperations = Array(conversations[idx].recentOperations.prefix(20))
         }
         conversations[idx].lastActiveAt = Date()
+        let workspacePath = conversations[idx].sandboxDir.isEmpty ? settings.ensureSandboxDir() : conversations[idx].sandboxDir
+        WorkspaceMemoryService.shared.ensureWorkspaceArtifacts(for: workspacePath, forceRefresh: true)
         refreshConversationContext(convId)
-        saveConversations()
+        requestSave(delay: 0.1)
     }
 
     func markOperationUndone(_ operationId: String, in convId: UUID) {
@@ -204,7 +308,7 @@ class ConversationStore: ObservableObject {
         conversations[idx].recentOperations[opIdx].isUndone = true
         conversations[idx].lastActiveAt = Date()
         refreshConversationContext(convId)
-        saveConversations()
+        requestSave(delay: 0.1)
     }
 
     func operation(_ operationId: String, in convId: UUID) -> FileOperationRecord? {
@@ -237,7 +341,7 @@ class ConversationStore: ObservableObject {
         conversations[convIdx].messages.remove(at: index)
         conversations[convIdx].lastActiveAt = Date()
         refreshConversationContext(convId)
-        saveConversations()
+        requestSave(delay: 0.1)
         cleanupUnusedAttachments(removeAllOrphans: true)
     }
 
@@ -247,7 +351,7 @@ class ConversationStore: ObservableObject {
         conversations[convIdx].messages.remove(at: msgIdx)
         conversations[convIdx].lastActiveAt = Date()
         refreshConversationContext(convId)
-        saveConversations()
+        requestSave(delay: 0.1)
         cleanupUnusedAttachments(removeAllOrphans: true)
     }
 
@@ -311,7 +415,7 @@ class ConversationStore: ObservableObject {
         // 删除该消息之后的所有消息
         conversations[idx].messages.removeSubrange((msgIdx + 1)...)
         refreshConversationContext(convId)
-        saveConversations()
+        requestSave(delay: 0.1)
         cleanupUnusedAttachments(removeAllOrphans: true)
     }
 
@@ -329,14 +433,69 @@ class ConversationStore: ObservableObject {
         }
     }
 
+    func requestSave(delay: TimeInterval = 0.35) {
+        scheduleSaveConversations(delay: delay)
+    }
+
     private func loadConversations() {
         let url = saveDir.appendingPathComponent("conversations.json")
         guard let data = try? Data(contentsOf: url),
               let loaded = try? JSONDecoder().decode([Conversation].self, from: data) else { return }
-        conversations = loaded
+        var didNormalizeSandbox = false
+        let normalized = loaded.map { conversation -> Conversation in
+            var mutable = conversation
+            let normalizedDir = AppStoragePaths.normalizeSandboxPath(mutable.sandboxDir)
+            if normalizedDir != mutable.sandboxDir {
+                mutable.sandboxDir = normalizedDir
+                didNormalizeSandbox = true
+            }
+            return mutable
+        }
+        conversations = normalized
         currentConversationId = conversations.first?.id
         if let currentConversationId {
             refreshConversationContext(currentConversationId, immediately: true)
+        }
+        if didNormalizeSandbox {
+            saveConversations()
+        }
+    }
+
+    private enum WorkspaceLibraryResolutionStrategy {
+        case replaceAll
+        case onlyWhenEmpty
+    }
+
+    private func resolveWorkspaceLibraryReference(
+        for conversationID: UUID,
+        workspacePath: String,
+        strategy: WorkspaceLibraryResolutionStrategy
+    ) {
+        let normalizedWorkspacePath = AppStoragePaths.normalizeSandboxPath(workspacePath)
+        guard !normalizedWorkspacePath.isEmpty else { return }
+
+        DispatchQueue.global(qos: .utility).async {
+            let library = KnowledgeBaseService.shared.ensureLibraryForWorkspace(rootPath: normalizedWorkspacePath)
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      let index = self.conversations.firstIndex(where: { $0.id == conversationID }) else { return }
+                let currentWorkspacePath = self.conversations[index].sandboxDir.isEmpty
+                    ? self.settings.ensureSandboxDir()
+                    : self.conversations[index].sandboxDir
+                guard AppStoragePaths.normalizeSandboxPath(currentWorkspacePath) == normalizedWorkspacePath else { return }
+
+                switch strategy {
+                case .replaceAll:
+                    self.conversations[index].knowledgeLibraryIDs = [library.id.uuidString]
+                case .onlyWhenEmpty:
+                    guard self.conversations[index].knowledgeLibraryIDs.isEmpty else { return }
+                    self.conversations[index].knowledgeLibraryIDs = [library.id.uuidString]
+                }
+
+                self.conversations[index].lastActiveAt = Date()
+                self.refreshConversationContext(conversationID)
+                self.requestSave(delay: 0.1)
+            }
         }
     }
 
@@ -376,6 +535,14 @@ class ConversationStore: ObservableObject {
         Set(conversations.flatMap { conversation in
             conversation.messages.compactMap(\.attachmentID)
         })
+    }
+
+    private func orderedLibraryIDs(from libraryIDs: [String]) -> [String] {
+        var seen = Set<String>()
+        return libraryIDs.filter { id in
+            guard !id.isEmpty else { return false }
+            return seen.insert(id).inserted
+        }
     }
 
     func refreshConversationContext(_ convId: UUID, immediately: Bool = false) {

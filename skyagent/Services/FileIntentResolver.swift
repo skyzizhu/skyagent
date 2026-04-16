@@ -1,6 +1,6 @@
 import Foundation
 
-enum FileIntentKind: String {
+enum FileIntentKind: String, Sendable {
     case createFiles
     case renameFiles
     case deleteFiles
@@ -53,7 +53,7 @@ enum FileIntentKind: String {
     }
 }
 
-struct FileIntentAnalysis {
+struct FileIntentAnalysis: Sendable {
     let kind: FileIntentKind
     let summary: String
     let executionPlan: String?
@@ -187,6 +187,11 @@ final class FileIntentResolver {
     private let relevantExtensions: Set<String> = [
         "docx", "xlsx", "pdf", "pptx", "txt", "md", "markdown", "csv", "json", "xml", "yaml", "yml",
         "html", "css", "js"
+    ]
+    private let skippedDirectoryNames: Set<String> = [
+        ".git", ".svn", ".hg", ".idea", ".vscode",
+        "node_modules", "Pods", "DerivedData", "build", "dist", ".build",
+        ".next", ".nuxt", ".turbo", ".cache", "__pycache__", ".venv", "venv"
     ]
 
     init(attachmentStore: UploadedAttachmentStore = .shared) {
@@ -1135,16 +1140,25 @@ final class FileIntentResolver {
         let rootURL = URL(fileURLWithPath: root)
         guard let enumerator = FileManager.default.enumerator(
             at: rootURL,
-            includingPropertiesForKeys: [.isRegularFileKey],
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey],
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else {
             return []
         }
 
         for case let fileURL as URL in enumerator {
+            if skippedDirectoryNames.contains(fileURL.lastPathComponent) {
+                enumerator.skipDescendants()
+                continue
+            }
             guard count < limit else { break }
-            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey]),
-                  values.isRegularFile == true else {
+            guard let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey]) else {
+                continue
+            }
+            if values.isDirectory == true {
+                continue
+            }
+            guard values.isRegularFile == true else {
                 continue
             }
             let ext = fileURL.pathExtension.lowercased()

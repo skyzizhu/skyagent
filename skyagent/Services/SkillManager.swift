@@ -13,17 +13,23 @@ final class SkillManager: ObservableObject {
     private let userStandardDir: URL
     private let registryURL: URL
     private let legacyAppSkillsDir: URL
+    private let legacyRegistryURLs: [URL]
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
-        self.baseDir = home.appendingPathComponent(".skyagent")
-        self.appSkillsDir = baseDir.appendingPathComponent("skills")
+        self.baseDir = AppStoragePaths.userRoot
+        self.appSkillsDir = AppStoragePaths.skillsDir
         self.userStandardDir = home.appendingPathComponent(".agents/skills")
-        self.registryURL = baseDir.appendingPathComponent("skills-registry.json")
+        self.registryURL = AppStoragePaths.skillsRegistryFile
         self.legacyAppSkillsDir = home.appendingPathComponent(".openclaw/workspace-coding/MiniAgent/data/skills")
+        self.legacyRegistryURLs = [
+            AppStoragePaths.userRoot.appendingPathComponent("skills-registry.json", isDirectory: false),
+            AppStoragePaths.skillsDir.appendingPathComponent("registry.json", isDirectory: false)
+        ]
         try? fm.createDirectory(at: baseDir, withIntermediateDirectories: true)
         try? fm.createDirectory(at: appSkillsDir, withIntermediateDirectories: true)
         migrateLegacySkillsIfNeeded()
+        migrateRegistryIfNeeded()
         reloadSkills()
     }
 
@@ -35,11 +41,16 @@ final class SkillManager: ObservableObject {
         self.baseDir = baseDir
         self.appSkillsDir = baseDir.appendingPathComponent("skills")
         self.userStandardDir = userStandardDir
-        self.registryURL = baseDir.appendingPathComponent("skills-registry.json")
+        self.registryURL = self.appSkillsDir.appendingPathComponent("skills-registry.json")
         self.legacyAppSkillsDir = legacyAppSkillsDir
+        self.legacyRegistryURLs = [
+            baseDir.appendingPathComponent("skills-registry.json", isDirectory: false),
+            self.appSkillsDir.appendingPathComponent("registry.json", isDirectory: false)
+        ]
         try? fm.createDirectory(at: baseDir, withIntermediateDirectories: true)
         try? fm.createDirectory(at: appSkillsDir, withIntermediateDirectories: true)
         migrateLegacySkillsIfNeeded()
+        migrateRegistryIfNeeded()
         reloadSkills()
     }
 
@@ -126,7 +137,7 @@ final class SkillManager: ObservableObject {
         1. 先只根据下面的 skill 名称和描述做发现，不要预先假设 skill 全文和资源内容。
         2. 如果用户在提示词里直接提到了某个 skill 名称，或需求明显匹配某个 skill 描述，你必须先调用 activate_skill 激活它，再继续处理任务。
         3. skill 激活后，只在真正需要时再调用 read_skill_resource 读取具体 references、templates、assets 或 scripts。
-        4. 如果某个已激活 skill 含有 scripts/，可以使用 run_skill_script。沙盒模式下允许执行本地脚本，但网络请求会被系统沙盒拦截，且只有当前会话工作目录可写；其他系统路径默认只读。开放模式下脚本可以正常访问网络。
+        4. 如果某个已激活 skill 含有 scripts/，可以使用 run_skill_script。skill 脚本走独立的 Skill Runtime，默认允许联网，不受普通 shell 是否开放影响；脚本工作目录默认是当前会话工作目录。
         5. 如果用户明确要求下载、安装新的 skill，请调用 install_skill；新 skill 必须安装到 ~/.skyagent/skills。
         6. 如果用户要求“下载并使用”某个 skill，安装成功后不要停下，必须继续 activate_skill，并继续用这个 skill 完成当前任务。
         7. 运行已激活 skill 的脚本时，优先使用 run_skill_script；不要自己用 shell 去 cd 到 skill 目录再手动 bash/python 执行脚本。
@@ -405,6 +416,30 @@ final class SkillManager: ObservableObject {
             let destination = appSkillsDir.appendingPathComponent(child.lastPathComponent)
             guard !fm.fileExists(atPath: destination.path) else { continue }
             try? fm.copyItem(at: child, to: destination)
+        }
+    }
+
+    private func migrateRegistryIfNeeded() {
+        try? fm.createDirectory(at: appSkillsDir, withIntermediateDirectories: true)
+
+        if !fm.fileExists(atPath: registryURL.path) {
+            for legacyURL in legacyRegistryURLs where fm.fileExists(atPath: legacyURL.path) {
+                do {
+                    try fm.moveItem(at: legacyURL, to: registryURL)
+                    break
+                } catch {
+                    if let data = try? Data(contentsOf: legacyURL) {
+                        try? data.write(to: registryURL, options: [.atomic])
+                        try? fm.removeItem(at: legacyURL)
+                        break
+                    }
+                }
+            }
+        }
+
+        for legacyURL in legacyRegistryURLs where fm.fileExists(atPath: legacyURL.path) {
+            guard legacyURL.standardizedFileURL != registryURL.standardizedFileURL else { continue }
+            try? fm.removeItem(at: legacyURL)
         }
     }
 
@@ -1243,7 +1278,7 @@ final class SkillManager: ObservableObject {
 
     private func persistRegistry() {
         if let data = try? JSONEncoder().encode(installedSkills) {
-            try? data.write(to: registryURL)
+            try? data.write(to: registryURL, options: [.atomic])
         }
     }
 }

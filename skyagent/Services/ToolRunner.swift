@@ -15,6 +15,7 @@ class ToolRunner {
     private let skillManager: SkillManager
     private let attachmentStore: UploadedAttachmentStore
     private let validationService: FileValidationService
+    private let webContentFetcher: WebContentFetcher
     private var allowedReadRoots: [String] = []
     private var activeSkillIDs: [String] = []
     private var activeAttachmentIDs: [String] = []
@@ -102,11 +103,13 @@ class ToolRunner {
     init(
         skillManager: SkillManager = .shared,
         attachmentStore: UploadedAttachmentStore = .shared,
-        validationService: FileValidationService = .shared
+        validationService: FileValidationService = .shared,
+        webContentFetcher: WebContentFetcher = .shared
     ) {
         self.skillManager = skillManager
         self.attachmentStore = attachmentStore
         self.validationService = validationService
+        self.webContentFetcher = webContentFetcher
         AppStoragePaths.migrateLegacyDataIfNeeded()
         let settings = AppSettings.load()
         self.sandboxDir = settings.ensureSandboxDir()
@@ -492,7 +495,28 @@ class ToolRunner {
             return outcome
         case .ready(let tool, let params):
             if tool == .webFetch {
-                let outcome = ToolExecutionOutcome(output: await webFetch(params["url"] as? String ?? ""), operation: nil)
+                let fetchResult = await webFetch(params["url"] as? String ?? "")
+                let outcome = ToolExecutionOutcome(
+                    output: fetchResult.visibleOutput,
+                    modelOutput: fetchResult.modelOutput,
+                    operation: nil,
+                    followupContextMessage: fetchResult.followupContextMessage
+                )
+                let normalized = normalizedLargeOutputOutcome(outcome, for: tool)
+                return advisedOutcome(for: normalized, tool: tool, params: params)
+            }
+            if tool == .webSearch {
+                let searchResult = await webSearch(
+                    params["query"] as? String ?? "",
+                    limit: params["limit"] as? Int,
+                    engine: params["engine"] as? String
+                )
+                let outcome = ToolExecutionOutcome(
+                    output: searchResult.visibleOutput,
+                    modelOutput: searchResult.modelOutput,
+                    operation: nil,
+                    followupContextMessage: searchResult.followupContextMessage
+                )
                 let normalized = normalizedLargeOutputOutcome(outcome, for: tool)
                 return advisedOutcome(for: normalized, tool: tool, params: params)
             }
@@ -677,6 +701,8 @@ class ToolRunner {
             )
         case .webFetch:
             outcome = ToolExecutionOutcome(output: "[错误] web_fetch 需要异步执行", operation: nil)
+        case .webSearch:
+            outcome = ToolExecutionOutcome(output: "[错误] web_search 需要异步执行", operation: nil)
         case .listFiles:
             outcome = ToolExecutionOutcome(output: listFiles(params["path"] as? String ?? nil, recursive: params["recursive"] as? Bool ?? false), operation: nil)
         case .importFile:
@@ -800,37 +826,12 @@ class ToolRunner {
             return outcome
         }
 
-        let lines = text.components(separatedBy: .newlines)
-        let nonEmptyLineCount = lines.reduce(into: 0) { partialResult, line in
-            if !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                partialResult += 1
-            }
-        }
-        let visiblePreview = String(text.prefix(largeToolVisibleOutputLimit))
-        let modelPreview = String(text.prefix(largeToolModelOutputLimit))
-        let countHint = nonEmptyLineCount > 1
-            ? "若每行代表一个结果项，则总数约为 \(nonEmptyLineCount) 项。"
-            : "结果为长文本输出，请直接基于摘要继续。"
-
-        let visibleOutput = """
-        [结果过长，已截断显示]
-        工具: \(tool.rawValue)
-        总长度: \(text.count.formatted()) 个字符
-        总行数: \(nonEmptyLineCount.formatted()) 行
-        说明: 以下仅展示前 \(largeToolVisibleOutputLimit.formatted()) 个字符，完整原始结果不会继续无上限展开。
-
-        \(visiblePreview)
-        """
-
-        let modelOutput = """
-        [工具结果过长，系统已做摘要]
-        工具: \(tool.rawValue)
-        总长度: \(text.count) 个字符
-        总行数: \(nonEmptyLineCount) 行
-        \(countHint)
-        以下为前 \(largeToolModelOutputLimit) 个字符预览：
-        \(modelPreview)
-        """
+        let summary = summarizedLargeText(
+            text,
+            label: tool.rawValue,
+            visibleCharacterLimit: largeToolVisibleOutputLimit,
+            modelCharacterLimit: largeToolModelOutputLimit
+        )
 
         let followupHint = """
         上一个工具结果过长，系统已自动摘要。
@@ -847,8 +848,8 @@ class ToolRunner {
             .joined(separator: "\n\n")
 
         return ToolExecutionOutcome(
-            output: visibleOutput,
-            modelOutput: modelOutput,
+            output: summary.visibleOutput,
+            modelOutput: summary.modelOutput,
             operation: outcome.operation,
             activatedSkillID: outcome.activatedSkillID,
             skillContextMessage: outcome.skillContextMessage,
@@ -856,6 +857,66 @@ class ToolRunner {
             previewImagePath: outcome.previewImagePath,
             previewImagePaths: outcome.previewImagePaths
         )
+    }
+
+    private func summarizedLargeText(
+        _ text: String,
+        label: String,
+        visibleCharacterLimit: Int,
+        modelCharacterLimit: Int
+    ) -> (visibleOutput: String, modelOutput: String) {
+        let allLines = text.components(separatedBy: .newlines)
+        let nonEmptyLines = allLines
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let nonEmptyLineCount = nonEmptyLines.count
+        let lineBased = shouldPreferLineSummary(for: nonEmptyLines)
+        let sampleLineLimit = lineBased ? min(20, nonEmptyLineCount) : min(8, nonEmptyLineCount)
+        let sampleLines = Array(nonEmptyLines.prefix(sampleLineLimit))
+        let visiblePreview = lineBased
+            ? sampleLines.joined(separator: "\n")
+            : String(text.prefix(visibleCharacterLimit))
+        let modelPreview = lineBased
+            ? Array(nonEmptyLines.prefix(min(12, nonEmptyLineCount))).joined(separator: "\n")
+            : String(text.prefix(modelCharacterLimit))
+
+        let visibleSummaryLine: String
+        let modelSummaryLine: String
+        if lineBased {
+            visibleSummaryLine = "结果较长：共约 \(nonEmptyLineCount.formatted()) 项，下面仅展示前 \(sampleLineLimit.formatted()) 项样例。"
+            modelSummaryLine = "工具结果较长：共约 \(nonEmptyLineCount) 项。请优先基于计数和样例继续回答，不要复述完整列表。"
+        } else {
+            visibleSummaryLine = "结果较长：共 \(text.count.formatted()) 个字符，下面仅展示开头摘要。"
+            modelSummaryLine = "工具结果较长：共 \(text.count) 个字符。请基于摘要继续回答，不要复述完整长文本。"
+        }
+
+        let visibleOutput = """
+        \(visibleSummaryLine)
+        工具: \(label)
+        总长度: \(text.count.formatted()) 个字符
+        总行数: \(nonEmptyLineCount.formatted()) 行
+
+        \(lineBased ? "样例：" : "摘要预览：")
+        \(visiblePreview)
+        """
+
+        let modelOutput = """
+        \(modelSummaryLine)
+        工具: \(label)
+        总长度: \(text.count) 个字符
+        总行数: \(nonEmptyLineCount) 行
+
+        \(lineBased ? "前若干项样例：" : "摘要预览：")
+        \(modelPreview)
+        """
+
+        return (visibleOutput, modelOutput)
+    }
+
+    private func shouldPreferLineSummary(for lines: [String]) -> Bool {
+        guard lines.count >= 8 else { return false }
+        let averageLength = lines.reduce(0) { $0 + $1.count } / max(lines.count, 1)
+        return averageLength <= 180
     }
 
     private func previewImage(singlePath: String?, paths: [String]?) -> ToolExecutionOutcome {
@@ -1263,7 +1324,14 @@ class ToolRunner {
     /// 判断绝对路径是否在沙盒内
     private func isInSandbox(_ absolutePath: String) -> Bool {
         let target = canonicalPathForComparison(absolutePath)
-        return sandboxWritableRoots().contains { root in
+        let workspaceRoots = [
+            sandboxDir,
+            URL(fileURLWithPath: sandboxDir).resolvingSymlinksInPath().path
+        ]
+        .map(canonicalPathForComparison)
+        .filter { !$0.isEmpty }
+
+        return workspaceRoots.contains { root in
             target == root || target.hasPrefix(root + "/")
         }
     }
@@ -2313,25 +2381,15 @@ class ToolRunner {
     }
 
     // MARK: - Web Fetch
-    private func webFetch(_ urlStr: String) async -> String {
-        guard let url = URL(string: urlStr) else { return "[错误] 无效 URL" }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 15
+    private func webFetch(_ urlStr: String) async -> WebFetchResult {
+        await webContentFetcher.fetchResult(urlString: urlStr)
+    }
 
-        do {
-            let (data, _) = try await URLSession.shared.data(for: request)
-            guard let html = String(data: data, encoding: .utf8) else {
-                return "[错误] 无法解码"
-            }
-            let cleaned = html.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
-            return String(cleaned.prefix(10000))
-        } catch {
-            let nsError = error as NSError
-            if nsError.domain == NSURLErrorDomain, nsError.code == NSURLErrorTimedOut {
-                return "[超时]"
-            }
-            return "[错误] \(error.localizedDescription)"
-        }
+    // MARK: - Web Search
+    private func webSearch(_ query: String, limit: Int?, engine: String?) async -> WebSearchResult {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let safeLimit = max(1, min(limit ?? 5, 10))
+        return await WebSearchService.shared.search(query: trimmed, limit: safeLimit, engineHint: engine)
     }
 
     // MARK: - Helpers
@@ -3805,10 +3863,6 @@ class ToolRunner {
                 "arg_count": .int(args.count)
             ]
         )
-        let isSandboxedScriptExecution = permissionMode == .sandbox
-        let sandboxNetworkWarning = isSandboxedScriptExecution && scriptMayUseNetwork(skill: skill, scriptPath: scriptPath)
-            ? sandboxNetworkWarningMessage(skill: skill, resource: resource)
-            : nil
         let normalizedArgs = normalizedScriptArgumentsForExecution(args)
         let process = Process()
         let stdout = Pipe()
@@ -3822,13 +3876,8 @@ class ToolRunner {
             reportProgress("stderr: \(line)")
         })
 
-        if isSandboxedScriptExecution {
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
-            process.arguments = ["-p", sandboxRestrictedProfile()] + [launch.executable] + launch.arguments + [scriptPath] + normalizedArgs
-        } else {
-            process.executableURL = URL(fileURLWithPath: launch.executable)
-            process.arguments = launch.arguments + [scriptPath] + normalizedArgs
-        }
+        process.executableURL = URL(fileURLWithPath: launch.executable)
+        process.arguments = launch.arguments + [scriptPath] + normalizedArgs
         process.currentDirectoryURL = URL(fileURLWithPath: normalizedWorkspaceExecutionDirectory())
         process.standardOutput = stdout
         process.standardError = stderr
@@ -3888,9 +3937,8 @@ class ToolRunner {
                 Timeout: \(safeTimeout)s
                 Termination: \(terminatedGracefully ? "graceful" : "forced")
                 """
-                let finalOutput = [sandboxNetworkWarning, output].compactMap { $0 }.joined(separator: "\n")
                 return ToolExecutionOutcome(
-                    output: finalOutput,
+                    output: output,
                     operation: buildSkillScriptOperation(
                         operationId: operationId,
                         skill: skill,
@@ -3950,9 +3998,8 @@ class ToolRunner {
             \(stdoutSection)
             \(stderrSection)
             """
-            let finalResult = [sandboxNetworkWarning, result].compactMap { $0 }.joined(separator: "\n")
             return ToolExecutionOutcome(
-                output: finalResult,
+                output: result,
                 operation: buildSkillScriptOperation(
                     operationId: operationId,
                     skill: skill,
@@ -4206,40 +4253,8 @@ class ToolRunner {
         }
     }
 
-    private func sandboxRestrictedProfile() -> String {
-        let allowRules = sandboxWritableRoots().map { root in
-            let escaped = root.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-            return """
-            (allow file-write*
-                (subpath "\(escaped)")
-            )
-            """
-        }.joined(separator: "\n")
-        return """
-        (version 1)
-        (allow default)
-        (deny network*)
-        (deny file-write*)
-        \(allowRules)
-        """
-    }
-
     private func normalizedWorkspaceExecutionDirectory() -> String {
         URL(fileURLWithPath: sandboxDir).resolvingSymlinksInPath().path
-    }
-
-    private func sandboxWritableRoots() -> [String] {
-        var roots: [String] = []
-        let candidates = [
-            sandboxDir,
-            URL(fileURLWithPath: sandboxDir).resolvingSymlinksInPath().path
-        ]
-
-        for candidate in candidates {
-            guard !candidate.isEmpty, !roots.contains(candidate) else { continue }
-            roots.append(candidate)
-        }
-        return roots
     }
 
     private func normalizedScriptArgumentsForExecution(_ args: [String]) -> [String] {
@@ -4253,27 +4268,6 @@ class ToolRunner {
             guard isInSandbox(canonical) else { return expanded }
             return canonical
         }
-    }
-
-    private func scriptMayUseNetwork(skill: AgentSkill, scriptPath: String) -> Bool {
-        let content = combinedReferencedScriptContent(for: skill, startingAt: scriptPath)
-        let signals = [
-            "curl ", "wget ", "requests.", "httpx.", "urllib.", "fetch(", "axios.", "urlsession",
-            "http://", "https://", "base_url", "generatecontent", "openai", "gemini", "anthropic"
-        ]
-        let lowercased = content.lowercased()
-        return signals.contains { lowercased.contains($0) }
-    }
-
-    private func sandboxNetworkWarningMessage(skill: AgentSkill, resource: AgentSkillResource) -> String {
-        """
-        [Sandbox network warning]
-        Skill: \(skill.name)
-        Script: \(resource.relativePath)
-        当前会话是沙盒模式。检测到这个脚本包含网络请求迹象，执行时网络访问会被系统沙盒拦截。
-        同时，沙盒模式下只有当前会话工作目录可写，其他系统路径默认只读。
-        如需让这个脚本真正联网，请切换到开放模式后再执行。
-        """
     }
 
     private func resolvedExecutionEnvironment() -> [String: String] {
@@ -4491,7 +4485,7 @@ class ToolRunner {
         case .template:
             return "Usage hint: 这是模板文件，适合作为输出骨架或起始内容。"
         case .script:
-            return "Usage hint: 这是 skill 脚本；你可以先阅读实现，再按需要通过 run_skill_script 执行。沙盒模式下允许本地执行但网络会被拦截，开放模式下可正常访问网络。"
+            return "Usage hint: 这是 skill 脚本；你可以先阅读实现，再按需要通过 run_skill_script 执行。skill 脚本走独立运行时，默认允许联网，不受普通 shell 开关影响。"
         case .asset:
             return "Usage hint: 这是资源文件；如果是二进制资产，请结合元信息决定是否需要继续引用或让用户手动查看。"
         case .other:
