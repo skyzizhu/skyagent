@@ -29,6 +29,7 @@ struct ChatView: View {
     @State private var cachedTranscriptLastMessageSignature = 0
     @State private var cachedTranscriptSnapshot = TranscriptSnapshot(messages: [], hiddenMessageCount: 0)
     @State private var cachedTranscriptItems: [TranscriptItem] = []
+    @State private var cachedTranscriptRenderRows: [TranscriptRenderRow] = []
     @State private var transcriptPresentationStore = TranscriptPresentationStore()
     @State private var conversationSwitchStartedAt: Date?
     @State private var transcriptRefreshStartedAt: Date?
@@ -37,6 +38,23 @@ struct ChatView: View {
 
     private struct KnowledgeSelectionTarget: Identifiable {
         let id: UUID
+    }
+
+    private struct TranscriptRefreshTrigger: Equatable {
+        let conversationID: UUID
+        let messageCount: Int
+        let lastMessageID: UUID?
+        let lastMessageFingerprint: Int
+    }
+
+    private struct TranscriptFollowTrigger: Equatable {
+        let conversationID: UUID
+        let messageCount: Int
+        let lastMessageID: UUID?
+        let lastMessageFingerprint: Int
+        let activityStateID: String?
+        let activityDetailFingerprint: Int
+        let displayedStateCount: Int
     }
 
     private enum TranscriptItem: Identifiable {
@@ -53,6 +71,14 @@ struct ChatView: View {
         }
     }
 
+    private struct TranscriptRenderRow: Identifiable {
+        let item: TranscriptItem
+        let spacing: CGFloat
+        let isLastVisibleMessage: Bool
+
+        var id: String { item.id }
+    }
+
     init(viewModel: ChatViewModel) {
         self.viewModel = viewModel
         self.store = viewModel.store
@@ -63,10 +89,10 @@ struct ChatView: View {
         VStack(spacing: 0) {
             if let conv = store.currentConversation {
                 let transcriptSnapshot = resolvedTranscriptSnapshot(for: conv)
-                let transcriptItems = resolvedTranscriptItems(for: conv, snapshot: transcriptSnapshot)
+                let transcriptRenderRows = resolvedTranscriptRenderRows(for: conv, snapshot: transcriptSnapshot)
                 conversationContent(
                     conv: conv,
-                    transcriptItems: transcriptItems,
+                    transcriptRenderRows: transcriptRenderRows,
                     hiddenMessageCount: transcriptSnapshot.hiddenMessageCount
                 )
 
@@ -124,14 +150,8 @@ struct ChatView: View {
         .onChange(of: visibleMessageLimit) {
             refreshTranscriptCache()
         }
-        .onChange(of: store.currentConversation?.messages.count) {
+        .onChange(of: transcriptRefreshTrigger) {
             scheduleTranscriptCacheRefresh()
-        }
-        .onChange(of: store.currentConversation?.messages.last?.id) {
-            scheduleTranscriptCacheRefresh()
-        }
-        .onChange(of: store.currentConversation?.messages.last?.content) {
-            scheduleTranscriptCacheRefresh(debounce: 0.05)
         }
         .alert(L10n.tr("sidebar.open_mode.title"), isPresented: $showOpenModeConfirmation) {
             Button(L10n.tr("common.cancel"), role: .cancel) {}
@@ -157,27 +177,27 @@ struct ChatView: View {
     }
 
     @ViewBuilder
-    private func conversationContent(conv: Conversation, transcriptItems: [TranscriptItem], hiddenMessageCount: Int) -> some View {
+    private func conversationContent(conv: Conversation, transcriptRenderRows: [TranscriptRenderRow], hiddenMessageCount: Int) -> some View {
         VStack(spacing: 0) {
             topDirectoryBar(for: conv)
 
             ZStack {
-                transcriptScrollView(conv: conv, transcriptItems: transcriptItems, hiddenMessageCount: hiddenMessageCount)
+                transcriptScrollView(conv: conv, transcriptRenderRows: transcriptRenderRows, hiddenMessageCount: hiddenMessageCount)
 
-                if shouldShowTranscriptLoading(for: conv, transcriptItems: transcriptItems) {
+                if shouldShowTranscriptLoading(for: conv, transcriptRenderRows: transcriptRenderRows) {
                     transcriptLoadingOverlay
                 }
             }
         }
     }
 
-    private func transcriptScrollView(conv: Conversation, transcriptItems: [TranscriptItem], hiddenMessageCount: Int) -> some View {
+    private func transcriptScrollView(conv: Conversation, transcriptRenderRows: [TranscriptRenderRow], hiddenMessageCount: Int) -> some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 18) {
                     transcriptStack(
                         conv: conv,
-                        transcriptItems: transcriptItems,
+                        transcriptRenderRows: transcriptRenderRows,
                         hiddenMessageCount: hiddenMessageCount,
                         scrollProxy: proxy
                     )
@@ -214,19 +234,7 @@ struct ChatView: View {
             .onChange(of: conv.id) {
                 applySavedTranscriptPresentation(for: conv.id, with: proxy)
             }
-            .onChange(of: conv.messages.count) {
-                scheduleScrollToBottom(with: proxy, animated: false)
-            }
-            .onChange(of: conv.messages.last?.content) {
-                scheduleScrollToBottom(with: proxy, animated: false, debounce: 0.06)
-            }
-            .onChange(of: activityViewModel.currentState?.id) {
-                scheduleScrollToBottom(with: proxy, animated: false, debounce: 0.02)
-            }
-            .onChange(of: activityViewModel.currentState?.detail) {
-                scheduleScrollToBottom(with: proxy, animated: false, debounce: 0.02)
-            }
-            .onChange(of: activityViewModel.displayedStates.count) {
+            .onChange(of: transcriptFollowTrigger(for: conv)) {
                 scheduleScrollToBottom(with: proxy, animated: false, debounce: 0.02)
             }
             .overlay(alignment: .bottomTrailing) {
@@ -257,7 +265,7 @@ struct ChatView: View {
     @ViewBuilder
     private func transcriptStack(
         conv: Conversation,
-        transcriptItems: [TranscriptItem],
+        transcriptRenderRows: [TranscriptRenderRow],
         hiddenMessageCount: Int,
         scrollProxy: ScrollViewProxy
     ) -> some View {
@@ -268,14 +276,12 @@ struct ChatView: View {
                     .padding(.bottom, 12)
             }
 
-            ForEach(Array(transcriptItems.enumerated()), id: \.element.id) { index, item in
+            ForEach(transcriptRenderRows) { row in
                 transcriptRow(
-                    item: item,
-                    nextItem: transcriptItems.indices.contains(index + 1) ? transcriptItems[index + 1] : nil,
-                    conversation: conv,
-                    transcriptItems: transcriptItems
+                    row: row,
+                    conversation: conv
                 )
-                .padding(.bottom, rowSpacing(after: item, next: transcriptItems.indices.contains(index + 1) ? transcriptItems[index + 1] : nil))
+                .padding(.bottom, row.spacing)
             }
 
             if !activityViewModel.displayedStates.isEmpty {
@@ -323,11 +329,10 @@ struct ChatView: View {
     }
 
     @ViewBuilder
-    private func transcriptRow(item: TranscriptItem, nextItem: TranscriptItem?, conversation: Conversation, transcriptItems: [TranscriptItem]) -> some View {
-        switch item {
+    private func transcriptRow(row: TranscriptRenderRow, conversation: Conversation) -> some View {
+        switch row.item {
         case .message(let msg):
-            let isLastVisibleMessage = msg.id == lastDisplayMessageID(in: transcriptItems)
-            let isLastAssistant = isLastVisibleMessage && msg.role == .assistant
+            let isLastAssistant = row.isLastVisibleMessage && msg.role == .assistant
 
             EquatableView(
                 content: MessageBubbleView(
@@ -451,10 +456,6 @@ struct ChatView: View {
         }
     }
 
-    private func lastDisplayMessageID(in items: [TranscriptItem]) -> UUID? {
-        items.reversed().compactMap(displayMessage(for:)).first?.id
-    }
-
     private func currentDirName(_ conv: Conversation) -> String {
         let dir = currentDirPath(conv)
         return (dir as NSString).lastPathComponent
@@ -537,6 +538,36 @@ struct ChatView: View {
         )
     }
 
+    private var transcriptRefreshTrigger: TranscriptRefreshTrigger? {
+        guard let conversation = store.currentConversation else { return nil }
+        var hasher = Hasher()
+        hasher.combine(conversation.messages.last?.renderFingerprint)
+        return TranscriptRefreshTrigger(
+            conversationID: conversation.id,
+            messageCount: conversation.messages.count,
+            lastMessageID: conversation.messages.last?.id,
+            lastMessageFingerprint: hasher.finalize()
+        )
+    }
+
+    private func transcriptFollowTrigger(for conversation: Conversation) -> TranscriptFollowTrigger {
+        var messageHasher = Hasher()
+        messageHasher.combine(conversation.messages.last?.renderFingerprint)
+
+        var activityHasher = Hasher()
+        activityHasher.combine(activityViewModel.currentState?.detail)
+
+        return TranscriptFollowTrigger(
+            conversationID: conversation.id,
+            messageCount: conversation.messages.count,
+            lastMessageID: conversation.messages.last?.id,
+            lastMessageFingerprint: messageHasher.finalize(),
+            activityStateID: activityViewModel.currentState?.id,
+            activityDetailFingerprint: activityHasher.finalize(),
+            displayedStateCount: activityViewModel.displayedStates.count
+        )
+    }
+
     private func transcriptMessageSignature(for message: Message?) -> Int {
         guard let message else { return 0 }
         var hasher = Hasher()
@@ -576,6 +607,17 @@ struct ChatView: View {
         return []
     }
 
+    private func resolvedTranscriptRenderRows(for conversation: Conversation, snapshot: TranscriptSnapshot) -> [TranscriptRenderRow] {
+        let key = transcriptCacheKey(for: conversation)
+        if cachedTranscriptMatches(key) {
+            return cachedTranscriptRenderRows
+        }
+        if cachedTranscriptConversationID == conversation.id {
+            return cachedTranscriptRenderRows
+        }
+        return []
+    }
+
     private func refreshTranscriptCache() {
         pendingTranscriptRefreshTask?.cancel()
         guard let conversation = store.currentConversation else {
@@ -588,6 +630,7 @@ struct ChatView: View {
             cachedTranscriptLastMessageSignature = 0
             cachedTranscriptSnapshot = TranscriptSnapshot(messages: [], hiddenMessageCount: 0)
             cachedTranscriptItems = []
+            cachedTranscriptRenderRows = []
             return
         }
 
@@ -597,22 +640,12 @@ struct ChatView: View {
         transcriptRefreshStartedAt = Date()
         let messages = conversation.messages
         let refreshStartedAt = Date()
-        logUIEvent(
-            category: .ui,
-            event: "transcript_cache_refresh_started",
-            status: .started,
-            summary: "开始刷新会话转录缓存",
-            metadata: [
-                "conversation_id": .string(conversation.id.uuidString),
-                "message_count": .int(messages.count),
-                "limit": .int(key.limit)
-            ]
-        )
 
         var workItem: DispatchWorkItem?
         workItem = DispatchWorkItem {
             let snapshot = Self.transcriptSnapshot(from: messages, limit: key.limit)
             let items = Self.transcriptItems(from: snapshot.messages)
+            let renderRows = Self.transcriptRenderRows(from: items)
 
             DispatchQueue.main.async {
                 guard workItem?.isCancelled == false,
@@ -626,21 +659,24 @@ struct ChatView: View {
                 cachedTranscriptLastMessageSignature = key.lastMessageSignature
                 cachedTranscriptSnapshot = snapshot
                 cachedTranscriptItems = items
+                cachedTranscriptRenderRows = renderRows
                 isTranscriptRefreshing = false
                 transcriptRefreshStartedAt = nil
                 let durationMs = Date().timeIntervalSince(refreshStartedAt) * 1000
-                logUIEvent(
-                    category: .ui,
-                    event: "transcript_cache_refresh_finished",
-                    status: .succeeded,
-                    durationMs: durationMs,
-                    summary: "会话转录缓存刷新完成",
-                    metadata: [
-                        "conversation_id": .string(key.conversationID.uuidString),
-                        "item_count": .int(items.count),
-                        "hidden_message_count": .int(snapshot.hiddenMessageCount)
-                    ]
-                )
+                if durationMs >= 120 || conversationSwitchStartedAt != nil {
+                    logUIEvent(
+                        category: .ui,
+                        event: "transcript_cache_refresh_finished",
+                        status: .succeeded,
+                        durationMs: durationMs,
+                        summary: "会话转录缓存刷新完成",
+                        metadata: [
+                            "conversation_id": .string(key.conversationID.uuidString),
+                            "item_count": .int(renderRows.count),
+                            "hidden_message_count": .int(snapshot.hiddenMessageCount)
+                        ]
+                    )
+                }
                 if let switchStartedAt = conversationSwitchStartedAt {
                     logUIEvent(
                         category: .ui,
@@ -650,7 +686,7 @@ struct ChatView: View {
                         summary: "会话切换完成",
                         metadata: [
                             "conversation_id": .string(key.conversationID.uuidString),
-                            "item_count": .int(items.count)
+                            "item_count": .int(renderRows.count)
                         ]
                     )
                     conversationSwitchStartedAt = nil
@@ -687,6 +723,61 @@ struct ChatView: View {
             return 0.14
         }
         return 0.08
+    }
+
+    private static func transcriptRenderRows(from items: [TranscriptItem]) -> [TranscriptRenderRow] {
+        func displayMessage(for item: TranscriptItem) -> Message? {
+            switch item {
+            case .message(let message):
+                return message
+            case .toolBatch(let messages):
+                return messages.last
+            }
+        }
+
+        func isToolItem(_ item: TranscriptItem) -> Bool {
+            switch item {
+            case .message(let message):
+                return message.role == .tool
+            case .toolBatch:
+                return true
+            }
+        }
+
+        func rowSpacing(after item: TranscriptItem, next: TranscriptItem?) -> CGFloat {
+            guard let next else { return 14 }
+            let currentIsTool = isToolItem(item)
+            let nextIsTool = isToolItem(next)
+            if currentIsTool && nextIsTool {
+                return 6
+            }
+            if currentIsTool || nextIsTool {
+                return 10
+            }
+            if case .message(let currentMessage) = item,
+               case .message(let nextMessage) = next,
+               currentMessage.role == .assistant && nextMessage.role == .assistant {
+                return 12
+            }
+            return 16
+        }
+
+        let lastDisplayMessageID = items.reversed().compactMap(displayMessage(for:)).first?.id
+        return items.enumerated().map { index, item in
+            let nextItem = items.indices.contains(index + 1) ? items[index + 1] : nil
+            let isLastVisibleMessage: Bool
+            switch item {
+            case .message(let message):
+                isLastVisibleMessage = message.id == lastDisplayMessageID
+            case .toolBatch:
+                isLastVisibleMessage = false
+            }
+            return TranscriptRenderRow(
+                item: item,
+                spacing: rowSpacing(after: item, next: nextItem),
+                isLastVisibleMessage: isLastVisibleMessage
+            )
+        }
     }
 
     private func restoreTranscriptPresentationStateForCurrentConversation() {
@@ -787,15 +878,15 @@ struct ChatView: View {
         }
     }
 
-    private func shouldShowTranscriptLoading(for conversation: Conversation, transcriptItems: [TranscriptItem]) -> Bool {
+    private func shouldShowTranscriptLoading(for conversation: Conversation, transcriptRenderRows: [TranscriptRenderRow]) -> Bool {
         let hasMessages = !conversation.messages.isEmpty
         if !hasMessages {
             return false
         }
-        if transcriptItems.isEmpty {
+        if transcriptRenderRows.isEmpty {
             return true
         }
-        return isTranscriptRefreshing && conversationSwitchStartedAt != nil && transcriptItems.count <= 2
+        return isTranscriptRefreshing && conversationSwitchStartedAt != nil && transcriptRenderRows.count <= 2
     }
 
     private var transcriptLoadingOverlay: some View {

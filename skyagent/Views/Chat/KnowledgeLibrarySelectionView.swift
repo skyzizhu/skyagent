@@ -14,7 +14,7 @@ struct KnowledgeLibrarySelectionView: View {
             header
             Divider()
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+                LazyVStack(alignment: .leading, spacing: 18) {
                     toggleCard
                     librariesCard
                 }

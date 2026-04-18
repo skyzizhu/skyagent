@@ -244,6 +244,10 @@
 "settings.skill.rescan" = "Skills を再スキャン";
 "settings.skill.hint" = "`~/.agents/skills` と `~/.skyagent/skills` から skills を自動読み込みします。";
 "settings.skill.empty" = "利用可能な skills がまだありません。標準ディレクトリから検出するか、ローカル skill フォルダを読み込んでください。";
+"settings.skill.installing" = "Skill をインストール中…";
+"settings.skill.install_done" = "Skill をインストールしました。";
+"settings.skill.uninstalling" = "Skill を削除中…";
+"settings.skill.uninstall_done" = "Skill を削除しました。";
 "settings.profile.save_as" = "Profile として保存...";
 "settings.models.saved_profiles" = "追加済みモデル";
 "settings.models.add_more" = "モデルを追加";

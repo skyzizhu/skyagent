@@ -14,6 +14,9 @@ final class SkillManager: ObservableObject {
     private let registryURL: URL
     private let legacyAppSkillsDir: URL
     private let legacyRegistryURLs: [URL]
+    private let fileWorkQueue = DispatchQueue(label: "com.skyagent.skill-manager.file-work", qos: .utility)
+    private let remoteRefsLock = NSLock()
+    private var remoteRefsCache: [String: [String]] = [:]
 
     init() {
         let home = FileManager.default.homeDirectoryForCurrentUser
@@ -67,6 +70,52 @@ final class SkillManager: ObservableObject {
     }
 
     func installSkill(from folderURL: URL) throws {
+        _ = try copySkillToManagedDirectory(from: folderURL)
+        reloadSkills()
+    }
+
+    func uninstallSkill(_ skill: AgentSkill) throws {
+        try removeManagedSkillDirectory(for: skill)
+        reloadSkills()
+    }
+
+    func installSkillAsync(from folderURL: URL) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            fileWorkQueue.async { [self] in
+                do {
+                    _ = try copySkillToManagedDirectory(from: folderURL)
+                    DispatchQueue.main.async {
+                        self.reloadSkills()
+                        continuation.resume()
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        }
+    }
+
+    func uninstallSkillAsync(_ skill: AgentSkill) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            fileWorkQueue.async { [self] in
+                do {
+                    try removeManagedSkillDirectory(for: skill)
+                    DispatchQueue.main.async {
+                        self.reloadSkills()
+                        continuation.resume()
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        }
+    }
+
+    private func copySkillToManagedDirectory(from folderURL: URL) throws -> URL {
         let standardizedSource = folderURL.resolvingSymlinksInPath().standardizedFileURL
         guard fm.fileExists(atPath: standardizedSource.appendingPathComponent("SKILL.md").path) else {
             throw NSError(domain: "SkillManager", code: 1, userInfo: [NSLocalizedDescriptionKey: "所选目录中没有找到 SKILL.md"])
@@ -81,15 +130,14 @@ final class SkillManager: ObservableObject {
         }
 
         try fm.copyItem(at: standardizedSource, to: destination)
-        reloadSkills()
+        return destination
     }
 
-    func uninstallSkill(_ skill: AgentSkill) throws {
+    private func removeManagedSkillDirectory(for skill: AgentSkill) throws {
         guard skill.isAppManaged else {
             throw NSError(domain: "SkillManager", code: 2, userInfo: [NSLocalizedDescriptionKey: "当前版本仅支持卸载 ~/.skyagent/skills 目录中的 skill"])
         }
         try fm.removeItem(atPath: skill.skillDirectory)
-        reloadSkills()
     }
 
     func skill(withID id: String) -> AgentSkill? {
@@ -254,6 +302,55 @@ final class SkillManager: ObservableObject {
 
         if let skillPath = request.path {
             try runGit(arguments: ["-C", tempDir.path, "sparse-checkout", "set", skillPath])
+        }
+
+        let sourceDir = try resolveInstalledSkillSourceDir(
+            clonedRepoDir: tempDir,
+            requestedPath: request.path
+        )
+
+        let destinationName = request.name?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? request.name!.trimmingCharacters(in: .whitespacesAndNewlines)
+            : defaultInstalledDirectoryName(for: request, sourceDir: sourceDir)
+        let destination = appSkillsDir.appendingPathComponent(destinationName)
+        guard !fm.fileExists(atPath: destination.path) else {
+            throw NSError(domain: "SkillManager", code: 4, userInfo: [NSLocalizedDescriptionKey: "目标 skill 已存在：\(destinationName)"])
+        }
+
+        try fm.copyItem(at: sourceDir, to: destination)
+        reloadSkills()
+
+        guard let installed = installedSkills.first(where: { $0.skillDirectory == destination.standardizedFileURL.path }) else {
+            throw NSError(domain: "SkillManager", code: 5, userInfo: [NSLocalizedDescriptionKey: "skill 已复制到 ~/.skyagent/skills，但重新加载后没有找到它"])
+        }
+        return installed
+    }
+
+    func installSkillFromRemoteAsync(
+        url: String?,
+        repo: String?,
+        path: String?,
+        ref: String?,
+        name: String?
+    ) async throws -> AgentSkill {
+        let request = try await resolveRemoteInstallRequestAsync(url: url, repo: repo, path: path, ref: ref, name: name)
+        let tempDir = fm.temporaryDirectory.appendingPathComponent("skyagent-skill-\(UUID().uuidString)")
+        try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: tempDir) }
+
+        let repoURL = "https://github.com/\(request.repo).git"
+        var cloneArgs = ["clone", "--depth", "1"]
+        if request.path != nil {
+            cloneArgs.append(contentsOf: ["--filter=blob:none", "--sparse"])
+        }
+        if let ref = request.ref {
+            cloneArgs.append(contentsOf: ["--branch", ref])
+        }
+        cloneArgs.append(contentsOf: [repoURL, tempDir.path])
+        try await runGitAsync(arguments: cloneArgs)
+
+        if let skillPath = request.path {
+            try await runGitAsync(arguments: ["-C", tempDir.path, "sparse-checkout", "set", skillPath])
         }
 
         let sourceDir = try resolveInstalledSkillSourceDir(
@@ -459,6 +556,22 @@ final class SkillManager: ObservableObject {
         )
     }
 
+    func resolveRemoteInstallRequestAsync(url: String?, repo: String?, path: String?, ref: String?, name: String?) async throws -> RemoteSkillInstallRequest {
+        if let url, !url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return try await parseGitHubURLAsync(url, overrideName: name)
+        }
+
+        guard let repo, !repo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw NSError(domain: "SkillManager", code: 6, userInfo: [NSLocalizedDescriptionKey: "install_skill 需要提供 GitHub tree url，或者 repo + path"])
+        }
+        return RemoteSkillInstallRequest(
+            repo: repo.trimmingCharacters(in: .whitespacesAndNewlines),
+            path: path?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+            ref: ref?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "main",
+            name: name?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        )
+    }
+
     private func parseGitHubURL(_ raw: String, overrideName: String?) throws -> RemoteSkillInstallRequest {
         guard let url = URL(string: raw),
               let host = url.host?.lowercased(),
@@ -497,6 +610,44 @@ final class SkillManager: ObservableObject {
         )
     }
 
+    private func parseGitHubURLAsync(_ raw: String, overrideName: String?) async throws -> RemoteSkillInstallRequest {
+        guard let url = URL(string: raw),
+              let host = url.host?.lowercased(),
+              host == "github.com" else {
+            throw NSError(domain: "SkillManager", code: 7, userInfo: [NSLocalizedDescriptionKey: "当前只支持 GitHub URL"])
+        }
+
+        let parts = url.pathComponents.filter { $0 != "/" && !$0.isEmpty }
+        guard parts.count >= 2 else {
+            throw NSError(domain: "SkillManager", code: 8, userInfo: [NSLocalizedDescriptionKey: "GitHub URL 至少需要包含 owner/repo"])
+        }
+
+        let repo = "\(parts[0])/\(parts[1])"
+        if parts.count == 2 {
+            return RemoteSkillInstallRequest(
+                repo: repo,
+                path: nil,
+                ref: nil,
+                name: overrideName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            )
+        }
+
+        guard parts.count >= 4, parts[2] == "tree" else {
+            throw NSError(domain: "SkillManager", code: 8, userInfo: [NSLocalizedDescriptionKey: "GitHub URL 需要是仓库根路径，或具体的 tree 路径，例如 /owner/repo/tree/main/path/to/skill"])
+        }
+
+        let refAndPath = try resolveRefAndPath(
+            parts: Array(parts.dropFirst(3)),
+            knownRefs: await fetchRemoteRefsAsync(for: repo)
+        )
+        return RemoteSkillInstallRequest(
+            repo: repo,
+            path: refAndPath.path,
+            ref: refAndPath.ref,
+            name: overrideName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        )
+    }
+
     private func runGit(arguments: [String]) throws {
         let process = Process()
         let stdout = Pipe()
@@ -511,6 +662,18 @@ final class SkillManager: ObservableObject {
             let error = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             let message = [error, output].filter { !$0.isEmpty }.joined(separator: "\n")
+            throw NSError(domain: "SkillManager", code: 9, userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "git 命令执行失败" : message])
+        }
+    }
+
+    private func runGitAsync(arguments: [String]) async throws {
+        let result = try await AsyncProcessRunner.shared.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: arguments,
+            timeout: 120
+        )
+        guard result.terminationStatus == 0 else {
+            let message = result.combinedMessage
             throw NSError(domain: "SkillManager", code: 9, userInfo: [NSLocalizedDescriptionKey: message.isEmpty ? "git 命令执行失败" : message])
         }
     }
@@ -1170,7 +1333,40 @@ final class SkillManager: ObservableObject {
         !ref.isEmpty && !ref.hasPrefix("/") && !ref.hasSuffix("/")
     }
 
+    private func cachedRemoteRefs(for repo: String) -> [String]? {
+        remoteRefsLock.lock()
+        defer { remoteRefsLock.unlock() }
+        return remoteRefsCache[repo]
+    }
+
+    private func storeRemoteRefs(_ refs: [String], for repo: String) {
+        guard !refs.isEmpty else { return }
+        remoteRefsLock.lock()
+        remoteRefsCache[repo] = refs
+        remoteRefsLock.unlock()
+    }
+
+    private func parsedRemoteRefs(from output: String) -> [String] {
+        output
+            .components(separatedBy: .newlines)
+            .compactMap { line -> String? in
+                guard let refRange = line.range(of: "refs/") else { return nil }
+                let ref = String(line[refRange.lowerBound...])
+                if ref.hasPrefix("refs/heads/") {
+                    return String(ref.dropFirst("refs/heads/".count))
+                }
+                if ref.hasPrefix("refs/tags/") {
+                    return String(ref.dropFirst("refs/tags/".count))
+                }
+                return nil
+            }
+    }
+
     private func fetchRemoteRefs(for repo: String) -> [String] {
+        if let cached = cachedRemoteRefs(for: repo) {
+            return cached
+        }
+
         let repoURL = "https://github.com/\(repo).git"
         let process = Process()
         let stdout = Pipe()
@@ -1185,21 +1381,32 @@ final class SkillManager: ObservableObject {
             process.waitUntilExit()
             guard process.terminationStatus == 0 else { return [] }
             let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            return output
-                .components(separatedBy: .newlines)
-                .compactMap { line in
-                    guard let refRange = line.range(of: "refs/") else { return nil }
-                    let ref = String(line[refRange.lowerBound...])
-                    if ref.hasPrefix("refs/heads/") {
-                        return String(ref.dropFirst("refs/heads/".count))
-                    }
-                    if ref.hasPrefix("refs/tags/") {
-                        return String(ref.dropFirst("refs/tags/".count))
-                    }
-                    return nil
-                }
+            let refs = parsedRemoteRefs(from: output)
+            storeRemoteRefs(refs, for: repo)
+            return refs
         } catch {
             let _ = stderr.fileHandleForReading.readDataToEndOfFile()
+            return []
+        }
+    }
+
+    private func fetchRemoteRefsAsync(for repo: String) async -> [String] {
+        if let cached = cachedRemoteRefs(for: repo) {
+            return cached
+        }
+
+        let repoURL = "https://github.com/\(repo).git"
+        do {
+            let result = try await AsyncProcessRunner.shared.run(
+                executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+                arguments: ["ls-remote", "--heads", "--tags", repoURL],
+                timeout: 20
+            )
+            guard result.terminationStatus == 0 else { return [] }
+            let refs = parsedRemoteRefs(from: result.stdoutString)
+            storeRemoteRefs(refs, for: repo)
+            return refs
+        } catch {
             return []
         }
     }

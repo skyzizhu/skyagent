@@ -54,6 +54,7 @@ final class KnowledgeBaseOverviewViewModel: ObservableObject {
     @Published private(set) var maintenancePlan: KnowledgeMaintenancePlan?
     @Published private(set) var importHealthByLibraryID: [String: LibraryImportHealth] = [:]
     @Published private(set) var recentActivity: [PersistedLogEvent] = []
+    @Published private(set) var filteredLibrariesSnapshot: [KnowledgeLibrary] = []
     @Published private(set) var isRefreshing = false
     @Published private(set) var statusMessage: String?
     @Published private(set) var errorMessage: String?
@@ -82,6 +83,7 @@ final class KnowledgeBaseOverviewViewModel: ObservableObject {
         self.conversationStore = conversationStore
         self.service = service ?? .shared
         bindStore()
+        bindFilters()
         refreshSnapshot()
     }
 
@@ -98,13 +100,11 @@ final class KnowledgeBaseOverviewViewModel: ObservableObject {
     }
 
     var filteredLibraries: [KnowledgeLibrary] {
-        libraries.filter { library in
-            matchesFilter(library) && matchesSearch(library)
-        }
+        filteredLibrariesSnapshot
     }
 
     var filteredLibraryCount: Int {
-        filteredLibraries.count
+        filteredLibrariesSnapshot.count
     }
 
     var latestLibraryMigrationActivity: MigrationActivitySummary? {
@@ -425,6 +425,21 @@ final class KnowledgeBaseOverviewViewModel: ObservableObject {
             .store(in: &cancellables)
     }
 
+    private func bindFilters() {
+        $searchText
+            .debounce(for: .milliseconds(160), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.recomputeFilteredLibraries()
+            }
+            .store(in: &cancellables)
+
+        $selectedFilter
+            .sink { [weak self] _ in
+                self?.recomputeFilteredLibraries()
+            }
+            .store(in: &cancellables)
+    }
+
     private func refreshSnapshot() {
         let currentConversation = conversationStore.currentConversation
         let settingsSnapshot = conversationStore.settings
@@ -493,7 +508,15 @@ final class KnowledgeBaseOverviewViewModel: ObservableObject {
                 self.recentActivity = snapshot.recentActivity
                 self.maintenanceSummary = snapshot.maintenanceSummary
                 self.maintenancePlan = snapshot.maintenancePlan
+                self.recomputeFilteredLibraries(sourceLibraries: snapshot.libraries)
             }
+        }
+    }
+
+    private func recomputeFilteredLibraries(sourceLibraries: [KnowledgeLibrary]? = nil) {
+        let librarySnapshot = sourceLibraries ?? libraries
+        filteredLibrariesSnapshot = librarySnapshot.filter { library in
+            matchesFilter(library) && matchesSearch(library)
         }
     }
 

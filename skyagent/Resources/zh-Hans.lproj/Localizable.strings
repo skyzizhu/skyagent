@@ -244,6 +244,10 @@
 "settings.skill.rescan" = "重扫 Skills";
 "settings.skill.hint" = "会自动加载这两个全局目录中的所有 skills：`~/.agents/skills` 和 `~/.skyagent/skills`。";
 "settings.skill.empty" = "还没有可用的 skills。你可以从标准目录自动发现，或导入一个本地 skill 文件夹。";
+"settings.skill.installing" = "正在安装 Skill…";
+"settings.skill.install_done" = "Skill 已安装。";
+"settings.skill.uninstalling" = "正在卸载 Skill…";
+"settings.skill.uninstall_done" = "Skill 已移除。";
 "settings.profile.save_as" = "保存为 Profile...";
 "settings.models.saved_profiles" = "已添加模型";
 "settings.models.add_more" = "添加更多模型";

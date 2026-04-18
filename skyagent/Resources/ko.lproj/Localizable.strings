@@ -244,6 +244,10 @@
 "settings.skill.rescan" = "Skills 다시 스캔";
 "settings.skill.hint" = "`~/.agents/skills` 및 `~/.skyagent/skills` 에서 skills 를 자동으로 불러옵니다.";
 "settings.skill.empty" = "사용 가능한 skills 가 없습니다. 표준 디렉터리에서 자동으로 찾거나 로컬 skill 폴더를 가져오세요.";
+"settings.skill.installing" = "Skill 설치 중…";
+"settings.skill.install_done" = "Skill 이 설치되었습니다.";
+"settings.skill.uninstalling" = "Skill 제거 중…";
+"settings.skill.uninstall_done" = "Skill 이 제거되었습니다.";
 "settings.profile.save_as" = "Profile로 저장...";
 "settings.models.saved_profiles" = "추가된 모델";
 "settings.models.add_more" = "모델 추가";

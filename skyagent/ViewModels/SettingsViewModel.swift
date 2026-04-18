@@ -29,6 +29,10 @@ class SettingsViewModel: ObservableObject {
     @Published private(set) var knowledgeLibraryCount = 0
     @Published private(set) var knowledgeImportStatusMessage: String?
     @Published private(set) var isKnowledgeImportRunning = false
+    @Published private(set) var isSkillOperationRunning = false
+    @Published private(set) var skillOperationStatusMessage: String?
+    @Published private(set) var installedSkillsSnapshot: [AgentSkill] = []
+    @Published private(set) var groupedAvailableSkillsSnapshot: [(source: AgentSkillSourceType, skills: [AgentSkill])] = []
 
     private var cancellables = Set<AnyCancellable>()
     private var knowledgeLibraryRefreshToken = UUID()
@@ -51,6 +55,7 @@ class SettingsViewModel: ObservableObject {
         self.draftRequireCommandReturnToSend = s.requireCommandReturnToSend
         self.draftProfiles = s.profiles
         self.selectedProfileId = s.activeProfileId ?? s.profiles.first?.id
+        refreshSkillCatalog()
         refreshLogs()
         refreshKnowledgeLibrary()
         observeStoreChanges()
@@ -174,34 +179,68 @@ class SettingsViewModel: ObservableObject {
         selectedProfileId = s.activeProfileId ?? s.profiles.first?.id
     }
 
-    var installedSkills: [AgentSkill] { skillManager.installedSkills }
+    var installedSkills: [AgentSkill] { installedSkillsSnapshot }
 
     var groupedAvailableSkills: [(source: AgentSkillSourceType, skills: [AgentSkill])] {
-        let available = skillManager.availableSkills
-        let groups = Dictionary(grouping: available, by: \.sourceType)
-        return groups.keys.sorted { $0.sortOrder < $1.sortOrder }.map { key in
-            (source: key, skills: groups[key]!.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })
-        }
+        groupedAvailableSkillsSnapshot
     }
 
     func reloadSkills() {
         skillManager.reloadSkills()
+        refreshSkillCatalog()
     }
 
     func installSkill(from folderURL: URL) {
-        do {
-            try skillManager.installSkill(from: folderURL)
-        } catch {
-            skillManager.lastErrorMessage = error.localizedDescription
+        guard !isSkillOperationRunning else { return }
+        isSkillOperationRunning = true
+        skillOperationStatusMessage = L10n.tr("settings.skill.installing")
+        skillManager.lastErrorMessage = nil
+
+        Task {
+            defer { isSkillOperationRunning = false }
+            do {
+                try await skillManager.installSkillAsync(from: folderURL)
+                skillOperationStatusMessage = L10n.tr("settings.skill.install_done")
+            } catch {
+                skillManager.lastErrorMessage = error.localizedDescription
+                skillOperationStatusMessage = nil
+            }
         }
     }
 
     func uninstallSkill(_ skill: AgentSkill) {
-        do {
-            try skillManager.uninstallSkill(skill)
-        } catch {
-            skillManager.lastErrorMessage = error.localizedDescription
+        guard !isSkillOperationRunning else { return }
+        isSkillOperationRunning = true
+        skillOperationStatusMessage = L10n.tr("settings.skill.uninstalling")
+        skillManager.lastErrorMessage = nil
+
+        Task {
+            defer { isSkillOperationRunning = false }
+            do {
+                try await skillManager.uninstallSkillAsync(skill)
+                skillOperationStatusMessage = L10n.tr("settings.skill.uninstall_done")
+            } catch {
+                skillManager.lastErrorMessage = error.localizedDescription
+                skillOperationStatusMessage = nil
+            }
         }
+    }
+
+    private func refreshSkillCatalog() {
+        let installed = skillManager.installedSkills
+        installedSkillsSnapshot = installed
+
+        let groups = Dictionary(grouping: installed, by: \.sourceType)
+        groupedAvailableSkillsSnapshot = groups.keys
+            .sorted { $0.sortOrder < $1.sortOrder }
+            .map { key in
+                (
+                    source: key,
+                    skills: (groups[key] ?? []).sorted {
+                        $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                    }
+                )
+            }
     }
 
     var mcpServers: [MCPServerConfig] { mcpManager.servers }
@@ -319,6 +358,13 @@ class SettingsViewModel: ObservableObject {
     }
 
     private func observeStoreChanges() {
+        skillManager.$installedSkills
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.refreshSkillCatalog()
+            }
+            .store(in: &cancellables)
+
         store.$currentConversationId
             .sink { [weak self] _ in
                 self?.refreshKnowledgeLibrary()

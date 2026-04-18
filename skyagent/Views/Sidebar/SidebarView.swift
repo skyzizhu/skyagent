@@ -224,13 +224,14 @@ struct SidebarView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 6) {
-                    ForEach(viewModel.filteredConversations) { conv in
+                    ForEach(viewModel.filteredConversationRows) { row in
+                        let conv = row.conversation
                         Button {
                             appState.closeSettings()
                             viewModel.selectConversation(conv.id)
                         } label: {
                             ConversationRowView(
-                                conv: conv,
+                                row: row,
                                 isCurrent: store.currentConversationId == conv.id
                             )
                             .frame(maxWidth: .infinity, alignment: .leading)

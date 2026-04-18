@@ -16,7 +16,7 @@ struct KnowledgeBaseOverviewView: View {
             header
             Divider()
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+                LazyVStack(alignment: .leading, spacing: 18) {
                     statusSection
                     summarySection
                     healthSection
@@ -316,15 +316,18 @@ struct KnowledgeBaseOverviewView: View {
         ) {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(spacing: 10) {
-                    Button(L10n.tr("settings.knowledge.activity.open_logs")) {
-                        viewModel.openEventLogsFolder()
-                    }
-                    .buttonStyle(.bordered)
+                    Menu {
+                        Button(L10n.tr("settings.knowledge.activity.open_logs")) {
+                            viewModel.openEventLogsFolder()
+                        }
 
-                    Button(L10n.tr("settings.knowledge.activity.open_sidecar_logs")) {
-                        viewModel.openSidecarLogsFolder()
+                        Button(L10n.tr("settings.knowledge.activity.open_sidecar_logs")) {
+                            viewModel.openSidecarLogsFolder()
+                        }
+                    } label: {
+                        Label(L10n.tr("settings.knowledge.activity.open_logs"), systemImage: "folder")
                     }
-                    .buttonStyle(.bordered)
+                    .menuStyle(.borderlessButton)
 
                     Spacer()
                 }

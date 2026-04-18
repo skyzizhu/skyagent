@@ -1356,8 +1356,11 @@ private final class MCPStdioSession: @unchecked Sendable {
                !message.isEmpty {
                 return message
             }
-            let request = activeRequestMethod?.replacingOccurrences(of: "/", with: " ")
-            return request == nil ? "MCP 正在处理中" : "MCP 正在处理 \(request!)"
+            if let request = activeRequestMethod?.replacingOccurrences(of: "/", with: " "),
+               !request.isEmpty {
+                return "MCP 正在处理 \(request)"
+            }
+            return "MCP 正在处理中"
         }
     }
 }

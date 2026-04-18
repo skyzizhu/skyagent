@@ -20,9 +20,10 @@ class ToolRunner {
     private var activeSkillIDs: [String] = []
     private var activeAttachmentIDs: [String] = []
     private var currentConversationID: UUID?
-    private var cachedShellEnvironment: [String: String]?
     private var cachedDocumentPythonPath: String?
     private var cachedDocumentPythonModules: [String: Bool]?
+    private let documentCapabilityLock = NSLock()
+    private var isDocumentCapabilityWarmupInFlight = false
     private let activeProcessLock = NSLock()
     private var activeProcess: Process?
     private var latestAssistantDraft = ""
@@ -119,6 +120,7 @@ class ToolRunner {
         try? FileManager.default.createDirectory(atPath: undoBaseDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(atPath: compatibilityBinDir, withIntermediateDirectories: true)
         ensureCompatibilityShims()
+        preloadDocumentCapabilitiesIfNeeded()
     }
 
     /// 切换到指定会话的权限设置
@@ -520,13 +522,15 @@ class ToolRunner {
                 let normalized = normalizedLargeOutputOutcome(outcome, for: tool)
                 return advisedOutcome(for: normalized, tool: tool, params: params)
             }
-            return executeBlocking(
-                name: name,
-                arguments: arguments,
+            let outcome = await executePreparedAsync(
+                tool: tool,
+                params: params,
                 operationId: operationId,
                 assistantContentOverride: assistantContentOverride,
                 onProgress: onProgress
             )
+            let normalized = normalizedLargeOutputOutcome(outcome, for: tool)
+            return advisedOutcome(for: normalized, tool: tool, params: params)
         }
     }
 
@@ -767,7 +771,7 @@ class ToolRunner {
         case .activateSkill:
             outcome = activateSkill(named: params["name"] as? String ?? "", operationId: operationId)
         case .installSkill:
-            outcome = installSkill(
+            outcome = installSkillBlocking(
                 url: params["url"] as? String,
                 repo: params["repo"] as? String,
                 path: params["path"] as? String,
@@ -811,6 +815,34 @@ class ToolRunner {
             )
         }
         return outcome
+    }
+
+    private func executePreparedAsync(
+        tool: ToolDefinition.ToolName,
+        params: [String: Any],
+        operationId: String,
+        assistantContentOverride: String? = nil,
+        onProgress: ((String) -> Void)? = nil
+    ) async -> ToolExecutionOutcome {
+        switch tool {
+        case .installSkill:
+            return await installSkill(
+                url: params["url"] as? String,
+                repo: params["repo"] as? String,
+                path: params["path"] as? String,
+                ref: params["ref"] as? String,
+                name: params["name"] as? String,
+                operationId: operationId
+            )
+        default:
+            return executePrepared(
+                tool: tool,
+                params: params,
+                operationId: operationId,
+                assistantContentOverride: assistantContentOverride,
+                onProgress: onProgress
+            )
+        }
     }
 
     private func normalizedLargeOutputOutcome(
@@ -1911,7 +1943,7 @@ class ToolRunner {
                 summary: "已导出 PDF 到 \(destination)",
                 detailLines: [
                     "格式：PDF",
-                    "标题：\(title?.isEmpty == false ? title! : "(未设置)")",
+                    "标题：\(title.flatMap { $0.isEmpty ? nil : $0 } ?? "(未设置)")",
                     "目标：\(destination)"
                 ],
                 toolName: ToolDefinition.ToolName.exportPDF.rawValue
@@ -1953,7 +1985,7 @@ class ToolRunner {
                 summary: "已导出 Word 到 \(destination)",
                 detailLines: [
                     "格式：DOCX",
-                    "标题：\(title?.isEmpty == false ? title! : "(未设置)")",
+                    "标题：\(title.flatMap { $0.isEmpty ? nil : $0 } ?? "(未设置)")",
                     "图片数：\(images.count)",
                     "目标：\(destination)"
                 ],
@@ -2029,7 +2061,7 @@ class ToolRunner {
                 summary: "已写入 Word 到 \(destination)",
                 detailLines: [
                     "格式：DOCX",
-                    "标题：\(title?.isEmpty == false ? title! : "(未设置)")",
+                    "标题：\(title.flatMap { $0.isEmpty ? nil : $0 } ?? "(未设置)")",
                     "图片数：\(images.count)",
                     "目标：\(destination)"
                 ],
@@ -2172,9 +2204,9 @@ class ToolRunner {
                 operationId: operationId,
                 successPrefix: "✅ 已插入 Word 章节",
                 operationTitle: "插入 Word 章节",
-                summary: updated.insertedAfter == nil
-                    ? "已在文末插入 \(trimmedSectionTitle)"
-                    : "已在 \(updated.insertedAfter!) 后插入 \(trimmedSectionTitle)",
+                summary: updated.insertedAfter.map {
+                    "已在 \($0) 后插入 \(trimmedSectionTitle)"
+                } ?? "已在文末插入 \(trimmedSectionTitle)",
                 detailLines: [
                     "格式：DOCX",
                     "新章节：\(trimmedSectionTitle)",
@@ -3597,7 +3629,9 @@ class ToolRunner {
         var index = index
         var result = ""
         repeat {
-            result = String(UnicodeScalar(65 + (index % 26))!) + result
+            let scalarValue = 65 + (index % 26)
+            guard let scalar = UnicodeScalar(scalarValue) else { return result }
+            result = String(scalar) + result
             index = index / 26 - 1
         } while index >= 0
         return result
@@ -3670,7 +3704,54 @@ class ToolRunner {
         )
     }
 
-    private func installSkill(url: String?, repo: String?, path: String?, ref: String?, name: String?, operationId: String) -> ToolExecutionOutcome {
+    private func installSkill(url: String?, repo: String?, path: String?, ref: String?, name: String?, operationId: String) async -> ToolExecutionOutcome {
+        do {
+            let installed = try await skillManager.installSkillFromRemoteAsync(
+                url: url,
+                repo: repo,
+                path: path,
+                ref: ref,
+                name: name
+            )
+            let normalizedInstalledPath = canonicalPathForComparison(installed.skillDirectory)
+            if !allowedReadRoots.contains(normalizedInstalledPath) {
+                allowedReadRoots.append(normalizedInstalledPath)
+            }
+            let operation = FileOperationRecord(
+                id: operationId,
+                toolName: ToolDefinition.ToolName.installSkill.rawValue,
+                title: "安装 Skill",
+                summary: "已安装 \(installed.name) 到 ~/.skyagent/skills",
+                detailLines: [
+                    "Skill：\(installed.name)",
+                    "目录：\(installed.skillDirectory)",
+                    "来源：\(installed.sourceType.displayName)",
+                    installed.hasScripts ? "提示：这个 skill 含有 scripts/；沙盒模式下可执行本地脚本但网络会被拦截，开放模式下可正常访问网络" : "提示：这个 skill 不依赖脚本执行",
+                    installed.requiredEnvironmentVariables.isEmpty
+                        ? "环境变量：未声明必需环境变量"
+                        : "环境变量：\(installed.requiredEnvironmentVariables.joined(separator: ", "))",
+                    "下一步：如果当前任务需要使用它，请立即调用 activate_skill"
+                ],
+                createdAt: Date(),
+                undoAction: UndoAction(kind: .deleteCreatedItem, targetPath: installed.skillDirectory, backupPath: nil),
+                isUndone: false
+            )
+            return ToolExecutionOutcome(
+                output: """
+                ✅ 已安装 skill：\(installed.name)
+                目录：\(installed.skillDirectory)
+                \(installed.hasScripts ? "该 skill 含有 scripts/；沙盒模式下可执行本地脚本但网络会被拦截，开放模式下可正常访问网络。" : "")
+                \(installed.requiredEnvironmentVariables.isEmpty ? "" : "该 skill 声明的环境变量：\(installed.requiredEnvironmentVariables.joined(separator: ", ")).")
+                现在这个 skill 已经可用。如果当前任务就要使用它，请继续调用 activate_skill(name: "\(installed.name)").
+                """,
+                operation: operation
+            )
+        } catch {
+            return ToolExecutionOutcome(output: "[错误] 下载并安装 skill 失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func installSkillBlocking(url: String?, repo: String?, path: String?, ref: String?, name: String?, operationId: String) -> ToolExecutionOutcome {
         do {
             let installed = try skillManager.installSkillFromRemote(
                 url: url,
@@ -4233,24 +4314,74 @@ class ToolRunner {
         return uniqueRequired.filter { available[$0] != true }
     }
 
-    private func resolveCommandPath(_ command: String) -> String? {
-        let process = Process()
-        let stdout = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-        process.arguments = [command]
-        process.environment = resolvedExecutionEnvironment()
-        process.standardOutput = stdout
-        process.standardError = Pipe()
-        do {
-            try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else { return nil }
-            let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            return (output?.isEmpty == false) ? output : nil
-        } catch {
-            return nil
+    private func preloadDocumentCapabilitiesIfNeeded() {
+        documentCapabilityLock.lock()
+        let shouldStart = cachedDocumentPythonModules == nil && !isDocumentCapabilityWarmupInFlight
+        if shouldStart {
+            isDocumentCapabilityWarmupInFlight = true
         }
+        documentCapabilityLock.unlock()
+
+        guard shouldStart else { return }
+
+        let compatibilityBinDir = self.compatibilityBinDir
+        let fallbackEnvironment = ProcessExecutionEnvironment.shared.resolvedEnvironment(
+            prependPathEntries: [compatibilityBinDir]
+        )
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            let pythonPath = self.resolvedDocumentPythonPath(environment: fallbackEnvironment)
+            Task { @MainActor in
+                let modules = await self.fetchDocumentPythonModulesAsync(using: pythonPath)
+                self.storePreloadedDocumentCapabilities(pythonPath: pythonPath, modules: modules)
+            }
+        }
+    }
+
+    private func storePreloadedDocumentCapabilities(pythonPath: String?, modules: [String: Bool]) {
+        documentCapabilityLock.lock()
+        if let pythonPath, cachedDocumentPythonPath == nil {
+            cachedDocumentPythonPath = pythonPath
+        }
+        if !modules.isEmpty {
+            cachedDocumentPythonModules = modules
+        }
+        isDocumentCapabilityWarmupInFlight = false
+        documentCapabilityLock.unlock()
+    }
+
+    private func fetchDocumentPythonModulesAsync(using pythonPath: String?) async -> [String: Bool] {
+        guard let pythonPath else { return [:] }
+
+        do {
+            let result = try await AsyncProcessRunner.shared.run(
+                executableURL: URL(fileURLWithPath: pythonPath),
+                arguments: [
+                    "-c",
+                    """
+                    import importlib.util, json
+                    mods = ["docx", "openpyxl", "PIL"]
+                    print(json.dumps({m: importlib.util.find_spec(m) is not None for m in mods}))
+                    """
+                ],
+                timeout: 5
+            )
+            guard result.terminationStatus == 0,
+                  let object = try JSONSerialization.jsonObject(with: result.stdout) as? [String: Bool] else {
+                return [:]
+            }
+            return object
+        } catch {
+            return [:]
+        }
+    }
+
+    private func resolveCommandPath(_ command: String) -> String? {
+        ProcessExecutionEnvironment.shared.resolveCommandPath(
+            command,
+            environment: resolvedExecutionEnvironment()
+        )
     }
 
     private func normalizedWorkspaceExecutionDirectory() -> String {
@@ -4273,21 +4404,9 @@ class ToolRunner {
     private func resolvedExecutionEnvironment() -> [String: String] {
         ensureCompatibilityShims()
 
-        var environment = ProcessInfo.processInfo.environment
-        for (key, value) in loadShellStartupEnvironment() {
-            if !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                environment[key] = value
-            }
-        }
-
-        let currentPath = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-        let pathSegments = currentPath
-            .split(separator: ":")
-            .map(String.init)
-            .filter { !$0.isEmpty }
-        if !pathSegments.contains(compatibilityBinDir) {
-            environment["PATH"] = ([compatibilityBinDir] + pathSegments).joined(separator: ":")
-        }
+        var environment = ProcessExecutionEnvironment.shared.resolvedEnvironment(
+            prependPathEntries: [compatibilityBinDir]
+        )
 
         if let documentPython = resolvedDocumentPythonPath(environment: environment) {
             environment["MINIAGENT_DOC_PYTHON"] = documentPython
@@ -4357,50 +4476,6 @@ class ToolRunner {
             cachedDocumentPythonModules = object
             return object
         } catch {
-            return [:]
-        }
-    }
-
-    private func loadShellStartupEnvironment() -> [String: String] {
-        if let cachedShellEnvironment {
-            return cachedShellEnvironment
-        }
-
-        let process = Process()
-        let stdout = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [
-            "-lc",
-            "source ~/.bashrc >/dev/null 2>&1 || true; source ~/.bash_profile >/dev/null 2>&1 || true; source ~/.profile >/dev/null 2>&1 || true; env -0"
-        ]
-        process.standardOutput = stdout
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else {
-                cachedShellEnvironment = [:]
-                return [:]
-            }
-
-            let data = stdout.fileHandleForReading.readDataToEndOfFile()
-            guard let raw = String(data: data, encoding: .utf8) else {
-                cachedShellEnvironment = [:]
-                return [:]
-            }
-
-            var environment: [String: String] = [:]
-            for entry in raw.split(separator: "\0") {
-                guard let separator = entry.firstIndex(of: "=") else { continue }
-                let key = String(entry[..<separator])
-                let value = String(entry[entry.index(after: separator)...])
-                environment[key] = value
-            }
-            cachedShellEnvironment = environment
-            return environment
-        } catch {
-            cachedShellEnvironment = [:]
             return [:]
         }
     }

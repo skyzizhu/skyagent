@@ -19,7 +19,7 @@ struct KnowledgeBaseLibraryView: View {
             header
             Divider()
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+                LazyVStack(alignment: .leading, spacing: 18) {
                     statusSection
                     overviewSection
                     storageSection
@@ -152,15 +152,18 @@ struct KnowledgeBaseLibraryView: View {
                 }
                 .buttonStyle(.bordered)
 
-                Button(L10n.tr("settings.knowledge.open_index")) {
-                    NSWorkspace.shared.open(AppStoragePaths.knowledgeLibrariesFile)
-                }
-                .buttonStyle(.bordered)
+                Menu {
+                    Button(L10n.tr("settings.knowledge.open_index")) {
+                        NSWorkspace.shared.open(AppStoragePaths.knowledgeLibrariesFile)
+                    }
 
-                Button(L10n.tr("settings.knowledge.open_imports")) {
-                    NSWorkspace.shared.open(AppStoragePaths.knowledgeImportsFile)
+                    Button(L10n.tr("settings.knowledge.open_imports")) {
+                        NSWorkspace.shared.open(AppStoragePaths.knowledgeImportsFile)
+                    }
+                } label: {
+                    Label(L10n.tr("common.more"), systemImage: "ellipsis.circle")
                 }
-                .buttonStyle(.bordered)
+                .menuStyle(.borderlessButton)
             }
 
             HStack(spacing: 10) {
@@ -375,15 +378,18 @@ struct KnowledgeBaseLibraryView: View {
         ) {
             VStack(alignment: .leading, spacing: 14) {
                 HStack(spacing: 10) {
-                    Button(L10n.tr("settings.knowledge.activity.open_logs")) {
-                        viewModel.openEventLogsFolder()
-                    }
-                    .buttonStyle(.bordered)
+                    Menu {
+                        Button(L10n.tr("settings.knowledge.activity.open_logs")) {
+                            viewModel.openEventLogsFolder()
+                        }
 
-                    Button(L10n.tr("settings.knowledge.activity.open_sidecar_logs")) {
-                        viewModel.openSidecarLogsFolder()
+                        Button(L10n.tr("settings.knowledge.activity.open_sidecar_logs")) {
+                            viewModel.openSidecarLogsFolder()
+                        }
+                    } label: {
+                        Label(L10n.tr("settings.knowledge.activity.open_logs"), systemImage: "folder")
                     }
-                    .buttonStyle(.bordered)
+                    .menuStyle(.borderlessButton)
 
                     Spacer()
                 }
@@ -471,24 +477,27 @@ struct KnowledgeBaseLibraryView: View {
                                     }
                                     .buttonStyle(.bordered)
 
-                                    Button(L10n.tr("settings.knowledge.manager.document_reimport")) {
-                                        Task { await viewModel.reimportDocument(document) }
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .disabled(viewModel.isBusy || (document.originalPath ?? "").isEmpty)
+                                    Menu {
+                                        Button(L10n.tr("settings.knowledge.manager.document_reimport")) {
+                                            Task { await viewModel.reimportDocument(document) }
+                                        }
+                                        .disabled(viewModel.isBusy || (document.originalPath ?? "").isEmpty)
 
-                                    Button(L10n.tr("settings.knowledge.manager.open_source")) {
-                                        viewModel.openSource(for: document)
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .disabled((document.originalPath ?? "").isEmpty)
+                                        Button(L10n.tr("settings.knowledge.manager.open_source")) {
+                                            viewModel.openSource(for: document)
+                                        }
+                                        .disabled((document.originalPath ?? "").isEmpty)
 
-                                    Button(L10n.tr("settings.knowledge.manager.delete_document")) {
-                                        documentPendingDeletion = document
+                                        Divider()
+
+                                        Button(L10n.tr("settings.knowledge.manager.delete_document"), role: .destructive) {
+                                            documentPendingDeletion = document
+                                        }
+                                        .disabled(viewModel.isBusy)
+                                    } label: {
+                                        Label(L10n.tr("common.more"), systemImage: "ellipsis.circle")
                                     }
-                                    .buttonStyle(.bordered)
-                                    .tint(.red)
-                                    .disabled(viewModel.isBusy)
+                                    .menuStyle(.borderlessButton)
                                 }
                             }
                             .padding(14)
@@ -508,7 +517,10 @@ struct KnowledgeBaseLibraryView: View {
     }
 
     private var querySection: some View {
-        sectionCard(
+        let shouldShowClearButton = !viewModel.queryResults.isEmpty || !viewModel.queryText.isEmpty
+        let canRunQuery = !viewModel.isQueryRunning && !viewModel.queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
+        return sectionCard(
             title: L10n.tr("settings.knowledge.manager.query_title"),
             subtitle: L10n.tr("settings.knowledge.manager.query_subtitle")
         ) {
@@ -521,9 +533,9 @@ struct KnowledgeBaseLibraryView: View {
                         Task { await viewModel.runQuery() }
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(viewModel.isQueryRunning || viewModel.queryText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(!canRunQuery)
 
-                    if !viewModel.queryResults.isEmpty || !viewModel.queryText.isEmpty {
+                    if shouldShowClearButton {
                         Button(L10n.tr("settings.knowledge.manager.query_clear")) {
                             viewModel.clearQueryResults()
                         }
@@ -545,63 +557,73 @@ struct KnowledgeBaseLibraryView: View {
                 if !viewModel.queryResults.isEmpty {
                     LazyVStack(alignment: .leading, spacing: 10) {
                         ForEach(viewModel.queryResults) { hit in
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                    Text(hit.title?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? hit.title! : L10n.tr("chat.knowledge.reference_default_title"))
-                                        .font(.system(size: 13.5, weight: .semibold, design: .rounded))
-                                        .lineLimit(1)
-
-                                    Spacer()
-
-                                    Text(String(format: "%.2f", hit.score))
-                                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 3)
-                                        .background(Capsule().fill(Color.primary.opacity(0.06)))
-                                }
-
-                                if let citation = hit.citation, !citation.isEmpty {
-                                    Text(citation)
-                                        .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
-                                        .foregroundStyle(.secondary)
-                                }
-
-                                Text(hit.snippet)
-                                    .font(.system(size: 12, design: .rounded))
-                                    .foregroundStyle(.secondary)
-                                    .fixedSize(horizontal: false, vertical: true)
-                                    .textSelection(.enabled)
-
-                                HStack(spacing: 10) {
-                                    if hit.documentID != nil {
-                                        Button(L10n.tr("settings.knowledge.document_detail.open")) {
-                                            viewModel.openDocumentFromHit(hit)
-                                        }
-                                        .buttonStyle(.bordered)
-                                    }
-
-                                    Button(L10n.tr("settings.knowledge.manager.open_source")) {
-                                        viewModel.openSource(for: hit)
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .disabled((hit.source?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) && hit.documentID == nil)
-                                }
-                            }
-                            .padding(14)
-                            .background(
-                                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                    .fill(Color.primary.opacity(0.03))
-                            )
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                    .stroke(Color.primary.opacity(0.06), lineWidth: 0.8)
-                            )
+                            queryResultRow(hit)
                         }
                     }
                 }
             }
         }
+    }
+
+    private func queryResultRow(_ hit: RetrievalHit) -> some View {
+        let normalizedTitle = hit.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = normalizedTitle?.isEmpty == false ? normalizedTitle : nil
+        let normalizedCitation = hit.citation?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let citation = normalizedCitation?.isEmpty == false ? normalizedCitation : nil
+        let canOpenSource = !(hit.source?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true) || hit.documentID != nil
+
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(title ?? L10n.tr("chat.knowledge.reference_default_title"))
+                    .font(.system(size: 13.5, weight: .semibold, design: .rounded))
+                    .lineLimit(1)
+
+                Spacer()
+
+                Text(String(format: "%.2f", hit.score))
+                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(Color.primary.opacity(0.06)))
+            }
+
+            if let citation {
+                Text(citation)
+                    .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(hit.snippet)
+                .font(.system(size: 12, design: .rounded))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+
+            HStack(spacing: 10) {
+                if hit.documentID != nil {
+                    Button(L10n.tr("settings.knowledge.document_detail.open")) {
+                        viewModel.openDocumentFromHit(hit)
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Button(L10n.tr("settings.knowledge.manager.open_source")) {
+                    viewModel.openSource(for: hit)
+                }
+                .buttonStyle(.bordered)
+                .disabled(!canOpenSource)
+            }
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.primary.opacity(0.03))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.primary.opacity(0.06), lineWidth: 0.8)
+        )
     }
 
     private var importsSection: some View {
@@ -761,19 +783,22 @@ struct KnowledgeBaseLibraryView: View {
                                     .buttonStyle(.bordered)
                                     .disabled(job.source.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
-                                    if job.status == .failed {
-                                        Button(L10n.tr("settings.knowledge.manager.import_retry")) {
-                                            Task { await viewModel.retryImportJob(job) }
+                                    Menu {
+                                        if job.status == .failed {
+                                            Button(L10n.tr("settings.knowledge.manager.import_retry")) {
+                                                Task { await viewModel.retryImportJob(job) }
+                                            }
+                                            .disabled(viewModel.isBusy || viewModel.mutatingImportJobIDs.contains(job.id))
                                         }
-                                        .buttonStyle(.bordered)
-                                        .disabled(viewModel.isBusy || viewModel.mutatingImportJobIDs.contains(job.id))
-                                    }
 
-                                    Button(L10n.tr("settings.knowledge.manager.import_remove")) {
-                                        Task { await viewModel.removeImportJob(job) }
+                                        Button(L10n.tr("settings.knowledge.manager.import_remove"), role: .destructive) {
+                                            Task { await viewModel.removeImportJob(job) }
+                                        }
+                                        .disabled(viewModel.isBusy || viewModel.mutatingImportJobIDs.contains(job.id))
+                                    } label: {
+                                        Label(L10n.tr("common.more"), systemImage: "ellipsis.circle")
                                     }
-                                    .buttonStyle(.bordered)
-                                    .disabled(viewModel.isBusy || viewModel.mutatingImportJobIDs.contains(job.id))
+                                    .menuStyle(.borderlessButton)
                                 }
                             }
                             .padding(14)

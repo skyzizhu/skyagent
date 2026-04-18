@@ -219,14 +219,19 @@ struct MessageBubbleView: View, Equatable {
 private struct KnowledgeReferenceMessageView: View {
     let title: String
     let references: [KnowledgeReferenceRecord]
+    private let groups: [KnowledgeReferenceGroup]
+    private let libraryNames: [String]
     @State private var isExpanded = true
 
-    private var groups: [KnowledgeReferenceGroup] {
+    init(title: String, references: [KnowledgeReferenceRecord]) {
+        self.title = title
+        self.references = references
+
         var orderedKeys: [String] = []
         var grouped: [String: [KnowledgeReferenceRecord]] = [:]
 
         for reference in references {
-            let key = groupingKey(for: reference)
+            let key = Self.groupingKey(for: reference)
             if grouped[key] == nil {
                 orderedKeys.append(key)
                 grouped[key] = []
@@ -234,13 +239,11 @@ private struct KnowledgeReferenceMessageView: View {
             grouped[key, default: []].append(reference)
         }
 
-        return orderedKeys.compactMap { key in
+        self.groups = orderedKeys.compactMap { key in
             guard let items = grouped[key], !items.isEmpty else { return nil }
             return KnowledgeReferenceGroup(key: key, references: items)
         }
-    }
 
-    private var libraryNames: [String] {
         var seen = Set<String>()
         var ordered: [String] = []
 
@@ -253,7 +256,7 @@ private struct KnowledgeReferenceMessageView: View {
             ordered.append(libraryName)
         }
 
-        return ordered
+        self.libraryNames = ordered
     }
 
     var body: some View {
@@ -324,7 +327,7 @@ private struct KnowledgeReferenceMessageView: View {
         )
     }
 
-    private func groupingKey(for reference: KnowledgeReferenceRecord) -> String {
+    private static func groupingKey(for reference: KnowledgeReferenceRecord) -> String {
         let source = reference.source?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !source.isEmpty {
             return source
@@ -342,9 +345,11 @@ private struct KnowledgeReferenceGroup: Identifiable {
 
 private struct KnowledgeReferenceGroupView: View {
     let group: KnowledgeReferenceGroup
+    private let groupLibraryName: String?
     @State private var isExpanded = true
 
-    private var groupLibraryName: String? {
+    init(group: KnowledgeReferenceGroup) {
+        self.group = group
         let names = Array(
             NSOrderedSet(
                 array: group.references.compactMap {
@@ -353,7 +358,7 @@ private struct KnowledgeReferenceGroupView: View {
                 }
             )
         ) as? [String] ?? []
-        return names.count == 1 ? names[0] : nil
+        self.groupLibraryName = names.count == 1 ? names[0] : nil
     }
 
     var body: some View {

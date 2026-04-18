@@ -762,8 +762,10 @@ final class MCPServerManager: ObservableObject {
                     isEnabled: server.isEnabled
                 )
             )
-            persistToken(server.authToken, for: merged.last!)
-            persistAdditionalSecretHeaders(headerSplit.secretHeaders, for: merged.last!)
+            if let importedServer = merged.last {
+                persistToken(server.authToken, for: importedServer)
+                persistAdditionalSecretHeaders(headerSplit.secretHeaders, for: importedServer)
+            }
             importedCount += 1
         }
 

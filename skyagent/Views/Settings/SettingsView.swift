@@ -3,6 +3,7 @@ import AppKit
 import UniformTypeIdentifiers
 
 private extension Double {
+    nonisolated
     var formattedMilliseconds: String {
         "\(Int(self)) ms"
     }
@@ -48,6 +49,15 @@ struct SettingsView: View {
         var slowTraces: [SlowTraceSummary] = []
         var focusedTraceID: String?
         var focusedTraceEntries: [PersistedLogEvent] = []
+        var focusedTraceTiming = TraceTimingSummary(
+            firstTokenMs: nil,
+            llmTotalMs: nil,
+            longestToolMs: nil,
+            mcpInitializeMs: nil,
+            skillScriptMs: nil,
+            shellMs: nil
+        )
+        var focusedTraceStages: [TraceStageSummary] = []
     }
 
     enum LogQuickFilter: String, CaseIterable, Identifiable {
@@ -339,7 +349,7 @@ struct SettingsView: View {
     private var contentPanel: some View {
         VStack(spacing: 0) {
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+                LazyVStack(alignment: .leading, spacing: 18) {
                     if displayMode == .embedded {
                         embeddedTopBar
                     }
@@ -620,13 +630,21 @@ struct SettingsView: View {
                         }
                     }
                     .buttonStyle(.bordered)
+                    .disabled(viewModel.isSkillOperationRunning)
 
                     Button(L10n.tr("settings.skill.rescan")) {
                         viewModel.reloadSkills()
                     }
                     .buttonStyle(.bordered)
+                    .disabled(viewModel.isSkillOperationRunning)
 
                     Spacer()
+                }
+
+                if let status = viewModel.skillOperationStatusMessage, !status.isEmpty {
+                    Text(status)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 Text(L10n.tr("settings.skill.hint"))
@@ -814,6 +832,10 @@ struct SettingsView: View {
                             .buttonStyle(.borderedProminent)
                             .disabled(viewModel.isKnowledgeImportRunning)
 
+                            Spacer()
+                        }
+
+                        HStack(spacing: 10) {
                             Button(L10n.tr("settings.knowledge.import_file")) {
                                 let panel = NSOpenPanel()
                                 panel.title = L10n.tr("settings.knowledge.import_file.title")
@@ -840,22 +862,24 @@ struct SettingsView: View {
                             .buttonStyle(.bordered)
                             .disabled(viewModel.isKnowledgeImportRunning)
 
-                            if let libraryURL = viewModel.currentKnowledgeLibraryFolderURL {
-                                Button(L10n.tr("settings.knowledge.open_library")) {
-                                    NSWorkspace.shared.open(libraryURL)
+                            Menu {
+                                if let libraryURL = viewModel.currentKnowledgeLibraryFolderURL {
+                                    Button(L10n.tr("settings.knowledge.open_library")) {
+                                        NSWorkspace.shared.open(libraryURL)
+                                    }
                                 }
-                                .buttonStyle(.bordered)
-                            }
 
-                            Button(L10n.tr("settings.knowledge.open_index")) {
-                                NSWorkspace.shared.open(viewModel.knowledgeLibrariesFileURL)
-                            }
-                            .buttonStyle(.bordered)
+                                Button(L10n.tr("settings.knowledge.open_index")) {
+                                    NSWorkspace.shared.open(viewModel.knowledgeLibrariesFileURL)
+                                }
 
-                            Button(L10n.tr("settings.knowledge.open_imports")) {
-                                NSWorkspace.shared.open(viewModel.knowledgeImportsFileURL)
+                                Button(L10n.tr("settings.knowledge.open_imports")) {
+                                    NSWorkspace.shared.open(viewModel.knowledgeImportsFileURL)
+                                }
+                            } label: {
+                                Label(L10n.tr("common.more"), systemImage: "ellipsis.circle")
                             }
-                            .buttonStyle(.bordered)
+                            .menuStyle(.borderlessButton)
 
                             Spacer()
                         }
@@ -1053,6 +1077,8 @@ struct SettingsView: View {
                     let focusedTraceID = logAnalysisSnapshot.focusedTraceID
                     let focusedTraceEntries = logAnalysisSnapshot.focusedTraceEntries
                     let slowTraces = logAnalysisSnapshot.slowTraces
+                    let focusedTraceTiming = logAnalysisSnapshot.focusedTraceTiming
+                    let focusedTraceStages = logAnalysisSnapshot.focusedTraceStages
 
                     HStack(spacing: 10) {
                         mcpMetricCard(title: "Loaded", value: "\(filteredEntries.count)", tint: .accentColor)
@@ -1093,7 +1119,12 @@ struct SettingsView: View {
                     labeledTextField("Trace ID", text: $logTraceFilter)
 
                     if let focusedTraceID, !focusedTraceEntries.isEmpty {
-                        logTracePanel(traceID: focusedTraceID, entries: focusedTraceEntries)
+                        logTracePanel(
+                            traceID: focusedTraceID,
+                            entries: focusedTraceEntries,
+                            timing: focusedTraceTiming,
+                            stageSummaries: focusedTraceStages
+                        )
                     }
 
                     if !slowTraces.isEmpty {
@@ -1117,7 +1148,7 @@ struct SettingsView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     } else {
-                        VStack(spacing: 8) {
+                        LazyVStack(spacing: 8) {
                             ForEach(filteredEntries.prefix(120)) { entry in
                                 logRow(entry)
                             }
@@ -2214,12 +2245,12 @@ struct SettingsView: View {
             llmSubtitle = "failed in \(Int(durationMs)) ms"
             llmTint = .red
         } else if let llmFinished {
-            let firstTokenText = firstToken?.durationMs.map { "first \($0.formattedMilliseconds)" } ?? "first —"
-            let totalText = llmFinished.durationMs.map { "total \($0.formattedMilliseconds)" } ?? "total —"
+            let firstTokenText = firstToken?.durationMs.map { "first \(Int($0)) ms" } ?? "first —"
+            let totalText = llmFinished.durationMs.map { "total \(Int($0)) ms" } ?? "total —"
             llmSubtitle = "\(firstTokenText) · \(totalText)"
             llmTint = .green
         } else if firstEvent(["llm_request_started"]) != nil {
-            llmSubtitle = firstToken?.durationMs.map { "first \($0.formattedMilliseconds)" } ?? "waiting first token"
+            llmSubtitle = firstToken?.durationMs.map { "first \(Int($0)) ms" } ?? "waiting first token"
             llmTint = .accentColor
         } else {
             llmSubtitle = "not requested"
@@ -2435,14 +2466,27 @@ struct SettingsView: View {
 
         let focusedTraceID: String?
         let focusedTraceEntries: [PersistedLogEvent]
+        let focusedTraceTiming: TraceTimingSummary
+        let focusedTraceStages: [TraceStageSummary]
         if traceFilter.isEmpty {
             focusedTraceID = nil
             focusedTraceEntries = []
+            focusedTraceTiming = TraceTimingSummary(
+                firstTokenMs: nil,
+                llmTotalMs: nil,
+                longestToolMs: nil,
+                mcpInitializeMs: nil,
+                skillScriptMs: nil,
+                shellMs: nil
+            )
+            focusedTraceStages = []
         } else {
             focusedTraceID = traceFilter
             focusedTraceEntries = entries
                 .filter { $0.traceID == traceFilter }
                 .sorted { $0.timestamp < $1.timestamp }
+            focusedTraceTiming = traceTimingSummaryStatic(entries: focusedTraceEntries)
+            focusedTraceStages = traceStageSummariesStatic(entries: focusedTraceEntries)
         }
 
         return LogAnalysisSnapshot(
@@ -2452,8 +2496,135 @@ struct SettingsView: View {
             errorCount: errorCount,
             slowTraces: slowTraces,
             focusedTraceID: focusedTraceID,
-            focusedTraceEntries: focusedTraceEntries
+            focusedTraceEntries: focusedTraceEntries,
+            focusedTraceTiming: focusedTraceTiming,
+            focusedTraceStages: focusedTraceStages
         )
+    }
+
+    nonisolated private static func traceTimingSummaryStatic(entries: [PersistedLogEvent]) -> TraceTimingSummary {
+        func latestDuration(for eventNames: Set<String>) -> Int? {
+            entries
+                .reversed()
+                .first(where: { eventNames.contains($0.event) && $0.durationMs != nil })
+                .flatMap { $0.durationMs.map(Int.init) }
+        }
+
+        func maxDuration(where predicate: (PersistedLogEvent) -> Bool) -> Int? {
+            entries
+                .filter(predicate)
+                .compactMap(\.durationMs)
+                .max()
+                .map(Int.init)
+        }
+
+        return TraceTimingSummary(
+            firstTokenMs: latestDuration(for: ["llm_first_token_received"]),
+            llmTotalMs: latestDuration(for: ["llm_stream_finished", "llm_request_failed"]),
+            longestToolMs: maxDuration {
+                ($0.event == "tool_completed" || $0.event == "tool_failed" || $0.event == "tool_skipped_repeat")
+                    && $0.operationID != nil
+            },
+            mcpInitializeMs: latestDuration(for: ["mcp_initialize_completed", "mcp_initialize_failed"]),
+            skillScriptMs: latestDuration(for: ["skill_script_completed", "skill_script_failed", "skill_script_timeout"]),
+            shellMs: latestDuration(for: ["shell_completed", "shell_failed", "shell_timeout"])
+        )
+    }
+
+    nonisolated private static func traceStageSummariesStatic(entries: [PersistedLogEvent]) -> [TraceStageSummary] {
+        func firstEvent(_ names: Set<String>) -> PersistedLogEvent? {
+            entries.first(where: { names.contains($0.event) })
+        }
+
+        func lastEvent(_ names: Set<String>) -> PersistedLogEvent? {
+            entries.last(where: { names.contains($0.event) })
+        }
+
+        let contextFinished = lastEvent(["context_prepare_finished"])
+        let memoryBuiltCount = entries.filter { $0.event == "memory_context_built" }.count
+        let contextSubtitle: String
+        if let contextFinished, let durationMs = contextFinished.durationMs {
+            contextSubtitle = memoryBuiltCount > 0 ? "ready in \(Int(durationMs)) ms · memory \(memoryBuiltCount)" : "ready in \(Int(durationMs)) ms"
+        } else if firstEvent(["context_prepare_started"]) != nil {
+            contextSubtitle = "building context"
+        } else {
+            contextSubtitle = "not recorded"
+        }
+
+        let firstToken = lastEvent(["llm_first_token_received"])
+        let llmFinished = lastEvent(["llm_stream_finished"])
+        let llmFailed = lastEvent(["llm_request_failed"])
+        let llmSubtitle: String
+        let llmTint: Color
+        if let llmFailed, let durationMs = llmFailed.durationMs {
+            llmSubtitle = "failed in \(Int(durationMs)) ms"
+            llmTint = .red
+        } else if let llmFinished {
+            let firstTokenText = firstToken?.durationMs.map { "first \($0.formattedMilliseconds)" } ?? "first —"
+            let totalText = llmFinished.durationMs.map { "total \($0.formattedMilliseconds)" } ?? "total —"
+            llmSubtitle = "\(firstTokenText) · \(totalText)"
+            llmTint = .green
+        } else if firstEvent(["llm_request_started"]) != nil {
+            llmSubtitle = firstToken?.durationMs.map { "first \($0.formattedMilliseconds)" } ?? "waiting first token"
+            llmTint = .accentColor
+        } else {
+            llmSubtitle = "not requested"
+            llmTint = .secondary
+        }
+
+        let executionEntries = entries.filter {
+            $0.event == "tool_started"
+            || $0.event == "tool_completed"
+            || $0.event == "tool_failed"
+            || $0.event == "tool_skipped_repeat"
+            || $0.event == "skill_script_started"
+            || $0.event == "skill_script_completed"
+            || $0.event == "skill_script_failed"
+            || $0.event == "skill_script_timeout"
+            || $0.event == "shell_started"
+            || $0.event == "shell_completed"
+            || $0.event == "shell_failed"
+            || $0.event == "shell_timeout"
+            || $0.event == "mcp_initialize_started"
+            || $0.event == "mcp_initialize_completed"
+            || $0.event == "mcp_initialize_failed"
+        }
+        let executionCount = Set(executionEntries.compactMap(\.operationID)).count
+        let maxExecutionMs = executionEntries.compactMap(\.durationMs).max().map(Int.init)
+        let executionSubtitle: String
+        let executionTint: Color
+        if executionEntries.contains(where: { $0.level.lowercased() == "error" || $0.status == "failed" || $0.status == "timeout" }) {
+            executionSubtitle = executionCount > 0 ? "\(executionCount) ops · max \(maxExecutionMs.map { "\($0) ms" } ?? "—")" : "failed"
+            executionTint = .red
+        } else if !executionEntries.isEmpty {
+            executionSubtitle = executionCount > 0 ? "\(executionCount) ops · max \(maxExecutionMs.map { "\($0) ms" } ?? "—")" : "in progress"
+            executionTint = .orange
+        } else {
+            executionSubtitle = "no tools used"
+            executionTint = .secondary
+        }
+
+        let finished = lastEvent(["assistant_turn_finished"])
+        let failed = lastEvent(["assistant_turn_failed"])
+        let completionSubtitle: String
+        let completionTint: Color
+        if let failed, let durationMs = failed.durationMs {
+            completionSubtitle = "failed in \(Int(durationMs)) ms"
+            completionTint = .red
+        } else if let finished, let durationMs = finished.durationMs {
+            completionSubtitle = "done in \(Int(durationMs)) ms"
+            completionTint = .green
+        } else {
+            completionSubtitle = "still running"
+            completionTint = .secondary
+        }
+
+        return [
+            TraceStageSummary(id: "context", title: "Context", subtitle: contextSubtitle, tint: contextFinished == nil && firstEvent(["context_prepare_started"]) == nil ? .secondary : .accentColor),
+            TraceStageSummary(id: "llm", title: "LLM", subtitle: llmSubtitle, tint: llmTint),
+            TraceStageSummary(id: "execution", title: "Execution", subtitle: executionSubtitle, tint: executionTint),
+            TraceStageSummary(id: "finish", title: "Done", subtitle: completionSubtitle, tint: completionTint)
+        ]
     }
 
     nonisolated private static func isBackgroundMemoryLogStatic(_ entry: PersistedLogEvent) -> Bool {
@@ -2492,12 +2663,15 @@ struct SettingsView: View {
         .font(.system(size: 10.5, weight: .semibold, design: .rounded))
     }
 
-    private func logTracePanel(traceID: String, entries: [PersistedLogEvent]) -> some View {
+    private func logTracePanel(
+        traceID: String,
+        entries: [PersistedLogEvent],
+        timing: TraceTimingSummary,
+        stageSummaries: [TraceStageSummary]
+    ) -> some View {
         let errorCount = entries.filter { $0.level.lowercased() == "error" }.count
         let timeoutCount = entries.filter(isTimeoutLog(_:)).count
         let totalDuration = max(0, (entries.last?.timestamp.timeIntervalSince(entries.first?.timestamp ?? Date()) ?? 0) * 1_000)
-        let timing = traceTimingSummary(entries: entries)
-        let stageSummaries = traceStageSummaries(entries: entries)
 
         return VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top, spacing: 12) {
@@ -3356,6 +3530,7 @@ struct SettingsView: View {
                     showSkillError = skillManager.lastErrorMessage != nil
                 }
                 .buttonStyle(.bordered)
+                .disabled(viewModel.isSkillOperationRunning)
             }
         }
         .padding(.vertical, 8)

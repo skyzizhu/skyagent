@@ -80,6 +80,7 @@ final class AppState: ObservableObject {
 
     init() {
         skillManager.reloadSkills()
+        ProcessExecutionEnvironment.shared.preloadEnvironmentIfNeeded()
         let llm = LLMService(settings: store.settings)
         let orchestrator = AgentOrchestrator(llm: llm)
         self.sidebarVM = SidebarViewModel(store: store, skillManager: skillManager)

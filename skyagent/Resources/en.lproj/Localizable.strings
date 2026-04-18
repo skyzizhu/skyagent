@@ -244,6 +244,10 @@
 "settings.skill.rescan" = "Rescan Skills";
 "settings.skill.hint" = "Skills are automatically loaded from `~/.agents/skills` and `~/.skyagent/skills`.";
 "settings.skill.empty" = "No skills are available yet. Discover them from standard directories or import a local skill folder.";
+"settings.skill.installing" = "Installing skill…";
+"settings.skill.install_done" = "Skill installed.";
+"settings.skill.uninstalling" = "Uninstalling skill…";
+"settings.skill.uninstall_done" = "Skill removed.";
 "settings.profile.save_as" = "Save as Profile...";
 "settings.models.saved_profiles" = "Added Models";
 "settings.models.add_more" = "Add More Models";

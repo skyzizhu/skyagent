@@ -244,6 +244,10 @@
 "settings.skill.rescan" = "Skills erneut scannen";
 "settings.skill.hint" = "Skills werden automatisch aus `~/.agents/skills` und `~/.skyagent/skills` geladen.";
 "settings.skill.empty" = "Noch keine Skills verfügbar. Entdecke sie über Standardverzeichnisse oder importiere einen lokalen Skill-Ordner.";
+"settings.skill.installing" = "Skill wird installiert…";
+"settings.skill.install_done" = "Skill installiert.";
+"settings.skill.uninstalling" = "Skill wird entfernt…";
+"settings.skill.uninstall_done" = "Skill entfernt.";
 "settings.profile.save_as" = "Als Profile speichern...";
 "settings.models.saved_profiles" = "Hinzugefügte Modelle";
 "settings.models.add_more" = "Weitere Modelle hinzufügen";

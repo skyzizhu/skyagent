@@ -587,7 +587,8 @@ final class AgentOrchestrator {
         }
 
         if call.name == ToolDefinition.ToolName.webFetch.rawValue
-            || call.name == ToolDefinition.ToolName.webSearch.rawValue {
+            || call.name == ToolDefinition.ToolName.webSearch.rawValue
+            || call.name == ToolDefinition.ToolName.installSkill.rawValue {
             await onEvent(.toolProgress(execution, Self.toolRunningSummary(for: call)))
             await Task.yield()
             return await ToolRunner.shared.execute(
@@ -912,7 +913,7 @@ final class AgentOrchestrator {
             let libraryName = hit.libraryName?.trimmingCharacters(in: .whitespacesAndNewlines)
             let citation = hit.citation?.trimmingCharacters(in: .whitespacesAndNewlines)
             let snippet = hit.snippet.trimmingCharacters(in: .whitespacesAndNewlines)
-            lines.append("\(index + 1). \(title?.isEmpty == false ? title! : "参考资料")")
+            lines.append("\(index + 1). \(title.flatMap { $0.isEmpty ? nil : $0 } ?? "参考资料")")
             if let libraryName, !libraryName.isEmpty {
                 lines.append("知识库：\(libraryName)")
             }

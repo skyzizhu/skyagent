@@ -4,6 +4,12 @@ import Combine
 
 @MainActor
 class ChatViewModel: ObservableObject {
+    private struct TimeoutRecoveryPlan {
+        let conversationOverride: Conversation
+        let detail: String?
+        let reason: String
+    }
+
     @Published var isLoading = false
     @Published var errorMessage: String?
     @Published var pendingApproval: OperationPreview?
@@ -428,7 +434,12 @@ class ChatViewModel: ObservableObject {
 
     // MARK: - Private
 
-    private func performChat(convId: UUID, traceContext: TraceContext? = nil, retryCount: Int = 0) async {
+    private func performChat(
+        convId: UUID,
+        traceContext: TraceContext? = nil,
+        retryCount: Int = 0,
+        conversationOverride: Conversation? = nil
+    ) async {
         let effectiveTraceContext = traceContext ?? currentTraceContext ?? TraceContext(conversationID: convId)
         currentTraceContext = effectiveTraceContext
         isLoading = true
@@ -465,7 +476,8 @@ class ChatViewModel: ObservableObject {
             )
         }
 
-        guard let conv = store.conversations.first(where: { $0.id == convId }) else {
+        let conversationForRun = conversationOverride ?? store.conversations.first(where: { $0.id == convId })
+        guard let conv = conversationForRun else {
             isLoading = false
             return
         }
@@ -476,6 +488,8 @@ class ChatViewModel: ObservableObject {
             traceContext: effectiveTraceContext,
             convId: convId
         )
+
+        var terminalError: Error?
 
         switch runResult {
         case .success:
@@ -488,6 +502,7 @@ class ChatViewModel: ObservableObject {
             }
 
         case .failure(let error):
+            terminalError = error
             if error is CancellationError {
                 flushPendingAssistantDelta()
                 cancelProcessingFallback()
@@ -522,8 +537,41 @@ class ChatViewModel: ObservableObject {
                 return
             }
 
-            // 网络错误自动重试
-            if isTimeoutRelated(error) {
+            if let recoveryPlan = timeoutRecoveryPlan(
+                for: error,
+                convId: convId,
+                retryCount: retryCount
+            ) {
+                activityViewModel.showRetrying(detail: recoveryPlan.detail)
+                if let current = store.conversations.first(where: { $0.id == convId }),
+                   current.messages.last?.role == .assistant {
+                    store.removeLastAssistantMessage(in: convId)
+                }
+                await LoggerService.shared.log(
+                    level: .warn,
+                    category: .conversation,
+                    event: "assistant_turn_timeout_recovery_scheduled",
+                    traceContext: effectiveTraceContext,
+                    status: .retrying,
+                    durationMs: elapsedMilliseconds(since: currentAssistantTurnStartedAt),
+                    summary: "检测到流式空闲超时，准备恢复重试",
+                    metadata: [
+                        "retry_count": .int(retryCount),
+                        "recovery_reason": .string(recoveryPlan.reason),
+                        "timeout_stage": .string(timeoutStage(for: error) ?? "unknown")
+                    ]
+                )
+                let delay = pow(2.0, Double(retryCount))
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                isLoading = false
+                await performChat(
+                    convId: convId,
+                    traceContext: effectiveTraceContext,
+                    retryCount: retryCount + 1,
+                    conversationOverride: recoveryPlan.conversationOverride
+                )
+                return
+            } else if isTimeoutRelated(error) {
                 errorMessage = L10n.tr("chat.error.request_timed_out")
                 activityViewModel.showFailure(errorMessage ?? "执行失败")
             } else if isNetworkRelated(error) {
@@ -574,6 +622,17 @@ class ChatViewModel: ObservableObject {
         let turnDurationMs = elapsedMilliseconds(since: currentAssistantTurnStartedAt)
         if let errorMessage {
             let errorKind = logErrorKind(for: errorMessage)
+            var failureMetadata: [String: LogValue] = [
+                "error_message": .string(errorMessage)
+            ]
+            if let terminalError {
+                if let timeoutStage = timeoutStage(for: terminalError) {
+                    failureMetadata["timeout_stage"] = .string(timeoutStage)
+                }
+                if let timeoutKind = timeoutFailureKind(for: terminalError) {
+                    failureMetadata["timeout_kind"] = .string(timeoutKind)
+                }
+            }
             await LoggerService.shared.log(
                 level: .error,
                 category: .conversation,
@@ -587,7 +646,7 @@ class ChatViewModel: ObservableObject {
                     retryCount: retryCount,
                     recoveryAction: retryCount < maxRetries ? .retry : .abort,
                     isUserVisible: true,
-                    extra: ["error_message": .string(errorMessage)]
+                    extra: failureMetadata
                 )
             )
         } else {
@@ -874,6 +933,82 @@ class ChatViewModel: ObservableObject {
         return false
     }
 
+    private func timeoutStage(for error: Error) -> String? {
+        if case LLMError.requestTimedOut = error { return "request" }
+        if case LLMError.firstTokenTimedOut = error { return "first_token" }
+        if case LLMError.streamIdleTimedOut = error { return "stream_idle" }
+        return nil
+    }
+
+    private func timeoutFailureKind(for error: Error) -> String? {
+        if case LLMError.firstTokenTimedOut = error {
+            return "first_token_timeout"
+        }
+        if case LLMError.requestTimedOut = error {
+            return "request_timeout"
+        }
+        if case LLMError.streamIdleTimedOut = error {
+            return "stream_idle_timeout"
+        }
+        return nil
+    }
+
+    private func timeoutRecoveryPlan(
+        for error: Error,
+        convId: UUID,
+        retryCount: Int
+    ) -> TimeoutRecoveryPlan? {
+        guard retryCount == 0,
+              case LLMError.streamIdleTimedOut = error,
+              var conversation = store.conversations.first(where: { $0.id == convId }) else {
+            return nil
+        }
+
+        guard let lastAssistantIndex = conversation.messages.lastIndex(where: { $0.role == .assistant }) else {
+            return nil
+        }
+
+        let lastAssistant = conversation.messages[lastAssistantIndex]
+        let trimmedAssistant = lastAssistant.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedAssistant.isEmpty,
+              (lastAssistant.toolCalls?.isEmpty ?? true),
+              lastAssistant.toolExecution == nil else {
+            return nil
+        }
+
+        let lastUserIndex = conversation.messages.lastIndex(where: { $0.role == .user }) ?? 0
+        let trailingMessages = conversation.messages.suffix(from: lastUserIndex)
+        let hasToolPhaseStarted = trailingMessages.contains { message in
+            message.role == .tool
+                || !(message.toolCalls?.isEmpty ?? true)
+                || message.toolExecution != nil
+        }
+        guard !hasToolPhaseStarted else {
+            return nil
+        }
+
+        let recoveryInstruction = """
+        [恢复指令]
+        上一轮响应在输出开头后中断。不要重复前面的开场白。
+        如果需要调用工具，请直接输出工具调用，不要先重复解释。
+        如果不需要调用工具，请从未完成处继续补全最终结果。
+        只补全剩余内容，避免从头重新回答。
+        [/恢复指令]
+        """
+        conversation.messages.append(
+            Message(
+                role: .system,
+                content: recoveryInstruction,
+                hiddenFromTranscript: true
+            )
+        )
+        return TimeoutRecoveryPlan(
+            conversationOverride: conversation,
+            detail: L10n.tr("chat.waiting.retry.detail"),
+            reason: "stream_idle_before_tool_call"
+        )
+    }
+
     private func logErrorKind(for errorMessage: String) -> LogErrorKind {
         let normalized = errorMessage.lowercased()
         if normalized.contains("timed out") || normalized.contains("超时") {
@@ -1087,7 +1222,7 @@ class ChatViewModel: ObservableObject {
                 libraryID: hit.libraryID,
                 libraryName: libraryName?.isEmpty == false ? libraryName : nil,
                 documentID: hit.documentID,
-                title: title?.isEmpty == false ? title! : L10n.tr("chat.knowledge.reference_default_title"),
+                title: title.flatMap { $0.isEmpty ? nil : $0 } ?? L10n.tr("chat.knowledge.reference_default_title"),
                 source: source?.isEmpty == false ? source : nil,
                 citation: citation?.isEmpty == false ? citation : nil,
                 snippet: compactSnippet,

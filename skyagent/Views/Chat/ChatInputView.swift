@@ -3,6 +3,13 @@ import AppKit
 import UniformTypeIdentifiers
 
 struct ChatInputView: View {
+    private struct AttachmentProgressSnapshot: Equatable {
+        let fileName: String
+        let kind: ComposerAttachmentStatus.Kind
+        let message: String
+        let updatedAt: Date
+    }
+
     @Binding var inputText: String
     @Binding var pendingAttachment: ComposerAttachment?
     @Binding var attachmentStatus: ComposerAttachmentStatus?
@@ -17,6 +24,7 @@ struct ChatInputView: View {
     let focusRequestID: Int
     @State private var editorHeight: CGFloat = 60
     @State private var isDropTargeted = false
+    @State private var lastAttachmentProgressSnapshot: AttachmentProgressSnapshot?
 
     private let minimumEditorHeight: CGFloat = 60
     private let maximumEditorHeight: CGFloat = 168
@@ -545,6 +553,7 @@ struct ChatInputView: View {
         let fileName = url.lastPathComponent
         let kind = ComposerAttachment.parsingKind(forExtension: url.pathExtension)
         pendingAttachment = nil
+        lastAttachmentProgressSnapshot = nil
         let startedAt = Date()
         attachmentStatus = ComposerAttachmentStatus(
             phase: .parsing,
@@ -696,12 +705,39 @@ struct ChatInputView: View {
             return
         }
 
+        let message = L10n.tr(progress.messageKey, arguments: progress.arguments)
+        let now = Date()
+        if let snapshot = lastAttachmentProgressSnapshot,
+           snapshot.fileName == fileName,
+           snapshot.kind == progress.kind,
+           snapshot.message == message,
+           now.timeIntervalSince(snapshot.updatedAt) < 0.3 {
+            return
+        }
+
+        if attachmentStatus?.kind == progress.kind,
+           attachmentStatus?.message == message {
+            lastAttachmentProgressSnapshot = AttachmentProgressSnapshot(
+                fileName: fileName,
+                kind: progress.kind,
+                message: message,
+                updatedAt: now
+            )
+            return
+        }
+
         attachmentStatus = ComposerAttachmentStatus(
             phase: .parsing,
             kind: progress.kind,
             fileName: fileName,
-            message: L10n.tr(progress.messageKey, arguments: progress.arguments),
+            message: message,
             startedAt: startedAt
+        )
+        lastAttachmentProgressSnapshot = AttachmentProgressSnapshot(
+            fileName: fileName,
+            kind: progress.kind,
+            message: message,
+            updatedAt: now
         )
     }
 

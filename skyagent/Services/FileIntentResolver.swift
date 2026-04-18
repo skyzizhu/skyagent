@@ -1082,7 +1082,9 @@ final class FileIntentResolver {
         var letters = ""
         while value > 0 {
             let remainder = (value - 1) % 26
-            letters = String(UnicodeScalar(remainder + 65)!) + letters
+            let scalarValue = remainder + 65
+            guard let scalar = UnicodeScalar(scalarValue) else { return letters }
+            letters = String(scalar) + letters
             value = (value - 1) / 26
         }
         return letters

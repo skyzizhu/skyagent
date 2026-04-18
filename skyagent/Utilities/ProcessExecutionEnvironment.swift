@@ -5,6 +5,7 @@ final class ProcessExecutionEnvironment: @unchecked Sendable {
 
     private let lock = NSLock()
     nonisolated(unsafe) private var cachedStartupEnvironment: [String: String]?
+    nonisolated(unsafe) private var isWarmupInFlight = false
 
     private init() {}
 
@@ -14,7 +15,12 @@ final class ProcessExecutionEnvironment: @unchecked Sendable {
     ) -> [String: String] {
         var environment = ProcessInfo.processInfo.environment
 
-        for (key, value) in startupEnvironment() where !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let startupEnvironmentSnapshot = startupEnvironment()
+        if startupEnvironmentSnapshot.isEmpty {
+            preloadEnvironmentIfNeeded()
+        }
+
+        for (key, value) in startupEnvironmentSnapshot where !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             environment[key] = value
         }
 
@@ -33,6 +39,23 @@ final class ProcessExecutionEnvironment: @unchecked Sendable {
         environment["PATH"] = pathSegments.joined(separator: ":")
 
         return environment
+    }
+
+    nonisolated func preloadEnvironmentIfNeeded() {
+        lock.lock()
+        let shouldStart = cachedStartupEnvironment == nil && !isWarmupInFlight
+        if shouldStart {
+            isWarmupInFlight = true
+        }
+        lock.unlock()
+
+        guard shouldStart else { return }
+
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            let environment = await self.loadStartupEnvironmentAsync()
+            self.storeWarmupResult(environment)
+        }
     }
 
     nonisolated func resolveCommandPath(_ command: String, environment: [String: String]) -> String? {
@@ -61,18 +84,7 @@ final class ProcessExecutionEnvironment: @unchecked Sendable {
             return cachedStartupEnvironment
         }
         lock.unlock()
-
-        var merged: [String: String] = [:]
-        for shellPath in preferredShells() {
-            for (key, value) in loadEnvironment(shellPath: shellPath) where !value.isEmpty {
-                merged[key] = value
-            }
-        }
-
-        lock.lock()
-        cachedStartupEnvironment = merged
-        lock.unlock()
-        return merged
+        return [:]
     }
 
     nonisolated private func preferredShells() -> [String] {
@@ -89,25 +101,38 @@ final class ProcessExecutionEnvironment: @unchecked Sendable {
         return unique
     }
 
-    nonisolated private func loadEnvironment(shellPath: String) -> [String: String] {
+    private func loadStartupEnvironmentAsync() async -> [String: String] {
+        var merged: [String: String] = [:]
+        for shellPath in preferredShells() {
+            let environment = await loadEnvironment(shellPath: shellPath)
+            for (key, value) in environment where !value.isEmpty {
+                merged[key] = value
+            }
+        }
+        return merged
+    }
+
+    nonisolated private func storeWarmupResult(_ environment: [String: String]) {
+        lock.lock()
+        cachedStartupEnvironment = environment
+        isWarmupInFlight = false
+        lock.unlock()
+    }
+
+    private func loadEnvironment(shellPath: String) async -> [String: String] {
         guard FileManager.default.isExecutableFile(atPath: shellPath) else { return [:] }
 
-        let process = Process()
-        let stdout = Pipe()
-        process.executableURL = URL(fileURLWithPath: shellPath)
-        process.arguments = [
-            "-lc",
-            startupCommand(for: shellPath)
-        ]
-        process.standardOutput = stdout
-        process.standardError = Pipe()
-
         do {
-            try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else { return [:] }
-
-            let data = stdout.fileHandleForReading.readDataToEndOfFile()
+            let result = try await AsyncProcessRunner.shared.run(
+                executableURL: URL(fileURLWithPath: shellPath),
+                arguments: [
+                    "-lc",
+                    startupCommand(for: shellPath)
+                ],
+                timeout: 3
+            )
+            guard result.terminationStatus == 0 else { return [:] }
+            let data = result.stdout
             guard let raw = String(data: data, encoding: .utf8) else { return [:] }
 
             var environment: [String: String] = [:]

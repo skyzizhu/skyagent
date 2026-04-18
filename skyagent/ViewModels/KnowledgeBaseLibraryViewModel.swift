@@ -32,6 +32,8 @@ final class KnowledgeBaseLibraryViewModel: ObservableObject {
     @Published private(set) var selectedDocumentSnippets: [KnowledgeDocumentSnippet] = []
     @Published private(set) var queryResults: [RetrievalHit] = []
     @Published private(set) var storageMetrics: KnowledgeLibraryStorageMetrics?
+    @Published private(set) var filteredDocumentsSnapshot: [KnowledgeDocument] = []
+    @Published private(set) var filteredImportJobsSnapshot: [KnowledgeImportJob] = []
     @Published private(set) var isRefreshing = false
     @Published private(set) var isImportRunning = false
     @Published private(set) var isQueryRunning = false
@@ -54,6 +56,7 @@ final class KnowledgeBaseLibraryViewModel: ObservableObject {
     let focusedCitation: String?
     let focusedSnippet: String?
     private var refreshFromDiskToken = UUID()
+    private var cancellables = Set<AnyCancellable>()
 
     private struct DiskSnapshot {
         let library: KnowledgeLibrary
@@ -80,6 +83,7 @@ final class KnowledgeBaseLibraryViewModel: ObservableObject {
         self.focusedSnippet = focusSnippet?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.conversationStore = conversationStore
         self.service = service ?? .shared
+        bindFilters()
         refreshFromDisk()
     }
 
@@ -178,46 +182,11 @@ final class KnowledgeBaseLibraryViewModel: ObservableObject {
     }
 
     var filteredDocuments: [KnowledgeDocument] {
-        let needle = documentSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !needle.isEmpty else { return documents }
-        return documents.filter { document in
-            [
-                document.name,
-                document.originalPath ?? "",
-                document.id.uuidString
-            ].contains { $0.lowercased().contains(needle) }
-        }
+        filteredDocumentsSnapshot
     }
 
     var filteredImportJobs: [KnowledgeImportJob] {
-        let needle = importSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let filteredByStatus = importJobs.filter { job in
-            switch selectedImportFilter {
-            case .all:
-                return true
-            case .failed:
-                return job.status == .failed
-            case .running:
-                return job.status == .running || job.status == .pending
-            case .succeeded:
-                return job.status == .succeeded
-            }
-        }
-
-        let filteredByReason = filteredByStatus.filter { job in
-            guard let selectedFailureReasonID, !selectedFailureReasonID.isEmpty else { return true }
-            return failureReasonID(for: job.errorMessage) == selectedFailureReasonID
-        }
-
-        guard !needle.isEmpty else { return filteredByReason }
-        return filteredByReason.filter { job in
-            [
-                job.title ?? "",
-                job.source,
-                job.errorMessage ?? "",
-                job.id.uuidString
-            ].contains { $0.lowercased().contains(needle) }
-        }
+        filteredImportJobsSnapshot
     }
 
     func importFilterTitle(_ filter: ImportFilter) -> String {
@@ -1154,6 +1123,34 @@ final class KnowledgeBaseLibraryViewModel: ObservableObject {
         return formatter
     }()
 
+    private func bindFilters() {
+        $documentSearchText
+            .debounce(for: .milliseconds(160), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.recomputeFilteredDocuments()
+            }
+            .store(in: &cancellables)
+
+        $importSearchText
+            .debounce(for: .milliseconds(160), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.recomputeFilteredImportJobs()
+            }
+            .store(in: &cancellables)
+
+        $selectedImportFilter
+            .sink { [weak self] _ in
+                self?.recomputeFilteredImportJobs()
+            }
+            .store(in: &cancellables)
+
+        $selectedFailureReasonID
+            .sink { [weak self] _ in
+                self?.recomputeFilteredImportJobs()
+            }
+            .store(in: &cancellables)
+    }
+
     private func refreshFromDisk() {
         let libraryID = library.id
         let currentLibrary = library
@@ -1218,7 +1215,60 @@ final class KnowledgeBaseLibraryViewModel: ObservableObject {
                 self.recentActivity = snapshot.recentActivity
                 self.selectedDocument = snapshot.selectedDocument
                 self.selectedDocumentSnippets = snapshot.selectedDocumentSnippets
+                self.recomputeFilteredDocuments(sourceDocuments: snapshot.documents)
+                self.recomputeFilteredImportJobs(sourceImportJobs: snapshot.importJobs)
             }
+        }
+    }
+
+    private func recomputeFilteredDocuments(sourceDocuments: [KnowledgeDocument]? = nil) {
+        let documentSnapshot = sourceDocuments ?? documents
+        let needle = documentSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else {
+            filteredDocumentsSnapshot = documentSnapshot
+            return
+        }
+        filteredDocumentsSnapshot = documentSnapshot.filter { document in
+            [
+                document.name,
+                document.originalPath ?? "",
+                document.id.uuidString
+            ].contains { $0.lowercased().contains(needle) }
+        }
+    }
+
+    private func recomputeFilteredImportJobs(sourceImportJobs: [KnowledgeImportJob]? = nil) {
+        let importSnapshot = sourceImportJobs ?? importJobs
+        let needle = importSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let filteredByStatus = importSnapshot.filter { job in
+            switch selectedImportFilter {
+            case .all:
+                return true
+            case .failed:
+                return job.status == .failed
+            case .running:
+                return job.status == .running || job.status == .pending
+            case .succeeded:
+                return job.status == .succeeded
+            }
+        }
+
+        let filteredByReason = filteredByStatus.filter { job in
+            guard let selectedFailureReasonID, !selectedFailureReasonID.isEmpty else { return true }
+            return failureReasonID(for: job.errorMessage) == selectedFailureReasonID
+        }
+
+        guard !needle.isEmpty else {
+            filteredImportJobsSnapshot = filteredByReason
+            return
+        }
+        filteredImportJobsSnapshot = filteredByReason.filter { job in
+            [
+                job.title ?? "",
+                job.source,
+                job.errorMessage ?? "",
+                job.id.uuidString
+            ].contains { $0.lowercased().contains(needle) }
         }
     }
 

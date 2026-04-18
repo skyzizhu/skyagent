@@ -123,7 +123,10 @@ final class ConversationContextService {
 
     private nonisolated func buildRecentResults(conversation: Conversation, scopeStartDate: Date?) -> [String] {
         conversation.recentOperations
-            .filter { scopeStartDate == nil || $0.createdAt >= scopeStartDate! }
+            .filter { operation in
+                guard let scopeStartDate else { return true }
+                return operation.createdAt >= scopeStartDate
+            }
             .prefix(3)
             .map { operation in
             let summary = operation.summary.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -133,7 +136,11 @@ final class ConversationContextService {
 
     private nonisolated func buildRecentTimeline(conversation: Conversation, scopeStartDate: Date?) -> [String] {
         let userEvents = conversation.messages
-            .filter { $0.role == .user && (scopeStartDate == nil || $0.timestamp >= scopeStartDate!) }
+            .filter { message in
+                guard message.role == .user else { return false }
+                guard let scopeStartDate else { return true }
+                return message.timestamp >= scopeStartDate
+            }
             .suffix(4)
             .map { message in
                 TimelineEvent(
@@ -143,7 +150,10 @@ final class ConversationContextService {
             }
 
         let operationEvents = conversation.recentOperations
-            .filter { scopeStartDate == nil || $0.createdAt >= scopeStartDate! }
+            .filter { operation in
+                guard let scopeStartDate else { return true }
+                return operation.createdAt >= scopeStartDate
+            }
             .prefix(4)
             .map { operation in
                 let actionPrefix = operation.isUndone ? "已撤销" : "已执行"
@@ -186,7 +196,10 @@ final class ConversationContextService {
             return "先解除阻塞：\(pending)"
         }
 
-        if let recentOperation = conversation.recentOperations.first(where: { scopeStartDate == nil || $0.createdAt >= scopeStartDate! }) {
+        if let recentOperation = conversation.recentOperations.first(where: { operation in
+            guard let scopeStartDate else { return true }
+            return operation.createdAt >= scopeStartDate
+        }) {
             if recentOperation.isUndone {
                 return "根据撤销后的状态继续后续处理"
             }
@@ -218,7 +231,10 @@ final class ConversationContextService {
         }
 
         let recentMessages = conversation.messages
-            .filter { scopeStartDate == nil || $0.timestamp >= scopeStartDate! }
+            .filter { message in
+                guard let scopeStartDate else { return true }
+                return message.timestamp >= scopeStartDate
+            }
             .suffix(6)
 
         if let lastAssistant = recentMessages.reversed().first(where: { $0.role == .assistant }) {
@@ -239,7 +255,11 @@ final class ConversationContextService {
         scopeStartDate: Date?
     ) -> String? {
         let scopedMessages = conversation.messages
-            .filter { $0.role == .user && (scopeStartDate == nil || $0.timestamp >= scopeStartDate!) }
+            .filter { message in
+                guard message.role == .user else { return false }
+                guard let scopeStartDate else { return true }
+                return message.timestamp >= scopeStartDate
+            }
             .suffix(6)
             .map(\.content)
 
@@ -266,14 +286,20 @@ final class ConversationContextService {
 
     private nonisolated func latestAttachmentID(in conversation: Conversation, scopeStartDate: Date?) -> String? {
         conversation.messages
-            .filter { scopeStartDate == nil || $0.timestamp >= scopeStartDate! }
+            .filter { message in
+                guard let scopeStartDate else { return true }
+                return message.timestamp >= scopeStartDate
+            }
             .reversed()
             .compactMap(\.attachmentID)
             .first
     }
 
     private nonisolated func recentOperationTargetPath(in conversation: Conversation, scopeStartDate: Date?) -> String? {
-        for operation in conversation.recentOperations where scopeStartDate == nil || operation.createdAt >= scopeStartDate! {
+        for operation in conversation.recentOperations {
+            if let scopeStartDate, operation.createdAt < scopeStartDate {
+                continue
+            }
             for line in operation.detailLines {
                 if let path = extractAbsolutePath(from: line) {
                     return path
@@ -354,7 +380,11 @@ final class ConversationContextService {
 
     private nonisolated func scopedUserMessages(in conversation: Conversation, scopeStartDate: Date?) -> [String] {
         conversation.messages
-            .filter { $0.role == .user && (scopeStartDate == nil || $0.timestamp >= scopeStartDate!) }
+            .filter { message in
+                guard message.role == .user else { return false }
+                guard let scopeStartDate else { return true }
+                return message.timestamp >= scopeStartDate
+            }
             .suffix(8)
             .map(\.content)
     }

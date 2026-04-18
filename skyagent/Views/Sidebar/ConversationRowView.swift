@@ -1,41 +1,23 @@
 import SwiftUI
 
 struct ConversationRowView: View {
-    let conv: Conversation
+    let row: SidebarViewModel.ConversationRowSnapshot
     let isCurrent: Bool
 
     @State private var isHovered = false
 
-    private var previewText: String {
-        let lastVisible = conv.messages.last(where: { $0.isVisibleInTranscript })
-            ?? conv.messages.last(where: { $0.hiddenFromTranscript != true && $0.role != .system })
-            ?? conv.messages.last(where: { $0.role != .system })
-        guard let last = lastVisible else { return L10n.tr("conversation.empty") }
-        let text = last.content
-            .replacingOccurrences(of: "🔧 执行工具: ", with: "🔧 ")
-            .replacingOccurrences(of: "📋 结果:", with: "")
-            .replacingOccurrences(of: "```", with: "")
-            .components(separatedBy: "\n")
-            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-            .first ?? ""
-        return String(text.prefix(50))
-    }
-
-    private var timeText: String {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: conv.lastActiveAt, relativeTo: Date())
-    }
-
     private var modeText: String {
-        conv.filePermissionMode == .sandbox ? L10n.tr("permission.sandbox") : L10n.tr("permission.open")
+        let conv = row.conversation
+        return conv.filePermissionMode == .sandbox ? L10n.tr("permission.sandbox") : L10n.tr("permission.open")
     }
 
     private var modeColor: Color {
-        conv.filePermissionMode == .sandbox ? .blue : .orange
+        let conv = row.conversation
+        return conv.filePermissionMode == .sandbox ? Color.blue : Color.orange
     }
 
     var body: some View {
+        let conv = row.conversation
         HStack(alignment: .top, spacing: 0) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(conv.title)
@@ -46,7 +28,7 @@ struct ConversationRowView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
 
-                Text(previewText)
+                Text(row.previewText)
                     .font(.system(size: 9, weight: .medium, design: .rounded))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -68,7 +50,7 @@ struct ConversationRowView: View {
                         .padding(.vertical, 3)
                         .background(modeColor.opacity(0.08), in: Capsule())
 
-                    Text(timeText)
+                    Text(row.timeText)
                         .font(.system(size: 9.5, weight: .medium, design: .rounded))
                         .foregroundStyle(.tertiary)
                         .fixedSize()
